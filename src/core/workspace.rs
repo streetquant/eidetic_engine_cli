@@ -2129,14 +2129,34 @@ pub fn workspace_memory_scope_generation(
     let mut generation = None;
     for workspace_id in &ids {
         if let Some(value) = connection.get_workspace_generation(workspace_id)? {
-            let total = generation.unwrap_or(0_u64).saturating_add(value);
+            let total = generation
+                .unwrap_or(0_u64)
+                .checked_add(value)
+                .ok_or_else(|| crate::db::DbError::MalformedRow {
+                    operation: crate::db::DbOperation::Query,
+                    message: "workspace memory scope generation overflow".to_owned(),
+                })?;
             generation = Some(total);
         }
     }
     // The membership term makes a newly adopted zero-generation workspace
     // stale the owner's index immediately; the sum keeps every member write
     // visible even when another member has a higher generation.
-    Ok(generation.map(|value| value.saturating_add(ids.len().saturating_sub(1) as u64)))
+    let membership_fence = u64::try_from(ids.len().saturating_sub(1)).map_err(|_| {
+        crate::db::DbError::MalformedRow {
+            operation: crate::db::DbOperation::Query,
+            message: "workspace memory scope membership count overflow".to_owned(),
+        }
+    })?;
+    match generation {
+        Some(value) => Ok(Some(value.checked_add(membership_fence).ok_or_else(
+            || crate::db::DbError::MalformedRow {
+                operation: crate::db::DbOperation::Query,
+                message: "workspace memory scope generation overflow".to_owned(),
+            },
+        )?)),
+        None => Ok(None),
+    }
 }
 
 /// Load the memory corpus admitted by an owner and its explicit adopted scope.
@@ -2981,7 +3001,8 @@ pub fn stable_workspace_id(path: &Path) -> String {
 /// stored under a different id than `requested_workspace_id`. Inserting child
 /// rows under the hashed id then fails SQLite with FOREIGN KEY constraint
 /// failed while `ee doctor` still reports healthy. If more than one matching
-/// row exists, prefer the one that already holds live memories.
+/// path row exists, fail closed unless the caller supplied an exact stored ID;
+/// live-memory counts are mutable data and are not identity evidence.
 pub(crate) fn ensure_bound_workspace(
     connection: &DbConnection,
     requested_workspace_id: &str,
@@ -3146,6 +3167,19 @@ pub(crate) fn select_existing_workspace_row(
     requested_workspace_id: &str,
     workspace_paths: &[&Path],
 ) -> Result<Option<StoredWorkspace>, DomainError> {
+    // An exact stored ID is the only authoritative identity supplied by the
+    // caller. It wins before path aliases are considered, so duplicate path
+    // rows cannot redirect a request to a mutable-count winner.
+    if let Some(requested) = connection
+        .get_workspace(requested_workspace_id)
+        .map_err(|error| DomainError::Storage {
+            message: format!("Failed to query workspace by requested id: {error}"),
+            repair: Some("ee doctor".to_owned()),
+        })?
+    {
+        return Ok(Some(requested));
+    }
+
     let mut matches = BTreeMap::new();
     let mut input_keys = BTreeSet::new();
     for workspace_path in workspace_paths {
@@ -3163,7 +3197,7 @@ pub(crate) fn select_existing_workspace_row(
             }
         }
     }
-    if matches.is_empty() && !input_keys.is_empty() {
+    if !input_keys.is_empty() {
         for row in connection
             .list_workspaces()
             .map_err(|error| DomainError::Storage {
@@ -3179,47 +3213,49 @@ pub(crate) fn select_existing_workspace_row(
             }
         }
     }
-    if !matches.is_empty() {
-        return Ok(Some(pick_workspace_row(
-            connection,
-            matches.into_values().collect(),
-        )?));
-    }
-    connection
-        .get_workspace(requested_workspace_id)
-        .map_err(|error| DomainError::Storage {
-            message: format!("Failed to query workspace by id: {error}"),
-            repair: Some("ee doctor".to_owned()),
-        })
-}
-
-pub(crate) fn pick_workspace_row(
-    connection: &DbConnection,
-    rows: Vec<StoredWorkspace>,
-) -> Result<StoredWorkspace, DomainError> {
-    let mut best: Option<(u64, String, StoredWorkspace)> = None;
-    for row in rows {
-        let live = connection
-            .count_live_memories_for_workspace(&row.id)
-            .map_err(|error| DomainError::Storage {
-                message: format!("Failed to count live memories for workspace: {error}"),
-                repair: Some("ee doctor".to_owned()),
-            })?;
-        let better = match &best {
-            None => true,
-            Some((best_live, best_id, _)) => {
-                live > *best_live || (live == *best_live && row.id < *best_id)
-            }
-        };
-        if better {
-            best = Some((live, row.id.clone(), row));
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_values().next()),
+        _ => {
+            let ids = matches.keys().cloned().collect::<Vec<_>>().join(", ");
+            Err(DomainError::Storage {
+                message: format!("ambiguous workspace identity for path binding: {ids}"),
+                repair: Some(
+                    "Provide an explicit workspace ID or remove duplicate path rows before continuing."
+                        .to_owned(),
+                ),
+            })
         }
     }
-    best.ok_or_else(|| DomainError::Storage {
-        message: "workspace row picker received an empty match set".to_owned(),
-        repair: Some("ee doctor".to_owned()),
-    })
-    .map(|(_, _, row)| row)
+}
+
+/// Select a workspace only when the restore caller has one unambiguous row.
+/// Mutable memory counts must never choose among multiple identities.
+pub(crate) fn pick_workspace_row(
+    _connection: &DbConnection,
+    rows: Vec<StoredWorkspace>,
+) -> Result<StoredWorkspace, DomainError> {
+    match rows.as_slice() {
+        [] => Err(DomainError::Storage {
+            message: "workspace row picker received an empty match set".to_owned(),
+            repair: Some("ee doctor".to_owned()),
+        }),
+        [row] => Ok(row.clone()),
+        _ => {
+            let ids = rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(DomainError::Storage {
+                message: format!("ambiguous workspace identities: {ids}"),
+                repair: Some(
+                    "Provide the workspace ID from restored graph metadata before continuing."
+                        .to_owned(),
+                ),
+            })
+        }
+    }
 }
 
 fn workspace_path_lookup_keys(path: &Path) -> Vec<String> {
@@ -3780,6 +3816,27 @@ mod tests {
                 },
             )
             .map_err(|error| error.to_string())?;
+        connection
+            .insert_memory(
+                "mem_00000000000000000000000001",
+                &crate::db::CreateMemoryInput {
+                    workspace_id: adopted_id.to_owned(),
+                    level: "procedural".to_owned(),
+                    kind: "rule".to_owned(),
+                    content: "adopted workspace memory".to_owned(),
+                    workflow_id: None,
+                    confidence: 0.9,
+                    utility: 0.5,
+                    importance: 0.5,
+                    provenance_uri: Some("fixture://workspace-adoption".to_owned()),
+                    trust_class: crate::models::TrustClass::HumanExplicit.as_str().to_owned(),
+                    trust_subclass: None,
+                    tags: vec!["adoption-proof".to_owned()],
+                    valid_from: None,
+                    valid_to: None,
+                },
+            )
+            .map_err(|error| error.to_string())?;
         let details = serde_json::json!({
             "schema": WORKSPACE_MEMORY_SCOPE_ADOPTION_SCHEMA_V1,
             "ownerWorkspaceId": owner_id,
@@ -3810,6 +3867,20 @@ mod tests {
                 .expect("adopted row remains separate")
                 .path,
             "/storage/codex-global/ee"
+        );
+        let scoped = list_memories_for_workspace_memory_scope(&connection, owner_id, None, false)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].id, "mem_00000000000000000000000001");
+        assert_eq!(scoped[0].workspace_id, adopted_id);
+        let stored = connection
+            .get_memory("mem_00000000000000000000000001")
+            .map_err(|error| error.to_string())?
+            .expect("adopted memory row remains present");
+        assert_eq!(stored.workspace_id, adopted_id);
+        assert_eq!(
+            stored.provenance_uri.as_deref(),
+            Some("fixture://workspace-adoption")
         );
         Ok(())
     }
@@ -3912,6 +3983,97 @@ mod tests {
     }
 
     #[test]
+    fn workspace_memory_scope_generation_rejects_checked_overflow() -> TestResult {
+        let connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
+        connection.migrate().map_err(|error| error.to_string())?;
+        let owner_id = "wsp_01234567890123456789012345";
+        let adopted_a = "wsp_98765432109876543210987654";
+        let adopted_b = "wsp_11111111111111111111111111";
+        for (workspace_id, path) in [
+            (owner_id, "/tmp/ee-overflow-owner"),
+            (adopted_a, "/tmp/ee-overflow-adopted-a"),
+            (adopted_b, "/tmp/ee-overflow-adopted-b"),
+        ] {
+            connection
+                .insert_workspace(
+                    workspace_id,
+                    &CreateWorkspaceInput {
+                        path: path.to_owned(),
+                        name: None,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            connection
+                .execute_raw(&format!(
+                    "UPDATE workspace_generations SET generation = 9223372036854775807 WHERE workspace_id = '{workspace_id}'"
+                ))
+                .map_err(|error| error.to_string())?;
+        }
+        for (audit_id, adopted_id) in [
+            ("audit_00000000000000000000000001", adopted_a),
+            ("audit_00000000000000000000000002", adopted_b),
+        ] {
+            let details = serde_json::json!({
+                "schema": WORKSPACE_MEMORY_SCOPE_ADOPTION_SCHEMA_V1,
+                "ownerWorkspaceId": owner_id,
+                "adoptedWorkspaceId": adopted_id,
+            })
+            .to_string();
+            connection
+                .insert_audit(
+                    audit_id,
+                    &CreateAuditInput {
+                        workspace_id: Some(owner_id.to_owned()),
+                        actor: Some("test".to_owned()),
+                        action: WORKSPACE_MEMORY_SCOPE_ADOPT_ACTION.to_owned(),
+                        target_type: Some("workspace".to_owned()),
+                        target_id: Some(adopted_id.to_owned()),
+                        details: Some(details),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        let error = workspace_memory_scope_generation(&connection, owner_id)
+            .expect_err("scope generation overflow must fail closed");
+        assert!(error.to_string().contains("generation overflow"));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_selection_rejects_ambiguous_path_rows() -> TestResult {
+        let connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
+        connection.migrate().map_err(|error| error.to_string())?;
+        let path = "/tmp/ee-ambiguous-selection";
+        let first_id = "wsp_aaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let second_id = "wsp_bbbbbbbbbbbbbbbbbbbbbbbbbb";
+        for (workspace_id, stored_path) in
+            [(first_id, path.to_owned()), (second_id, format!("{path}/"))]
+        {
+            connection
+                .insert_workspace(
+                    workspace_id,
+                    &CreateWorkspaceInput {
+                        path: stored_path,
+                        name: None,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        let error = select_existing_workspace_row(
+            &connection,
+            "wsp_cccccccccccccccccccccccccc",
+            &[Path::new(path)],
+        )
+        .expect_err("duplicate path rows must not be selected by mutable memory counts");
+        assert!(error.message().contains("ambiguous workspace identity"));
+        let explicit = select_existing_workspace_row(&connection, first_id, &[Path::new(path)])
+            .map_err(|error| error.to_string())?
+            .expect("explicit workspace ID resolves duplicate path rows");
+        assert_eq!(explicit.id, first_id);
+        Ok(())
+    }
+
+    #[test]
     fn adoption_owner_selection_rejects_ambiguous_path_rows() -> TestResult {
         let connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
         connection.migrate().map_err(|error| error.to_string())?;
@@ -3941,74 +4103,35 @@ mod tests {
     }
 
     #[test]
-    fn pick_workspace_row_prefers_the_occupied_id() -> TestResult {
+    fn pick_workspace_row_rejects_ambiguous_identities() -> TestResult {
         let connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
-        connection.migrate().map_err(|error| error.to_string())?;
-        let empty = StoredWorkspace {
-            id: "wsp_bbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
-            path: "/tmp/ee-empty".to_owned(),
-            name: Some("empty".to_owned()),
-            scope_kind: "standalone".to_owned(),
-            repository_root: None,
-            repository_fingerprint: None,
-            subproject_path: None,
-            created_at: "2026-01-01T00:00:00Z".to_owned(),
-            updated_at: "2026-01-01T00:00:00Z".to_owned(),
-        };
-        let occupied = StoredWorkspace {
-            id: "wsp_aaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-            path: "/tmp/ee-occupied".to_owned(),
-            name: Some("occupied".to_owned()),
-            scope_kind: "standalone".to_owned(),
-            repository_root: None,
-            repository_fingerprint: None,
-            subproject_path: None,
-            created_at: "2026-01-01T00:00:00Z".to_owned(),
-            updated_at: "2026-01-01T00:00:00Z".to_owned(),
-        };
-        connection
-            .insert_workspace(
-                &occupied.id,
-                &CreateWorkspaceInput {
-                    path: occupied.path.clone(),
-                    name: occupied.name.clone(),
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        connection
-            .insert_workspace(
-                &empty.id,
-                &CreateWorkspaceInput {
-                    path: empty.path.clone(),
-                    name: empty.name.clone(),
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        connection
-            .insert_memory(
-                "mem_00000000000000000000000001",
-                &crate::db::CreateMemoryInput {
-                    workspace_id: occupied.id.clone(),
-                    level: "procedural".to_owned(),
-                    kind: "rule".to_owned(),
-                    content: "occupied workspace memory".to_owned(),
-                    workflow_id: None,
-                    confidence: 0.9,
-                    utility: 0.5,
-                    importance: 0.5,
-                    provenance_uri: None,
-                    trust_class: crate::models::TrustClass::HumanExplicit.as_str().to_owned(),
-                    trust_subclass: None,
-                    tags: Vec::new(),
-                    valid_from: None,
-                    valid_to: None,
-                },
-            )
-            .map_err(|error| error.to_string())?;
-
-        let picked = pick_workspace_row(&connection, vec![empty, occupied.clone()])
-            .map_err(|error| error.message())?;
-        assert_eq!(picked.id, occupied.id, "occupied workspace wins");
+        let rows = vec![
+            StoredWorkspace {
+                id: "wsp_bbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                path: "/tmp/ee-empty".to_owned(),
+                name: Some("empty".to_owned()),
+                scope_kind: "standalone".to_owned(),
+                repository_root: None,
+                repository_fingerprint: None,
+                subproject_path: None,
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            },
+            StoredWorkspace {
+                id: "wsp_aaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                path: "/tmp/ee-occupied".to_owned(),
+                name: Some("occupied".to_owned()),
+                scope_kind: "standalone".to_owned(),
+                repository_root: None,
+                repository_fingerprint: None,
+                subproject_path: None,
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            },
+        ];
+        let error = pick_workspace_row(&connection, rows)
+            .expect_err("multiple workspace identities must not be selected by mutable data");
+        assert!(error.message().contains("ambiguous workspace identities"));
         Ok(())
     }
 

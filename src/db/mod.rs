@@ -58187,7 +58187,9 @@ mod tests {
 
     #[test]
     fn with_write_owner_fence_is_reentrant_without_implicit_transaction() -> TestResult {
-        let connection = DbConnection::open_memory().map_err(TestFailure::from)?;
+        let tempdir = tempfile::tempdir().map_err(|error| TestFailure::new(error.to_string()))?;
+        let connection = DbConnection::open_file(tempdir.path().join("reentrant.db"))
+            .map_err(TestFailure::from)?;
         let location = connection.location().clone();
 
         connection.with_write_owner_fence(TestFailure::from, || {
