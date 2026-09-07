@@ -9423,6 +9423,8 @@ pub enum WorkspaceCommand {
     Alias(WorkspaceAliasArgs),
     /// Report dirty-path hygiene and commit-readiness guidance.
     Hygiene(WorkspaceHygieneArgs),
+    /// Adopt an explicitly verified workspace memory scope without rewriting memory rows.
+    Adopt(WorkspaceMemoryScopeAdoptArgs),
 }
 
 /// Arguments for `ee workspace resolve`.
@@ -9484,6 +9486,30 @@ pub struct WorkspaceAliasArgs {
     pub clear: bool,
 
     /// Report the alias change without writing the registry.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub dry_run: bool,
+}
+
+/// Arguments for `ee workspace adopt`.
+#[derive(Clone, Debug, Eq, Parser, PartialEq)]
+pub struct WorkspaceMemoryScopeAdoptArgs {
+    /// Existing workspace ID whose memories were verified as the same logical store.
+    #[arg(value_name = "WORKSPACE_ID")]
+    pub workspace_id: String,
+
+    /// Human-readable operator rationale for the explicit scope adoption.
+    #[arg(long, required = true, value_name = "TEXT")]
+    pub reason: String,
+
+    /// Metadata-only identity proof hash recorded with the adoption.
+    #[arg(long = "evidence-hash", required = true, value_name = "HASH")]
+    pub evidence_hash: String,
+
+    /// Override the database path. Defaults to <workspace>/.ee/ee.db.
+    #[arg(long, value_name = "PATH")]
+    pub database: Option<PathBuf>,
+
+    /// Report the adoption without writing the audit chain.
     #[arg(long, action = ArgAction::SetTrue)]
     pub dry_run: bool,
 }
@@ -21170,6 +21196,21 @@ where
                 Err(error) => write_domain_error(&error, cli.wants_json(), stdout, stderr),
             }
         }
+        WorkspaceCommand::Adopt(args) => {
+            let options = workspace_core::WorkspaceMemoryScopeAdoptionOptions {
+                workspace_path: Some(cli.resolve_workspace()),
+                database_path: args.database.clone(),
+                adopted_workspace_id: args.workspace_id.clone(),
+                reason: args.reason.clone(),
+                evidence_hash: args.evidence_hash.clone(),
+                dry_run: args.dry_run,
+                actor: Some("ee-cli".to_owned()),
+            };
+            match workspace_core::adopt_workspace_memory_scope(&options) {
+                Ok(report) => render_workspace_memory_scope_adoption(cli, &report, stdout),
+                Err(error) => write_domain_error(&error, cli.wants_json(), stdout, stderr),
+            }
+        }
         WorkspaceCommand::Hygiene(args) => {
             let options = workspace_core::WorkspaceHygieneOptions {
                 workspace_path: cli.resolve_workspace(),
@@ -21284,6 +21325,42 @@ where
                 "workspace_alias: status={} alias={} persisted={}\n",
                 report.status,
                 report.alias.as_deref().unwrap_or("-"),
+                report.persisted
+            ),
+        ),
+        output::Renderer::Json
+        | output::Renderer::Jsonl
+        | output::Renderer::Compact
+        | output::Renderer::Hook => write_stdout(stdout, &(workspace_response_json(report) + "\n")),
+    }
+}
+
+fn render_workspace_memory_scope_adoption<W>(
+    cli: &Cli,
+    report: &workspace_core::WorkspaceMemoryScopeAdoptionReport,
+    stdout: &mut W,
+) -> ProcessExitCode
+where
+    W: Write,
+{
+    match cli.renderer() {
+        output::Renderer::Human | output::Renderer::Markdown => write_stdout(
+            stdout,
+            &format!(
+                "Workspace memory scope {}: {} adopts {} ({} live memories in scope)\n",
+                report.status,
+                report.owner_workspace_id,
+                report.adopted_workspace_id,
+                report.scoped_live_memory_count
+            ),
+        ),
+        output::Renderer::Toon => write_stdout(
+            stdout,
+            &format!(
+                "workspace_adopt: status={} owner={} adopted={} persisted={}\n",
+                report.status,
+                report.owner_workspace_id,
+                report.adopted_workspace_id,
                 report.persisted
             ),
         ),
@@ -43939,6 +44016,23 @@ where
     let post_version = conn.schema_version().unwrap_or(None);
     let applied: Vec<u32> = result.applied().to_vec();
     let skipped: Vec<u32> = result.skipped().to_vec();
+    // Register the post-migration workspace before the derived-index audit.
+    // The audit row has a foreign key to workspaces; a legacy database can
+    // be migrated from an unregistered path and otherwise fails after the
+    // schema migration has already committed. Dry-run remains read-only.
+    if !applied.is_empty() {
+        let canonical_workspace = workspace_path
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_path.clone());
+        if let Err(error) = crate::core::workspace::ensure_bound_workspace(
+            &conn,
+            &crate::core::workspace::stable_workspace_id(&canonical_workspace),
+            &[canonical_workspace.as_path(), workspace_path.as_path()],
+        ) {
+            return write_domain_error(&error, cli.wants_json(), stdout, stderr);
+        }
+    }
+
     let post_migration_index_rebuild = match run_post_migration_index_rebuild(
         &conn,
         &workspace_path,
@@ -67494,6 +67588,7 @@ impl NormalizedInvocation {
                     WorkspaceCommand::Resolve(_) => "workspace resolve".to_string(),
                     WorkspaceCommand::List(_) => "workspace list".to_string(),
                     WorkspaceCommand::Alias(_) => "workspace alias".to_string(),
+                    WorkspaceCommand::Adopt(_) => "workspace adopt".to_string(),
                     WorkspaceCommand::Hygiene(_) => "workspace hygiene".to_string(),
                 },
                 Command::Workflow(workflow) => match workflow {
@@ -70675,6 +70770,73 @@ mod tests {
             "stderr output exceeded",
             "oversized stderr error",
         )
+    }
+
+    #[test]
+    fn migrate_run_registers_unbound_workspace_before_index_audit() -> TestResult {
+        let workspace = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let database_path = workspace.path().join(".ee").join("ee.db");
+        seed_legacy_v011_database(workspace.path())?;
+
+        // Keep a valid legacy workspace row, but make its stored path unrelated
+        // to the CLI workspace so the migration target is genuinely unregistered.
+        let connection = crate::db::DbConnection::open_file(&database_path)
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute_raw("UPDATE workspaces SET path = '/tmp/ee-unbound-migration-source'")
+            .map_err(|error| error.to_string())?;
+        connection.close().map_err(|error| error.to_string())?;
+
+        let workspace_arg = workspace.path().to_string_lossy().into_owned();
+        let (exit, stdout, stderr) = invoke(&[
+            "ee",
+            "--json",
+            "--workspace",
+            workspace_arg.as_str(),
+            "migrate",
+            "run",
+        ]);
+        ensure_equal(&exit, &ProcessExitCode::Success, "unbound migration exit")?;
+        ensure(stderr.is_empty(), "unbound migration stderr clean")?;
+        let response: serde_json::Value =
+            serde_json::from_str(&stdout).map_err(|error| error.to_string())?;
+        ensure_equal(
+            &response["success"],
+            &serde_json::json!(true),
+            "unbound migration response succeeds",
+        )?;
+        ensure(
+            response["data"]["postMigrationIndexRebuild"]["auditId"].is_string(),
+            "unbound migration emits an index rebuild audit id",
+        )?;
+
+        let connection = crate::db::DbConnection::open_file(&database_path)
+            .map_err(|error| error.to_string())?;
+        let canonical = workspace
+            .path()
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let row = connection
+            .get_workspace_by_path(&canonical.display().to_string())
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "migration target workspace was not registered".to_owned())?;
+        let expected_id = crate::core::workspace::stable_workspace_id(&canonical);
+        ensure_equal(&row.id, &expected_id, "registered migration workspace id")?;
+        let audits = connection
+            .list_audit_by_target(
+                "migration",
+                super::POST_MIGRATION_INDEX_REBUILD_STEP_ID,
+                Some(8),
+            )
+            .map_err(|error| error.to_string())?;
+        ensure(
+            audits
+                .iter()
+                .any(|audit| audit.workspace_id.as_deref() == Some(row.id.as_str())),
+            "migration index audit references the registered workspace",
+        )?;
+        connection.close().map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     #[test]

@@ -656,6 +656,12 @@ impl RememberPolicyBypassReport {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RememberCreateIdempotency<'a> {
+    idempotency_key: &'a str,
+    content_hash: &'a str,
+}
+
 /// Create a manual memory and publish its single-document index job.
 ///
 /// Dry-run mode validates and returns the canonical record shape without
@@ -664,7 +670,7 @@ pub fn remember_memory(
     options: &RememberMemoryOptions<'_>,
 ) -> Result<RememberMemoryReport, DomainError> {
     let mut id_source = RememberIdSource::Ambient;
-    remember_memory_inner(options, &mut id_source, None, false, &[], None)
+    remember_memory_inner(options, &mut id_source, None, false, &[], None, None)
 }
 
 /// [`remember_memory`] with the search-index publish optionally deferred
@@ -676,6 +682,22 @@ fn remember_memory_with_index_mode(
     typed_field_assignments: &[String],
     attempt_family: Option<&RememberAttemptFamily<'_>>,
 ) -> Result<RememberMemoryReport, DomainError> {
+    remember_memory_with_index_mode_and_idempotency(
+        options,
+        defer_index_processing,
+        typed_field_assignments,
+        attempt_family,
+        None,
+    )
+}
+
+fn remember_memory_with_index_mode_and_idempotency(
+    options: &RememberMemoryOptions<'_>,
+    defer_index_processing: bool,
+    typed_field_assignments: &[String],
+    attempt_family: Option<&RememberAttemptFamily<'_>>,
+    create_idempotency: Option<RememberCreateIdempotency<'_>>,
+) -> Result<RememberMemoryReport, DomainError> {
     let mut id_source = RememberIdSource::Ambient;
     remember_memory_inner(
         options,
@@ -684,6 +706,7 @@ fn remember_memory_with_index_mode(
         defer_index_processing,
         typed_field_assignments,
         attempt_family,
+        create_idempotency,
     )
 }
 
@@ -692,7 +715,7 @@ pub fn remember_memory_seeded(
     determinism: &mut Deterministic<Seed>,
 ) -> Result<RememberMemoryReport, DomainError> {
     let mut id_source = RememberIdSource::Seeded(determinism);
-    remember_memory_inner(options, &mut id_source, None, false, &[], None)
+    remember_memory_inner(options, &mut id_source, None, false, &[], None, None)
 }
 
 /// Build a dry-run-first memory candidate from a git commit or diff.
@@ -1404,6 +1427,7 @@ fn remember_memory_inner(
     defer_index_processing: bool,
     typed_field_assignments: &[String],
     attempt_family: Option<&RememberAttemptFamily<'_>>,
+    create_idempotency: Option<RememberCreateIdempotency<'_>>,
 ) -> Result<RememberMemoryReport, DomainError> {
     validate_remember_level_kind_cross_wire(options.level, options.kind)?;
     remember_memory_inner_with_store(
@@ -1414,6 +1438,7 @@ fn remember_memory_inner(
         None,
         typed_field_assignments,
         attempt_family,
+        create_idempotency,
     )
 }
 
@@ -1425,6 +1450,7 @@ fn remember_memory_inner_with_store(
     store_override: Option<&RememberStoreOverride>,
     typed_field_assignments: &[String],
     attempt_family: Option<&RememberAttemptFamily<'_>>,
+    create_idempotency: Option<RememberCreateIdempotency<'_>>,
 ) -> Result<RememberMemoryReport, DomainError> {
     let mut prepared = prepare_remember_memory_with_store(
         options,
@@ -1490,6 +1516,16 @@ fn remember_memory_inner_with_store(
     prepared.workspace_id = workspace_id;
 
     let memory_id = prepared.memory_id.to_string();
+    let idempotency_input = create_idempotency.map(|identity| CreateRememberIdempotencyKeyInput {
+        workspace_id: prepared.workspace_id.clone(),
+        idempotency_key: identity.idempotency_key.to_owned(),
+        content_hash: identity.content_hash.to_owned(),
+        memory_id: memory_id.clone(),
+    });
+    let replay_content_hash = create_idempotency.map_or_else(
+        || remember_content_hash(&prepared.content),
+        |identity| identity.content_hash.to_owned(),
+    );
     let audit_id = id_source.next_audit_id();
     let policy_bypass_audit_id = prepared
         .policy_bypass
@@ -1591,7 +1627,12 @@ fn remember_memory_inner_with_store(
         .link
         .as_ref()
         .map(|_| generate_memory_link_id());
-    let mut write_replay_guard = RememberWriteReplayGuard::arm(&prepared.workspace_path)?;
+    let mut write_replay_guard = RememberWriteReplayGuard::arm(
+        &prepared.workspace_path,
+        &memory_id,
+        create_idempotency.map(|identity| identity.idempotency_key),
+        &replay_content_hash,
+    )?;
     crate::core::write_owner::run_one_shot_write_intake(
         &prepared.workspace_path,
         &write_operation,
@@ -1609,7 +1650,7 @@ fn remember_memory_inner_with_store(
                 &audit_details,
                 &index_input,
                 policy_bypass.as_ref(),
-                audit_lane,
+                idempotency_input.as_ref(),
             )
         },
     )?;
@@ -3147,12 +3188,24 @@ struct RememberWriteReplayGuard {
 }
 
 impl RememberWriteReplayGuard {
-    fn arm(workspace_path: &Path) -> Result<Self, DomainError> {
-        super::write_owner::mark_write_replay_required(workspace_path).map_err(|error| {
-            DomainError::Storage {
-                message: format!("Failed to record write-spool recovery marker: {error}"),
-                repair: Some("ee doctor --json".to_owned()),
-            }
+    fn arm(
+        workspace_path: &Path,
+        memory_id: &str,
+        idempotency_key: Option<&str>,
+        content_hash: &str,
+    ) -> Result<Self, DomainError> {
+        let marker_result = match idempotency_key {
+            Some(idempotency_key) => crate::core::write_owner::mark_remember_write_replay_required(
+                workspace_path,
+                memory_id,
+                Some(idempotency_key),
+                content_hash,
+            ),
+            None => crate::core::write_owner::mark_write_replay_required(workspace_path),
+        };
+        marker_result.map_err(|error| DomainError::Storage {
+            message: format!("Failed to record write-spool recovery marker: {error}"),
+            repair: Some("ee doctor --json".to_owned()),
         })?;
         Ok(Self {
             workspace_path: workspace_path.to_path_buf(),
@@ -3174,7 +3227,11 @@ impl RememberWriteReplayGuard {
 
 impl Drop for RememberWriteReplayGuard {
     fn drop(&mut self) {
-        if self.armed {
+        // A normal returned error has already unwound the authoritative
+        // transaction and may clear the marker. A panic is commit-ambiguous:
+        // preserve the marker so the next exact idempotent retry can reconcile
+        // durable state rather than silently claiming the write was clean.
+        if self.armed && !std::thread::panicking() {
             let _ = super::write_owner::mark_write_replay_clean(&self.workspace_path);
         }
     }
@@ -4634,7 +4691,12 @@ pub(crate) fn prepare_remember_txn_write_for_connection(
         });
     }
     crate::core::ensure_addressed_database_exists(&prepared.database_path)?;
-    let write_replay_guard = RememberWriteReplayGuard::arm(&prepared.workspace_path)?;
+    let write_replay_guard = RememberWriteReplayGuard::arm(
+        &prepared.workspace_path,
+        &prepared.memory_id.to_string(),
+        None,
+        &remember_content_hash(&prepared.content),
+    )?;
     migrate_remember_database_with_retry(connection)?;
     let workspace_id = crate::core::workspace::ensure_bound_workspace(
         connection,
@@ -4695,7 +4757,7 @@ fn record_remembered_memory_in_txn(
     audit_details: &str,
     index_input: &CreateSearchIndexJobInput,
     policy_bypass: Option<&RememberPolicyBypassReport>,
-    audit_lane: Option<&AuditLaneHandle>,
+    idempotency_input: Option<&CreateRememberIdempotencyKeyInput>,
 ) -> crate::db::Result<()> {
     match embed_dedup_decision.content_simhash {
         Some(content_simhash) => connection.insert_memory_with_content_simhash(
@@ -4729,16 +4791,16 @@ fn record_remembered_memory_in_txn(
             },
         )?;
     }
-    if audit_lane.is_none() {
-        emit_remember_audit_events(
-            connection,
-            None,
-            memory_id,
-            audit_id,
-            memory_input,
-            audit_details,
-            policy_bypass,
-        )?;
+    emit_remember_audit_events(
+        connection,
+        memory_id,
+        audit_id,
+        memory_input,
+        audit_details,
+        policy_bypass,
+    )?;
+    if let Some(idempotency_input) = idempotency_input {
+        connection.insert_remember_idempotency_key(idempotency_input)?;
     }
     connection.insert_search_index_job(index_job_id, index_input)
 }
@@ -4760,7 +4822,7 @@ fn store_remembered_memory_with_retry(
     audit_details: &str,
     index_input: &CreateSearchIndexJobInput,
     policy_bypass: Option<&RememberPolicyBypassReport>,
-    audit_lane: Option<&AuditLaneHandle>,
+    idempotency_input: Option<&CreateRememberIdempotencyKeyInput>,
 ) -> Result<(), DomainError> {
     for attempt in 0..REMEMBER_CONTENTION_MAX_ATTEMPTS {
         match connection.with_transaction(|| {
@@ -4777,25 +4839,10 @@ fn store_remembered_memory_with_retry(
                 audit_details,
                 index_input,
                 policy_bypass,
-                audit_lane,
+                idempotency_input,
             )
         }) {
             Ok(()) => {
-                if let Some(audit_lane) = audit_lane {
-                    emit_remember_audit_events(
-                        connection,
-                        Some(audit_lane),
-                        memory_id,
-                        audit_id,
-                        memory_input,
-                        audit_details,
-                        policy_bypass,
-                    )
-                    .map_err(|error| DomainError::Storage {
-                        message: format!("Failed to emit remember audit event: {error}"),
-                        repair: Some("ee doctor".to_owned()),
-                    })?;
-                }
                 return Ok(());
             }
             Err(error) if remember_write_contention_is_retryable(&error) => {
@@ -4807,7 +4854,11 @@ fn store_remembered_memory_with_retry(
                         "failed to rollback transaction after write contention"
                     );
                 }
-                if memory_exists_after_commit_ambiguity(connection, memory_id)? {
+                if authoritative_remember_write_exists_after_commit_ambiguity(
+                    connection,
+                    memory_id,
+                    idempotency_input,
+                )? {
                     return Ok(());
                 }
                 if attempt + 1 < REMEMBER_CONTENTION_MAX_ATTEMPTS {
@@ -5299,7 +5350,6 @@ fn trace_remember_embed_dedup_decision(
 
 fn emit_remember_audit_events(
     connection: &DbConnection,
-    audit_lane: Option<&AuditLaneHandle>,
     memory_id: &str,
     audit_id: &str,
     memory_input: &CreateMemoryInput,
@@ -5315,7 +5365,7 @@ fn emit_remember_audit_events(
         details: Some(audit_details.to_owned()),
     };
     emit_with_direct_fallback(
-        audit_lane,
+        None,
         AuditLaneEvent::from_audit_input(audit_id, 1, &memory_audit),
         |event| insert_audit_event(connection, event),
     )?;
@@ -5330,7 +5380,7 @@ fn emit_remember_audit_events(
                 details: Some(policy_bypass_audit_details(policy_bypass)),
             };
             emit_with_direct_fallback(
-                audit_lane,
+                None,
                 AuditLaneEvent::from_audit_input(policy_audit_id, 2, &policy_audit),
                 |event| insert_audit_event(connection, event),
             )?;
@@ -5339,17 +5389,39 @@ fn emit_remember_audit_events(
     Ok(())
 }
 
-fn memory_exists_after_commit_ambiguity(
+fn authoritative_remember_write_exists_after_commit_ambiguity(
     connection: &DbConnection,
     memory_id: &str,
+    idempotency_input: Option<&CreateRememberIdempotencyKeyInput>,
 ) -> Result<bool, DomainError> {
-    connection
+    let memory_exists = connection
         .get_memory(memory_id)
         .map(|memory| memory.is_some())
         .map_err(|error| DomainError::Storage {
             message: format!("Failed to query memory after write contention: {error}"),
             repair: Some("ee doctor".to_string()),
-        })
+        })?;
+    if !memory_exists {
+        return Ok(false);
+    }
+    let Some(idempotency_input) = idempotency_input else {
+        return Ok(true);
+    };
+    let stored = connection
+        .get_remember_idempotency_key(
+            &idempotency_input.workspace_id,
+            &idempotency_input.idempotency_key,
+        )
+        .map_err(|error| DomainError::Storage {
+            message: format!(
+                "Failed to query idempotency identity after write contention: {error}"
+            ),
+            repair: Some("ee doctor --json".to_string()),
+        })?;
+    Ok(stored.is_some_and(|stored| {
+        stored.content_hash == idempotency_input.content_hash
+            && stored.memory_id == idempotency_input.memory_id
+    }))
 }
 
 fn remember_write_contention_is_retryable(error: &impl ToString) -> bool {
@@ -6977,6 +7049,7 @@ const REMEMBER_REINFORCE_HAMMING_K: u32 = 32;
 /// evidence spans (`evidence_spans.session_id` is NOT NULL).
 const REMEMBER_REINFORCE_SESSION_KEY: &str = "ee-remember-reinforce";
 const REMEMBER_IDEMPOTENCY_KEY_MAX_BYTES: usize = 128;
+const REMEMBER_IDEMPOTENCY_RECOVER_AUDIT_ACTION: &str = "memory.idempotency_recover";
 
 /// Write-control toggles layered over [`RememberMemoryOptions`] (bd-1pi9m.4).
 #[derive(Clone, Copy, Debug, Default)]
@@ -7656,6 +7729,598 @@ fn apply_remember_reinforce(
     })
 }
 
+fn remember_existing_idempotency_outcome(
+    connection: &DbConnection,
+    workspace_path: &Path,
+    database_path: &Path,
+    workspace_id: &str,
+    idempotency_key: &str,
+    content_hash: &str,
+    dry_run: bool,
+) -> Result<Option<RememberOutcome>, DomainError> {
+    let existing = connection
+        .get_remember_idempotency_key(workspace_id, idempotency_key)
+        .map_err(|error| DomainError::Storage {
+            message: format!("Failed to look up idempotency key: {error}"),
+            repair: Some("ee doctor --json".to_owned()),
+        })?;
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    if existing.content_hash != content_hash {
+        return Err(remember_idempotency_conflict_error(idempotency_key));
+    }
+    let memory_exists = connection
+        .get_memory(&existing.memory_id)
+        .map_err(|error| DomainError::Storage {
+            message: format!(
+                "Failed to verify memory {} referenced by idempotency key: {error}",
+                existing.memory_id
+            ),
+            repair: Some("ee doctor --json".to_owned()),
+        })?
+        .is_some();
+    if !memory_exists {
+        return Err(DomainError::Storage {
+            message: format!(
+                "Idempotency key `{idempotency_key}` references missing memory {}",
+                existing.memory_id
+            ),
+            repair: Some("ee doctor --json".to_owned()),
+        });
+    }
+
+    if !dry_run
+        && super::write_owner::workspace_write_replay_matches_remember(
+            workspace_path,
+            &existing.memory_id,
+            idempotency_key,
+            content_hash,
+        )
+    {
+        let _workspace_write_lock = acquire_remember_workspace_lock(
+            connection,
+            workspace_id,
+            &format!("replay-{}", existing.memory_id),
+        )?;
+        let current = connection
+            .get_remember_idempotency_key(workspace_id, idempotency_key)
+            .map_err(|error| DomainError::Storage {
+                message: format!("Failed to recheck idempotency key under lock: {error}"),
+                repair: Some("ee doctor --json".to_owned()),
+            })?
+            .ok_or_else(|| DomainError::Storage {
+                message: format!(
+                    "Idempotency key `{idempotency_key}` disappeared during replay reconciliation"
+                ),
+                repair: Some("ee doctor --json".to_owned()),
+            })?;
+        if current.content_hash != content_hash {
+            return Err(remember_idempotency_conflict_error(idempotency_key));
+        }
+        if current.memory_id != existing.memory_id {
+            return Err(DomainError::Storage {
+                message: format!(
+                    "Idempotency key `{idempotency_key}` changed memory identity during reconciliation"
+                ),
+                repair: Some("ee doctor --json".to_owned()),
+            });
+        }
+        if super::write_owner::workspace_write_replay_matches_remember(
+            workspace_path,
+            &current.memory_id,
+            idempotency_key,
+            content_hash,
+        ) {
+            super::write_owner::mark_write_replay_clean(workspace_path).map_err(|error| {
+                DomainError::Storage {
+                    message: format!(
+                        "Committed idempotent memory {} was recovered, but clearing its replay marker failed: {error}",
+                        current.memory_id
+                    ),
+                    repair: Some("ee doctor --json".to_owned()),
+                }
+            })?;
+        }
+    }
+
+    Ok(Some(RememberOutcome::AlreadyRecorded(
+        RememberAlreadyRecordedReport {
+            version: env!("CARGO_PKG_VERSION"),
+            workspace_id: workspace_id.to_owned(),
+            database_path: database_path.to_path_buf(),
+            memory_id: existing.memory_id,
+            idempotency_key: existing.idempotency_key,
+            dry_run,
+        },
+    )))
+}
+
+/// Stable schema for proof-driven replay-marker reconciliation.
+pub const REMEMBER_WRITE_RECOVERY_RECONCILE_SCHEMA_V1: &str =
+    "ee.remember.write_recovery_reconcile.v1";
+
+/// A replay marker exists but does not carry a canonical exact remember identity.
+pub const REMEMBER_WRITE_RECOVERY_UNSUPPORTED_MARKER_CODE: &str =
+    "remember_write_recovery_unsupported_marker";
+
+/// The durable memory and idempotency ledger do not prove the marked operation.
+pub const REMEMBER_WRITE_RECOVERY_UNPROVEN_CODE: &str = "remember_write_recovery_unproven";
+
+/// The marker changed while the workspace write lock was being acquired.
+pub const REMEMBER_WRITE_RECOVERY_MARKER_CHANGED_CODE: &str =
+    "remember_write_recovery_marker_changed";
+
+/// Options for proving and optionally clearing one committed remember marker.
+#[derive(Clone, Copy, Debug)]
+pub struct RememberWriteRecoveryReconcileOptions<'a> {
+    pub workspace_path: &'a Path,
+    pub database_path: Option<&'a Path>,
+    pub dry_run: bool,
+}
+
+/// Result of a proof-driven replay-marker reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RememberWriteRecoveryReconcileReport {
+    pub version: &'static str,
+    pub workspace_id: String,
+    pub workspace_path: PathBuf,
+    pub database_path: PathBuf,
+    pub marker_path: PathBuf,
+    pub status: &'static str,
+    pub marker_present: bool,
+    pub reconciled: bool,
+    pub durable_mutation: bool,
+    pub memory_id: Option<String>,
+    pub content_hash: Option<String>,
+    pub idempotency_key_hash: Option<String>,
+    pub matching_identity_count: usize,
+    pub memory_content_hash_verified: bool,
+    pub idempotency_identity_verified: bool,
+    pub marker_stable_under_lock: bool,
+    pub dry_run: bool,
+}
+
+impl RememberWriteRecoveryReconcileReport {
+    #[must_use]
+    pub fn data_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schema": REMEMBER_WRITE_RECOVERY_RECONCILE_SCHEMA_V1,
+            "command": "maintenance reconcile-write-recovery",
+            "version": self.version,
+            "workspace": self.workspace_path.display().to_string(),
+            "workspaceId": &self.workspace_id,
+            "databasePath": self.database_path.display().to_string(),
+            "markerPath": self.marker_path.display().to_string(),
+            "status": self.status,
+            "markerPresent": self.marker_present,
+            "reconciled": self.reconciled,
+            "durableMutation": self.durable_mutation,
+            "memoryId": &self.memory_id,
+            "contentHash": &self.content_hash,
+            "idempotencyKeyHash": &self.idempotency_key_hash,
+            "matchingIdentityCount": self.matching_identity_count,
+            "memoryContentHashVerified": self.memory_content_hash_verified,
+            "idempotencyIdentityVerified": self.idempotency_identity_verified,
+            "markerStableUnderLock": self.marker_stable_under_lock,
+            "dryRun": self.dry_run,
+            "summary": {
+                "total": 1,
+                "succeeded": usize::from(self.reconciled || !self.marker_present),
+                "skipped": usize::from(self.dry_run || !self.marker_present),
+                "failed": 0,
+            },
+            "next": if self.marker_present && self.dry_run {
+                "ee maintenance reconcile-write-recovery --workspace . --json"
+            } else {
+                "ee status --workspace . --json"
+            },
+        })
+    }
+}
+
+fn remember_write_recovery_unproven(message: String) -> DomainError {
+    DomainError::UnsatisfiedDegradedModeCode {
+        code: REMEMBER_WRITE_RECOVERY_UNPROVEN_CODE,
+        message,
+        repair: Some(
+            "Preserve the marker and inspect `ee db check --full --json`, the exact memory, and `remember_idempotency_keys` before any manual recovery."
+                .to_owned(),
+        ),
+    }
+}
+
+fn committed_remember_recovery_identity_count(
+    connection: &DbConnection,
+    workspace_id: &str,
+    identity: &super::write_owner::RememberWriteReplayIdentity,
+) -> Result<usize, DomainError> {
+    let memory = connection
+        .get_memory(&identity.memory_id)
+        .map_err(|error| DomainError::Storage {
+            message: format!(
+                "Failed to inspect replay-marker memory {}: {error}",
+                identity.memory_id
+            ),
+            repair: Some("ee db check --full --json".to_owned()),
+        })?
+        .ok_or_else(|| {
+            remember_write_recovery_unproven(format!(
+                "Replay-marker memory {} is absent from the authoritative database",
+                identity.memory_id
+            ))
+        })?;
+    if memory.workspace_id != workspace_id || memory.tombstoned_at.is_some() {
+        return Err(remember_write_recovery_unproven(format!(
+            "Replay-marker memory {} is not a live memory in the selected workspace",
+            identity.memory_id
+        )));
+    }
+    let stored_content_hash = remember_content_hash(&memory.content);
+    if stored_content_hash != identity.content_hash {
+        return Err(remember_write_recovery_unproven(format!(
+            "Replay-marker content hash does not match committed memory {}",
+            identity.memory_id
+        )));
+    }
+
+    let identities = connection
+        .list_remember_idempotency_keys_for_memory(workspace_id, &identity.memory_id)
+        .map_err(|error| DomainError::Storage {
+            message: format!(
+                "Failed to inspect idempotency identities for memory {}: {error}",
+                identity.memory_id
+            ),
+            repair: Some("ee db check --full --json".to_owned()),
+        })?;
+    let matching = identities
+        .iter()
+        .filter(|stored| {
+            stored.workspace_id == workspace_id
+                && stored.memory_id == identity.memory_id
+                && stored.content_hash == identity.content_hash
+                && format!(
+                    "blake3:{}",
+                    blake3::hash(stored.idempotency_key.as_bytes()).to_hex()
+                ) == identity.idempotency_key_hash
+        })
+        .count();
+    if matching != 1 {
+        return Err(remember_write_recovery_unproven(format!(
+            "Replay-marker identity for memory {} matched {matching} committed idempotency rows; exactly one is required",
+            identity.memory_id
+        )));
+    }
+    Ok(matching)
+}
+
+/// Prove that an operation-scoped remember marker names an already committed
+/// memory/idempotency transaction and clear only that exact stale marker.
+///
+/// This command never creates, revises, tombstones, links, indexes, or audits a
+/// memory. Legacy and malformed markers remain blocked. The marker is re-read
+/// after acquiring the same workspace advisory lock used by `ee remember`, and
+/// the database evidence is verified again immediately before durable cleanup.
+pub fn reconcile_committed_remember_write_recovery(
+    options: &RememberWriteRecoveryReconcileOptions<'_>,
+) -> Result<RememberWriteRecoveryReconcileReport, DomainError> {
+    let workspace_path = resolve_workspace_path(options.workspace_path, false)?;
+    let database_path = options
+        .database_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| workspace_path.join(".ee").join("ee.db"));
+    let workspace_id = stable_workspace_id(&workspace_path);
+    let marker_path = super::write_owner::write_spool_recovery_state_path(&workspace_path);
+    if !super::write_owner::workspace_write_replay_required(&workspace_path) {
+        return Ok(RememberWriteRecoveryReconcileReport {
+            version: env!("CARGO_PKG_VERSION"),
+            workspace_id,
+            workspace_path,
+            database_path,
+            marker_path,
+            status: "not_required",
+            marker_present: false,
+            reconciled: false,
+            durable_mutation: false,
+            memory_id: None,
+            content_hash: None,
+            idempotency_key_hash: None,
+            matching_identity_count: 0,
+            memory_content_hash_verified: false,
+            idempotency_identity_verified: false,
+            marker_stable_under_lock: true,
+            dry_run: options.dry_run,
+        });
+    }
+    let identity = super::write_owner::remember_write_replay_identity(&workspace_path)
+        .ok_or_else(|| DomainError::UnsatisfiedDegradedModeCode {
+            code: REMEMBER_WRITE_RECOVERY_UNSUPPORTED_MARKER_CODE,
+            message: "Replay-required state is legacy, malformed, or lacks a canonical exact idempotent remember identity"
+                .to_owned(),
+            repair: Some(
+                "Preserve the marker and perform explicit operator recovery with verified DB/WAL evidence."
+                    .to_owned(),
+            ),
+        })?;
+    MemoryId::from_str(&identity.memory_id)
+        .map_err(|error| remember_write_recovery_unproven(error.to_string()))?;
+    if !database_path.exists() {
+        return Err(DomainError::Storage {
+            message: format!(
+                "Cannot reconcile write recovery because database {} does not exist",
+                database_path.display()
+            ),
+            repair: Some("Select the workspace containing the committed memory.".to_owned()),
+        });
+    }
+
+    let connection = open_remember_database_with_retry(&database_path)?;
+    migrate_remember_database_with_retry(&connection)?;
+    let _workspace_write_lock =
+        acquire_remember_workspace_lock(&connection, &workspace_id, &identity.memory_id)?;
+    let locked_identity = super::write_owner::remember_write_replay_identity(&workspace_path)
+        .ok_or_else(|| DomainError::UnsatisfiedDegradedModeCode {
+            code: REMEMBER_WRITE_RECOVERY_MARKER_CHANGED_CODE,
+            message: "Replay marker changed or became unreadable while acquiring the workspace write lock"
+                .to_owned(),
+            repair: Some("Retry after the active writer completes, then inspect `ee status --json`.".to_owned()),
+        })?;
+    if locked_identity != identity {
+        return Err(DomainError::UnsatisfiedDegradedModeCode {
+            code: REMEMBER_WRITE_RECOVERY_MARKER_CHANGED_CODE,
+            message: "Replay marker identity changed while acquiring the workspace write lock"
+                .to_owned(),
+            repair: Some(
+                "Retry after the active writer completes, then inspect `ee status --json`."
+                    .to_owned(),
+            ),
+        });
+    }
+    let matching_identity_count =
+        committed_remember_recovery_identity_count(&connection, &workspace_id, &identity)?;
+    if options.dry_run {
+        return Ok(RememberWriteRecoveryReconcileReport {
+            version: env!("CARGO_PKG_VERSION"),
+            workspace_id,
+            workspace_path,
+            database_path,
+            marker_path,
+            status: "would_reconcile",
+            marker_present: true,
+            reconciled: false,
+            durable_mutation: false,
+            memory_id: Some(identity.memory_id),
+            content_hash: Some(identity.content_hash),
+            idempotency_key_hash: Some(identity.idempotency_key_hash),
+            matching_identity_count,
+            memory_content_hash_verified: true,
+            idempotency_identity_verified: true,
+            marker_stable_under_lock: true,
+            dry_run: true,
+        });
+    }
+
+    let final_identity = super::write_owner::remember_write_replay_identity(&workspace_path)
+        .ok_or_else(|| DomainError::UnsatisfiedDegradedModeCode {
+            code: REMEMBER_WRITE_RECOVERY_MARKER_CHANGED_CODE,
+            message: "Replay marker changed immediately before reconciliation".to_owned(),
+            repair: Some(
+                "Retry after the active writer completes, then inspect `ee status --json`."
+                    .to_owned(),
+            ),
+        })?;
+    if final_identity != identity {
+        return Err(DomainError::UnsatisfiedDegradedModeCode {
+            code: REMEMBER_WRITE_RECOVERY_MARKER_CHANGED_CODE,
+            message: "Replay marker identity changed immediately before reconciliation".to_owned(),
+            repair: Some(
+                "Retry after the active writer completes, then inspect `ee status --json`."
+                    .to_owned(),
+            ),
+        });
+    }
+    let final_matching_identity_count =
+        committed_remember_recovery_identity_count(&connection, &workspace_id, &identity)?;
+    if final_matching_identity_count != matching_identity_count {
+        return Err(remember_write_recovery_unproven(format!(
+            "Committed recovery evidence changed from {matching_identity_count} to {final_matching_identity_count} matching rows"
+        )));
+    }
+    super::write_owner::mark_write_replay_clean(&workspace_path).map_err(|error| {
+        DomainError::Storage {
+            message: format!(
+                "Committed remember identity was proven, but the replay marker could not be cleared: {error}"
+            ),
+            repair: Some("Retry `ee maintenance reconcile-write-recovery --json`.".to_owned()),
+        }
+    })?;
+    if super::write_owner::workspace_write_replay_required(&workspace_path) {
+        return Err(DomainError::Storage {
+            message: "Replay marker remained required after durable reconciliation".to_owned(),
+            repair: Some(
+                "Inspect `.ee/write-spool/recovery-state.json` and retry recovery.".to_owned(),
+            ),
+        });
+    }
+
+    Ok(RememberWriteRecoveryReconcileReport {
+        version: env!("CARGO_PKG_VERSION"),
+        workspace_id,
+        workspace_path,
+        database_path,
+        marker_path,
+        status: "reconciled",
+        marker_present: true,
+        reconciled: true,
+        durable_mutation: true,
+        memory_id: Some(identity.memory_id),
+        content_hash: Some(identity.content_hash),
+        idempotency_key_hash: Some(identity.idempotency_key_hash),
+        matching_identity_count,
+        memory_content_hash_verified: true,
+        idempotency_identity_verified: true,
+        marker_stable_under_lock: true,
+        dry_run: false,
+    })
+}
+
+pub fn recover_remember_idempotency(
+    options: &RememberMemoryOptions<'_>,
+    raw_idempotency_key: &str,
+    raw_memory_id: &str,
+) -> Result<RememberAlreadyRecordedReport, DomainError> {
+    if options.dry_run {
+        return Err(remember_usage_error(
+            "idempotency recovery cannot be combined with --dry-run".to_owned(),
+        ));
+    }
+    let idempotency_key = validate_remember_idempotency_key(raw_idempotency_key)?;
+    let memory_id = MemoryId::from_str(raw_memory_id)
+        .map_err(|error| remember_usage_error(error.to_string()))?
+        .to_string();
+    let canonical_content = MemoryContent::parse(options.content)
+        .map_err(|error| remember_usage_error(error.to_string()))?
+        .as_str()
+        .to_owned();
+    let content_hash = remember_content_hash(&canonical_content);
+    let workspace_path = resolve_workspace_path(options.workspace_path, false)?;
+    let database_path = options
+        .database_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| workspace_path.join(".ee").join("ee.db"));
+    if !database_path.exists() {
+        return Err(DomainError::Storage {
+            message: format!(
+                "Cannot recover idempotency identity because database {} does not exist",
+                database_path.display()
+            ),
+            repair: Some("Select the workspace containing the committed memory.".to_owned()),
+        });
+    }
+    let workspace_id = stable_workspace_id(&workspace_path);
+    if !super::write_owner::workspace_write_replay_allows_remember_recovery(
+        &workspace_path,
+        &memory_id,
+        &idempotency_key,
+        &content_hash,
+    ) {
+        return Err(remember_usage_error(
+            "idempotency recovery requires a replay-required marker for this exact operation, or a legacy replay marker with no operation payload"
+                .to_owned(),
+        ));
+    }
+
+    let connection = open_remember_database_with_retry(&database_path)?;
+    migrate_remember_database_with_retry(&connection)?;
+    let _workspace_write_lock =
+        acquire_remember_workspace_lock(&connection, &workspace_id, &memory_id)?;
+    if !super::write_owner::workspace_write_replay_allows_remember_recovery(
+        &workspace_path,
+        &memory_id,
+        &idempotency_key,
+        &content_hash,
+    ) {
+        return Err(remember_usage_error(
+            "the replay marker changed while acquiring the workspace recovery lock".to_owned(),
+        ));
+    }
+
+    let memory = connection
+        .get_memory(&memory_id)
+        .map_err(|error| DomainError::Storage {
+            message: format!("Failed to inspect recovery memory {memory_id}: {error}"),
+            repair: Some("ee memory show <memory-id> --json".to_owned()),
+        })?
+        .ok_or_else(|| {
+            remember_usage_error(format!("recovery memory {memory_id} was not found"))
+        })?;
+    if memory.workspace_id != workspace_id || memory.tombstoned_at.is_some() {
+        return Err(remember_usage_error(format!(
+            "recovery memory {memory_id} is not a live memory in the selected workspace"
+        )));
+    }
+    if memory.content != canonical_content {
+        return Err(remember_usage_error(format!(
+            "recovery content does not exactly match memory {memory_id}"
+        )));
+    }
+
+    let existing = connection
+        .get_remember_idempotency_key(&workspace_id, &idempotency_key)
+        .map_err(|error| DomainError::Storage {
+            message: format!("Failed to inspect recovery idempotency key: {error}"),
+            repair: Some("ee doctor --json".to_owned()),
+        })?;
+    match existing {
+        Some(existing)
+            if existing.content_hash == content_hash && existing.memory_id == memory_id => {}
+        Some(_) => return Err(remember_idempotency_conflict_error(&idempotency_key)),
+        None => {
+            let audit_id = generate_audit_id();
+            let idempotency_key_hash = format!(
+                "blake3:{}",
+                blake3::hash(idempotency_key.as_bytes()).to_hex()
+            );
+            let audit_details = serde_json::json!({
+                "schema": "ee.remember.idempotency_recovery.v1",
+                "memoryId": &memory_id,
+                "contentHash": &content_hash,
+                "idempotencyKeyHash": idempotency_key_hash,
+                "markerClass": "replay_required",
+            })
+            .to_string();
+            connection
+                .with_transaction(|| {
+                    connection.insert_remember_idempotency_key(
+                        &CreateRememberIdempotencyKeyInput {
+                            workspace_id: workspace_id.clone(),
+                            idempotency_key: idempotency_key.clone(),
+                            content_hash: content_hash.clone(),
+                            memory_id: memory_id.clone(),
+                        },
+                    )?;
+                    connection.insert_audit(
+                        &audit_id,
+                        &CreateAuditInput {
+                            workspace_id: Some(workspace_id.clone()),
+                            actor: Some("ee remember --recover-memory-id".to_owned()),
+                            action: REMEMBER_IDEMPOTENCY_RECOVER_AUDIT_ACTION.to_owned(),
+                            target_type: Some("memory".to_owned()),
+                            target_id: Some(memory_id.clone()),
+                            details: Some(audit_details.clone()),
+                        },
+                    )
+                })
+                .map_err(|error| DomainError::Storage {
+                    message: format!(
+                        "Failed to recover idempotency identity for memory {memory_id}: {error}"
+                    ),
+                    repair: Some(
+                        "Restore the verified pre-recovery backup and inspect `ee doctor --json`."
+                            .to_owned(),
+                    ),
+                })?;
+        }
+    }
+
+    super::write_owner::mark_write_replay_clean(&workspace_path).map_err(|error| {
+        DomainError::Storage {
+            message: format!(
+                "Recovered idempotency identity for memory {memory_id}, but failed to clear the replay marker: {error}"
+            ),
+            repair: Some("ee doctor --json".to_owned()),
+        }
+    })?;
+    Ok(RememberAlreadyRecordedReport {
+        version: env!("CARGO_PKG_VERSION"),
+        workspace_id,
+        database_path,
+        memory_id,
+        idempotency_key,
+        dry_run: false,
+    })
+}
+
 fn record_remember_idempotency_key(
     report: &RememberMemoryReport,
     idempotency_key: &str,
@@ -7767,29 +8432,19 @@ pub fn remember_memory_with_controls_typed_fields_and_family(
             .unwrap_or_else(|_| stable_workspace_id(&canonical));
 
             if let Some(key) = idempotency_key.as_deref() {
-                let existing = connection
-                    .get_remember_idempotency_key(&workspace_id, key)
-                    .map_err(|error| DomainError::Storage {
-                        message: format!("Failed to look up idempotency key: {error}"),
-                        repair: Some("ee doctor --json".to_owned()),
-                    })?;
-                if let Some(existing) = existing {
-                    if idempotency_request_hash
-                        .as_deref()
-                        .is_some_and(|request_hash| existing.content_hash == request_hash)
-                    {
-                        return Ok(RememberOutcome::AlreadyRecorded(
-                            RememberAlreadyRecordedReport {
-                                version: env!("CARGO_PKG_VERSION"),
-                                workspace_id,
-                                database_path,
-                                memory_id: existing.memory_id,
-                                idempotency_key: existing.idempotency_key,
-                                dry_run: options.dry_run,
-                            },
-                        ));
-                    }
-                    return Err(remember_idempotency_conflict_error(key));
+                let request_hash = idempotency_request_hash.as_deref().ok_or_else(|| {
+                    remember_usage_error("idempotency request hash was not prepared".to_owned())
+                })?;
+                if let Some(outcome) = remember_existing_idempotency_outcome(
+                    &connection,
+                    &workspace_path,
+                    &database_path,
+                    &workspace_id,
+                    key,
+                    request_hash,
+                    options.dry_run,
+                )? {
+                    return Ok(outcome);
                 }
             }
 
@@ -7826,20 +8481,78 @@ pub fn remember_memory_with_controls_typed_fields_and_family(
         }
     }
 
-    let report = remember_memory_with_index_mode(
+    let create_idempotency = match (
+        idempotency_key.as_deref(),
+        idempotency_request_hash.as_deref(),
+    ) {
+        (Some(idempotency_key), Some(content_hash)) => Some(RememberCreateIdempotency {
+            idempotency_key,
+            content_hash,
+        }),
+        _ => None,
+    };
+    let report = match remember_memory_with_index_mode_and_idempotency(
         options,
         controls.defer_index_processing,
         typed_field_assignments,
         attempt_family,
-    )?;
-    if let Some(key) = idempotency_key.as_deref()
-        && !options.dry_run
-    {
-        let request_hash = idempotency_request_hash.as_deref().ok_or_else(|| {
-            remember_usage_error("idempotency request hash was not prepared".to_owned())
-        })?;
-        record_remember_idempotency_key(&report, key, request_hash)?;
-    }
+        create_idempotency,
+    ) {
+        Ok(report) => report,
+        Err(error)
+            if idempotency_key.is_some()
+                && error
+                    .message()
+                    .to_ascii_lowercase()
+                    .contains("unique constraint failed: remember_idempotency_keys") =>
+        {
+            // A concurrent writer can pass the initial lookup before the
+            // workspace write lock is acquired. Its transaction is then
+            // rolled back by the durable idempotency primary-key conflict.
+            // Re-read the winner after rollback and expose the same
+            // already-recorded outcome instead of leaking a storage error.
+            let workspace_path = if options.database_path.is_some() {
+                resolve_workspace_path(options.workspace_path, options.dry_run)?
+            } else {
+                resolve_memory_write_workspace_path(options.workspace_path, options.dry_run)?
+            };
+            let database_path = options
+                .database_path
+                .map(absolute_path_from_cwd)
+                .unwrap_or_else(|| workspace_path.join(".ee").join("ee.db"));
+            let request_hash = idempotency_request_hash.as_deref().ok_or_else(|| {
+                remember_usage_error("idempotency request hash was not prepared".to_owned())
+            })?;
+            let connection = open_remember_database_with_retry(&database_path)?;
+            migrate_remember_database_with_retry(&connection)?;
+            let canonical = workspace_path
+                .canonicalize()
+                .unwrap_or_else(|_| workspace_path.clone());
+            let workspace_id = crate::core::workspace::bound_workspace_id_or_hash(
+                &connection,
+                &stable_workspace_id(&canonical),
+                &[
+                    options.workspace_path,
+                    workspace_path.as_path(),
+                    canonical.as_path(),
+                ],
+            )
+            .unwrap_or_else(|_| stable_workspace_id(&canonical));
+            if let Some(outcome) = remember_existing_idempotency_outcome(
+                &connection,
+                &workspace_path,
+                &database_path,
+                &workspace_id,
+                idempotency_key.as_deref().expect("guarded by is_some"),
+                request_hash,
+                options.dry_run,
+            )? {
+                return Ok(outcome);
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     Ok(RememberOutcome::Created(Box::new(report)))
 }
 
@@ -7924,29 +8637,19 @@ pub fn remember_global_memory_with_controls_and_typed_fields(
         if paths.database_path.exists() {
             let connection = open_remember_database_with_retry(&paths.database_path)?;
             migrate_remember_database_with_retry(&connection)?;
-            if let Some(existing) = connection
-                .get_remember_idempotency_key(&workspace_id, key)
-                .map_err(|error| DomainError::Storage {
-                    message: format!("Failed to look up global idempotency key: {error}"),
-                    repair: Some("ee doctor --json".to_owned()),
-                })?
-            {
-                if idempotency_request_hash
-                    .as_deref()
-                    .is_some_and(|request_hash| existing.content_hash == request_hash)
-                {
-                    return Ok(RememberOutcome::AlreadyRecorded(
-                        RememberAlreadyRecordedReport {
-                            version: env!("CARGO_PKG_VERSION"),
-                            workspace_id,
-                            database_path: paths.database_path,
-                            memory_id: existing.memory_id,
-                            idempotency_key: existing.idempotency_key,
-                            dry_run: options.dry_run,
-                        },
-                    ));
-                }
-                return Err(remember_idempotency_conflict_error(key));
+            let request_hash = idempotency_request_hash.as_deref().ok_or_else(|| {
+                remember_usage_error("idempotency request hash was not prepared".to_owned())
+            })?;
+            if let Some(outcome) = remember_existing_idempotency_outcome(
+                &connection,
+                &paths.root,
+                &paths.database_path,
+                &workspace_id,
+                key,
+                request_hash,
+                options.dry_run,
+            )? {
+                return Ok(outcome);
             }
         }
     }
@@ -7960,15 +8663,17 @@ pub fn remember_global_memory_with_controls_and_typed_fields(
         Some(&store_override),
         typed_field_assignments,
         None,
+        match (
+            idempotency_key.as_deref(),
+            idempotency_request_hash.as_deref(),
+        ) {
+            (Some(idempotency_key), Some(content_hash)) => Some(RememberCreateIdempotency {
+                idempotency_key,
+                content_hash,
+            }),
+            _ => None,
+        },
     )?;
-    if let Some(key) = idempotency_key.as_deref()
-        && !global_options.dry_run
-    {
-        let request_hash = idempotency_request_hash.as_deref().ok_or_else(|| {
-            remember_usage_error("idempotency request hash was not prepared".to_owned())
-        })?;
-        record_remember_idempotency_key(&report, key, request_hash)?;
-    }
     Ok(RememberOutcome::Created(Box::new(report)))
 }
 
@@ -13543,9 +14248,7 @@ mod tests {
     }
 
     #[test]
-    fn store_remembered_memory_queues_audit_when_lane_is_enabled() -> TestResult {
-        use crate::core::audit_lane::{AuditLane, AuditLaneConfig, insert_audit_event_batch};
-
+    fn store_remembered_memory_commits_authoritative_audit_and_job_together() -> TestResult {
         let connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
         connection.migrate().map_err(|error| error.to_string())?;
 
@@ -13554,20 +14257,20 @@ mod tests {
             .insert_workspace(
                 workspace_id,
                 &CreateWorkspaceInput {
-                    path: "/tmp/audit-lane-memory-test".to_owned(),
-                    name: Some("audit lane memory test".to_owned()),
+                    path: "/tmp/atomic-memory-audit-test".to_owned(),
+                    name: Some("atomic memory audit test".to_owned()),
                 },
             )
             .map_err(|error| error.to_string())?;
 
         let memory_id = "mem_00000000000000000000002002";
-        let audit_id = "audit_auditlane00000000000000001";
-        let index_job_id = "sidx_auditlane00000000000000001";
+        let audit_id = "audit_atomicaudit000000000000001";
+        let index_job_id = "sidx_atomicaudit000000000000001";
         let memory_input = CreateMemoryInput {
             workspace_id: workspace_id.to_owned(),
             level: "procedural".to_owned(),
             kind: "rule".to_owned(),
-            content: "Route remember audit through the audit lane.".to_owned(),
+            content: "Commit remember memory, audit, and index obligation atomically.".to_owned(),
             workflow_id: None,
             confidence: 0.9,
             utility: 0.5,
@@ -13586,11 +14289,6 @@ mod tests {
             document_id: Some(memory_id.to_owned()),
             documents_total: 1,
         };
-        let (handle, mut lane) = AuditLane::new(AuditLaneConfig {
-            capacity: 4,
-            batch_size: 4,
-            shutdown_event_limit: 4,
-        });
 
         store_remembered_memory_with_retry(
             &connection,
@@ -13605,28 +14303,22 @@ mod tests {
             "{}",
             &index_input,
             None,
-            Some(&handle),
+            None,
         )
         .map_err(|error| error.to_string())?;
 
         ensure(
             connection
-                .get_audit(audit_id)
+                .get_memory(memory_id)
                 .map_err(|error| error.to_string())?
-                .is_none(),
+                .is_some(),
             true,
-            "enabled lane skips direct audit insert",
+            "authoritative memory row",
         )?;
-        let report = lane.drain_available(|batch| {
-            insert_audit_event_batch(&connection, batch)
-                .expect("drained audit events should batch insert");
-        });
-        ensure(report.drained_events, 1, "drained event count")?;
-
         let audit = connection
             .get_audit(audit_id)
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| "drained audit row missing".to_owned())?;
+            .ok_or_else(|| "authoritative audit row missing".to_owned())?;
         ensure(
             audit.action,
             audit_actions::MEMORY_CREATE.to_owned(),
@@ -13637,7 +14329,111 @@ mod tests {
             Some(memory_id.to_owned()),
             "audit target id",
         )?;
+        let job = connection
+            .get_search_index_job(index_job_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "transaction-bound index job missing".to_owned())?;
+        ensure(
+            job.document_id.as_deref(),
+            Some(memory_id),
+            "index job memory id",
+        )?;
 
+        connection.close().map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn remember_idempotency_failure_rolls_back_memory_audit_and_job() -> TestResult {
+        let connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
+        connection.migrate().map_err(|error| error.to_string())?;
+        let workspace_id = setup_remember_test_workspace(&connection)?;
+        let survivor_id = MemoryId::from_uuid(uuid::Uuid::from_u128(91_001)).to_string();
+        connection
+            .insert_memory(
+                &survivor_id,
+                &remember_test_memory_input(&workspace_id, "surviving identity owner"),
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .insert_remember_idempotency_key(&CreateRememberIdempotencyKeyInput {
+                workspace_id: workspace_id.clone(),
+                idempotency_key: "rollback-key".to_owned(),
+                content_hash: remember_content_hash("surviving identity owner"),
+                memory_id: survivor_id.clone(),
+            })
+            .map_err(|error| error.to_string())?;
+
+        let candidate_id = MemoryId::from_uuid(uuid::Uuid::from_u128(91_002)).to_string();
+        let audit_id = generate_audit_id();
+        let job_id = generate_search_index_job_id();
+        let candidate_input =
+            remember_test_memory_input(&workspace_id, "candidate must roll back completely");
+        let index_input = CreateSearchIndexJobInput {
+            workspace_id: workspace_id.clone(),
+            job_type: SearchIndexJobType::SingleDocument,
+            document_source: Some("memory".to_owned()),
+            document_id: Some(candidate_id.clone()),
+            documents_total: 1,
+        };
+        let duplicate_identity = CreateRememberIdempotencyKeyInput {
+            workspace_id: workspace_id.clone(),
+            idempotency_key: "rollback-key".to_owned(),
+            content_hash: remember_content_hash("candidate must roll back completely"),
+            memory_id: candidate_id.clone(),
+        };
+        let result = store_remembered_memory_with_retry(
+            &connection,
+            &candidate_id,
+            &audit_id,
+            &job_id,
+            &candidate_input,
+            None,
+            None,
+            &RememberEmbedDedupDecision::disabled(),
+            None,
+            "{}",
+            &index_input,
+            None,
+            Some(&duplicate_identity),
+        );
+        ensure(
+            result.is_err(),
+            true,
+            "duplicate identity must fail the candidate transaction",
+        )?;
+        ensure(
+            connection
+                .get_memory(&candidate_id)
+                .map_err(|error| error.to_string())?
+                .is_none(),
+            true,
+            "candidate memory rolled back",
+        )?;
+        ensure(
+            connection
+                .get_audit(&audit_id)
+                .map_err(|error| error.to_string())?
+                .is_none(),
+            true,
+            "candidate audit rolled back",
+        )?;
+        ensure(
+            connection
+                .get_search_index_job(&job_id)
+                .map_err(|error| error.to_string())?
+                .is_none(),
+            true,
+            "candidate index job rolled back",
+        )?;
+        let identity = connection
+            .get_remember_idempotency_key(&workspace_id, "rollback-key")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "surviving identity disappeared".to_owned())?;
+        ensure(
+            identity.memory_id.as_str(),
+            survivor_id.as_str(),
+            "surviving identity owner",
+        )?;
         connection.close().map_err(|error| error.to_string())
     }
 
@@ -20451,6 +21247,268 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_same_key_remembers_converge_to_one_authoritative_write() -> TestResult {
+        let temp = upgrade_test_workspace()?;
+        let workspace = std::sync::Arc::new(temp.path().to_path_buf());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|_| {
+                let workspace = std::sync::Arc::clone(&workspace);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || -> Result<String, String> {
+                    let content =
+                        "Concurrent exactly-once remember converges on one durable identity.";
+                    let options =
+                        upgrade_remember_options(workspace.as_path(), content, 0.9, None, false);
+                    barrier.wait();
+                    let outcome = remember_memory_with_controls(
+                        &options,
+                        &RememberWriteControls {
+                            reinforce: false,
+                            idempotency_key: Some("concurrent-same-key"),
+                            defer_index_processing: true,
+                        },
+                    )
+                    .map_err(|error| error.message())?;
+                    match outcome {
+                        RememberOutcome::Created(report) => Ok(report.memory_id.to_string()),
+                        RememberOutcome::AlreadyRecorded(report) => Ok(report.memory_id),
+                        RememberOutcome::Reinforced(_) => {
+                            Err("concurrent keyed write must not reinforce".to_owned())
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut ids = Vec::new();
+        for handle in handles {
+            ids.push(
+                handle
+                    .join()
+                    .map_err(|_| "concurrent remember thread panicked".to_owned())??,
+            );
+        }
+        ids.sort();
+        ids.dedup();
+        ensure(ids.len(), 1_usize, "one surviving concurrent memory id")?;
+
+        let canonical = workspace
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let workspace_id = stable_workspace_id(&canonical);
+        let connection = open_upgrade_test_db(workspace.as_path())?;
+        let memories = connection
+            .list_memories(&workspace_id, None, true)
+            .map_err(|error| error.to_string())?;
+        ensure(memories.len(), 1_usize, "one concurrent memory row")?;
+        ensure(
+            memories[0].id.as_str(),
+            ids[0].as_str(),
+            "surviving concurrent memory row",
+        )?;
+        let identity = connection
+            .get_remember_idempotency_key(&workspace_id, "concurrent-same-key")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "concurrent identity missing".to_owned())?;
+        ensure(
+            identity.memory_id.as_str(),
+            ids[0].as_str(),
+            "concurrent identity owner",
+        )?;
+        let jobs = connection
+            .list_search_index_jobs(&workspace_id, None)
+            .map_err(|error| error.to_string())?;
+        ensure(jobs.len(), 1_usize, "one concurrent index obligation")?;
+        ensure(
+            jobs[0].document_id.as_deref(),
+            Some(ids[0].as_str()),
+            "concurrent job memory id",
+        )?;
+        ensure(
+            connection
+                .list_audit_by_action(audit_actions::MEMORY_CREATE, None)
+                .map_err(|error| error.to_string())?
+                .len(),
+            1_usize,
+            "one concurrent memory-create audit",
+        )?;
+        ensure(
+            crate::core::write_owner::workspace_write_replay_required(workspace.as_path()),
+            false,
+            "concurrent exact-once marker clean",
+        )?;
+        connection.close().map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn remember_explicit_recovery_attaches_identity_without_duplicate_memory() -> TestResult {
+        let temp = upgrade_test_workspace()?;
+        let content = "Interrupted remember recovery preserves one committed memory.";
+        let options = upgrade_remember_options(temp.path(), content, 0.8, None, false);
+        let created = remember_memory_with_index_mode(&options, true, &[], None)
+            .map_err(|error| error.message())?;
+        let memory_id = created.memory_id.to_string();
+        let connection = open_upgrade_test_db(temp.path())?;
+        let before_memories = connection
+            .list_memories(&created.workspace_id, None, true)
+            .map_err(|error| error.to_string())?;
+        let before_jobs = connection
+            .list_search_index_jobs(&created.workspace_id, None)
+            .map_err(|error| error.to_string())?;
+        connection.close().map_err(|error| error.to_string())?;
+        crate::core::write_owner::mark_write_replay_required(temp.path())
+            .map_err(|error| error.to_string())?;
+
+        let recovered = recover_remember_idempotency(&options, "recovery-key", &memory_id)
+            .map_err(|error| error.message())?;
+        ensure(
+            recovered.memory_id.as_str(),
+            memory_id.as_str(),
+            "recovered memory id",
+        )?;
+        ensure(
+            crate::core::write_owner::workspace_write_replay_required(temp.path()),
+            false,
+            "recovery marker cleared after identity commit",
+        )?;
+
+        let connection = open_upgrade_test_db(temp.path())?;
+        let identity = connection
+            .get_remember_idempotency_key(&created.workspace_id, "recovery-key")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "recovered identity missing".to_owned())?;
+        ensure(
+            identity.memory_id.as_str(),
+            memory_id.as_str(),
+            "identity memory id",
+        )?;
+        ensure(
+            connection
+                .list_memories(&created.workspace_id, None, true)
+                .map_err(|error| error.to_string())?
+                .len(),
+            before_memories.len(),
+            "recovery creates no memory",
+        )?;
+        ensure(
+            connection
+                .list_search_index_jobs(&created.workspace_id, None)
+                .map_err(|error| error.to_string())?
+                .len(),
+            before_jobs.len(),
+            "recovery creates no index job",
+        )?;
+        ensure(
+            connection
+                .list_audit_by_action(REMEMBER_IDEMPOTENCY_RECOVER_AUDIT_ACTION, None)
+                .map_err(|error| error.to_string())?
+                .len(),
+            1_usize,
+            "one recovery audit row",
+        )?;
+        connection.close().map_err(|error| error.to_string())?;
+
+        match remember_memory_with_controls(
+            &options,
+            &RememberWriteControls {
+                reinforce: false,
+                idempotency_key: Some("recovery-key"),
+                defer_index_processing: true,
+            },
+        )
+        .map_err(|error| error.message())?
+        {
+            RememberOutcome::AlreadyRecorded(report) => ensure(
+                report.memory_id.as_str(),
+                memory_id.as_str(),
+                "replay memory id",
+            ),
+            other => Err(format!("expected recovered replay, got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn remember_explicit_recovery_rejects_content_mismatch_without_mutation() -> TestResult {
+        let temp = upgrade_test_workspace()?;
+        let original = "Exact recovery content must match the committed memory.";
+        let created = remember_memory_with_index_mode(
+            &upgrade_remember_options(temp.path(), original, 0.8, None, false),
+            true,
+            &[],
+            None,
+        )
+        .map_err(|error| error.message())?;
+        crate::core::write_owner::mark_write_replay_required(temp.path())
+            .map_err(|error| error.to_string())?;
+        let wrong = upgrade_remember_options(
+            temp.path(),
+            "Different recovery content must be rejected.",
+            0.8,
+            None,
+            false,
+        );
+        let error =
+            recover_remember_idempotency(&wrong, "mismatch-key", &created.memory_id.to_string())
+                .expect_err("mismatched recovery content must fail");
+        ensure(
+            error.message().contains("does not exactly match"),
+            true,
+            "content mismatch error",
+        )?;
+        ensure(
+            crate::core::write_owner::workspace_write_replay_required(temp.path()),
+            true,
+            "failed recovery preserves marker",
+        )?;
+        let connection = open_upgrade_test_db(temp.path())?;
+        ensure(
+            connection
+                .get_remember_idempotency_key(&created.workspace_id, "mismatch-key")
+                .map_err(|error| error.to_string())?
+                .is_none(),
+            true,
+            "failed recovery writes no identity",
+        )?;
+        connection.close().map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn remember_explicit_recovery_rejects_mismatched_scoped_marker() -> TestResult {
+        let temp = upgrade_test_workspace()?;
+        let content = "Scoped recovery marker identity cannot be substituted.";
+        let options = upgrade_remember_options(temp.path(), content, 0.8, None, false);
+        let created = remember_memory_with_index_mode(&options, true, &[], None)
+            .map_err(|error| error.message())?;
+        let content_hash = remember_content_hash(content);
+        crate::core::write_owner::mark_remember_write_replay_required(
+            temp.path(),
+            &created.memory_id.to_string(),
+            Some("original-key"),
+            &content_hash,
+        )
+        .map_err(|error| error.to_string())?;
+        let error = recover_remember_idempotency(
+            &options,
+            "substituted-key",
+            &created.memory_id.to_string(),
+        )
+        .expect_err("mismatched scoped marker must fail");
+        ensure(
+            error
+                .message()
+                .contains("requires a replay-required marker"),
+            true,
+            "scoped marker mismatch error",
+        )?;
+        ensure(
+            crate::core::write_owner::workspace_write_replay_required(temp.path()),
+            true,
+            "rejected scoped recovery preserves marker",
+        )
+    }
+
+    #[test]
     fn remember_idempotency_replay_returns_original_memory() -> TestResult {
         let temp = upgrade_test_workspace()?;
         let content = "Idempotent lesson: pin the schema before regenerating goldens.";
@@ -20591,6 +21649,144 @@ mod tests {
                 "expected typed-field idempotency conflict, got {other:?}"
             )),
         }
+    }
+
+    #[test]
+    fn remember_idempotency_replay_clears_post_commit_marker_without_duplication() -> TestResult {
+        let temp = upgrade_test_workspace()?;
+        let content = "Post-commit interruption recovery must converge without duplicating memory.";
+        let key = "post-commit-replay-key";
+        let controls = RememberWriteControls {
+            reinforce: false,
+            idempotency_key: Some(key),
+            defer_index_processing: true,
+        };
+        let created = upgrade_created_report(
+            remember_memory_with_controls(
+                &upgrade_remember_options(temp.path(), content, 0.9, None, false),
+                &controls,
+            )
+            .map_err(|error| error.message())?,
+            "initial authoritative write",
+        )?;
+        let memory_id = created.memory_id.to_string();
+        let content_hash = remember_content_hash(content);
+
+        let connection = open_upgrade_test_db(temp.path())?;
+        let memories_before = connection
+            .list_memories(&created.workspace_id, None, true)
+            .map_err(|error| error.to_string())?;
+        let jobs_before = connection
+            .list_search_index_jobs(&created.workspace_id, None)
+            .map_err(|error| error.to_string())?;
+        let audits_before = connection
+            .list_audit_by_action(audit_actions::MEMORY_CREATE, None)
+            .map_err(|error| error.to_string())?;
+        let identity_before = connection
+            .get_remember_idempotency_key(&created.workspace_id, key)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "initial idempotency identity missing".to_owned())?;
+        connection.close().map_err(|error| error.to_string())?;
+
+        crate::core::write_owner::mark_remember_write_replay_required(
+            temp.path(),
+            &memory_id,
+            Some(key),
+            &content_hash,
+        )
+        .map_err(|error| error.to_string())?;
+        ensure(
+            crate::core::write_owner::workspace_write_replay_matches_remember(
+                temp.path(),
+                &memory_id,
+                key,
+                &content_hash,
+            ),
+            true,
+            "post-commit marker identifies the exact durable write",
+        )?;
+
+        let replay = remember_memory_with_controls(
+            &upgrade_remember_options(temp.path(), content, 0.9, None, false),
+            &controls,
+        )
+        .map_err(|error| error.message())?;
+        match replay {
+            RememberOutcome::AlreadyRecorded(report) => ensure(
+                report.memory_id,
+                memory_id.clone(),
+                "post-commit replay returns the durable memory",
+            )?,
+            other => return Err(format!("expected already_recorded, got {other:?}")),
+        }
+        ensure(
+            crate::core::write_owner::workspace_write_replay_required(temp.path()),
+            false,
+            "exact post-commit replay clears the marker",
+        )?;
+
+        let connection = open_upgrade_test_db(temp.path())?;
+        let memories_after = connection
+            .list_memories(&created.workspace_id, None, true)
+            .map_err(|error| error.to_string())?;
+        let jobs_after = connection
+            .list_search_index_jobs(&created.workspace_id, None)
+            .map_err(|error| error.to_string())?;
+        let audits_after = connection
+            .list_audit_by_action(audit_actions::MEMORY_CREATE, None)
+            .map_err(|error| error.to_string())?;
+        let identity_after = connection
+            .get_remember_idempotency_key(&created.workspace_id, key)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "reconciled idempotency identity missing".to_owned())?;
+        ensure(
+            memories_after.len(),
+            memories_before.len(),
+            "post-commit replay creates no memory",
+        )?;
+        ensure(
+            jobs_after.len(),
+            jobs_before.len(),
+            "post-commit replay creates no index job",
+        )?;
+        ensure(
+            audits_after.len(),
+            audits_before.len(),
+            "post-commit replay creates no audit",
+        )?;
+        ensure(
+            identity_after,
+            identity_before,
+            "post-commit replay preserves the exact idempotency identity",
+        )?;
+        connection.close().map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn remember_replay_guard_preserves_marker_during_panic() -> TestResult {
+        let temp = upgrade_test_workspace()?;
+        let memory_id = "mem_01234567890123456789012345";
+        let key = "panic-replay-key";
+        let content_hash = remember_content_hash("panic marker preservation");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard =
+                RememberWriteReplayGuard::arm(temp.path(), memory_id, Some(key), &content_hash)
+                    .expect("replay guard should arm");
+            panic!("simulated commit-ambiguous interruption");
+        }));
+        ensure(result.is_err(), true, "simulated panic was observed")?;
+        ensure(
+            crate::core::write_owner::workspace_write_replay_matches_remember(
+                temp.path(),
+                memory_id,
+                key,
+                &content_hash,
+            ),
+            true,
+            "panic preserves the exact replay marker",
+        )?;
+        crate::core::write_owner::mark_write_replay_clean(temp.path())
+            .map_err(|error| error.to_string())
     }
 
     #[test]

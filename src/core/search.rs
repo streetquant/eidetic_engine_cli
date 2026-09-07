@@ -7476,7 +7476,11 @@ fn resolve_similar_seed_memory(
     // Workspace + scope trust lane: the seed must belong to the requested
     // workspace (or be globally scoped) and pass the active `--memory-scope`,
     // exactly like every other search candidate.
-    let workspace_candidate = memory.workspace_id == workspace_id
+    let workspace_scope_ids =
+        crate::core::workspace::workspace_memory_scope_ids(connection, workspace_id)?;
+    let workspace_candidate = workspace_scope_ids
+        .iter()
+        .any(|id| memory.workspace_id == *id)
         || crate::models::memory_tags_include_global_scope(&tags);
     let admissible = workspace_candidate && scope_context.memory_in_scope_with_tags(&memory, &tags);
 
@@ -7563,7 +7567,7 @@ async fn run_similar_with_cx_and_posture(
     let posture_is_overridden = embedding_posture_override.is_some();
     let mut embedding_posture = match embedding_posture_override {
         Some(posture) => posture,
-        None => current_embedding_posture(&connection, &target.workspace_id, &index_dir)?,
+        None => current_embedding_posture(&connection, &workspace_id, &index_dir)?,
     };
     let initial_semantic_request_capable = similar_semantic_request_capable(&embedding_posture);
     let lexical_fallback = !initial_semantic_request_capable;
@@ -7610,8 +7614,7 @@ async fn run_similar_with_cx_and_posture(
     if !posture_is_overridden
         && initial_semantic_request_capable
         && !embedding_posture.semantic
-        && let Ok(updated) =
-            current_embedding_posture(&connection, &target.workspace_id, &index_dir)
+        && let Ok(updated) = current_embedding_posture(&connection, &workspace_id, &index_dir)
     {
         embedding_posture = updated;
     }

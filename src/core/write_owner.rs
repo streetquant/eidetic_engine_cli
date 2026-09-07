@@ -89,6 +89,18 @@ pub const WRITE_IMMUNE_QUARANTINE_DECISION_SCHEMA_V1: &str =
 /// Relative path to the durable write-spool crash-recovery state marker.
 pub const WRITE_SPOOL_RECOVERY_STATE_PATH: &str = ".ee/write-spool/recovery-state.json";
 
+/// Redaction-safe identity persisted for one interrupted idempotent remember.
+///
+/// The raw idempotency key is deliberately absent. Recovery may clear the
+/// marker only after hashing a committed ledger key and matching all three
+/// fields exactly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RememberWriteReplayIdentity {
+    pub memory_id: String,
+    pub idempotency_key_hash: String,
+    pub content_hash: String,
+}
+
 /// Hard cap on `.ee/write-spool/recovery-state.json` reads. The schema
 /// is `{"schema": "ee.write_spool.recovery_state.v1", "state":
 /// "clean"|"uncommitted_write_replay_required"}` — well under 200
@@ -199,42 +211,47 @@ pub fn write_spool_recovery_state_path(workspace_path: &Path) -> PathBuf {
 
 /// Mark the workspace as having an interrupted write that requires replay.
 pub fn mark_write_replay_required(workspace_path: &Path) -> std::io::Result<()> {
-    write_recovery_state(workspace_path, WRITE_SPOOL_RECOVERY_STATE_REPLAY_REQUIRED)
+    write_recovery_state(
+        workspace_path,
+        WRITE_SPOOL_RECOVERY_STATE_REPLAY_REQUIRED,
+        None,
+    )
+}
+
+/// Mark one idempotent remember operation as requiring replay.
+///
+/// The raw idempotency key is never written to disk. The marker carries only
+/// its BLAKE3 digest plus the canonical content hash and candidate memory ID,
+/// allowing a retry to prove that a committed identity belongs to the exact
+/// interrupted operation before clearing the marker.
+pub fn mark_remember_write_replay_required(
+    workspace_path: &Path,
+    memory_id: &str,
+    idempotency_key: Option<&str>,
+    content_hash: &str,
+) -> std::io::Result<()> {
+    let operation = serde_json::json!({
+        "kind": "remember",
+        "memoryId": memory_id,
+        "idempotencyKeyHash": idempotency_key.map(recovery_identity_hash),
+        "contentHash": content_hash,
+    });
+    write_recovery_state(
+        workspace_path,
+        WRITE_SPOOL_RECOVERY_STATE_REPLAY_REQUIRED,
+        Some(&operation),
+    )
 }
 
 /// Mark the workspace write-spool recovery state as clean.
 pub fn mark_write_replay_clean(workspace_path: &Path) -> std::io::Result<()> {
-    write_recovery_state(workspace_path, WRITE_SPOOL_RECOVERY_STATE_CLEAN)
+    write_recovery_state(workspace_path, WRITE_SPOOL_RECOVERY_STATE_CLEAN, None)
 }
 
 /// Returns true when the workspace has an interrupted write requiring replay.
 #[must_use]
 pub fn workspace_write_replay_required(workspace_path: &Path) -> bool {
-    let path = write_spool_recovery_state_path(workspace_path);
-    if recovery_state_path_has_symlink_component(&path).unwrap_or(true) {
-        return false;
-    }
-    let Ok(metadata) = fs::symlink_metadata(&path) else {
-        return false;
-    };
-    if !metadata.file_type().is_file() {
-        return false;
-    }
-    // Refuse oversized recovery-state files at stat time. The
-    // recovery JSON is well under 200 bytes; anything over the 4 KiB
-    // cap is corrupt or hostile and we treat it like a missing/
-    // unreadable file (return false → no replay) rather than
-    // allocating the file into memory. Layer-1 of the bounded-read
-    // defense, mirroring the .git-gitfile pre-check shape from
-    // c8f33694.
-    if metadata.len() > RECOVERY_STATE_MAX_BYTES {
-        return false;
-    }
-    let Ok(raw) = read_recovery_state_file(&path) else {
-        return false;
-    };
-    serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
+    recovery_state_value(workspace_path)
         .and_then(|value| {
             value
                 .get("state")
@@ -243,6 +260,146 @@ pub fn workspace_write_replay_required(workspace_path: &Path) -> bool {
         })
         .as_deref()
         == Some(WRITE_SPOOL_RECOVERY_STATE_REPLAY_REQUIRED)
+}
+
+/// Return true only when the durable replay marker identifies this exact
+/// idempotent remember operation.
+#[must_use]
+pub fn workspace_write_replay_matches_remember(
+    workspace_path: &Path,
+    memory_id: &str,
+    idempotency_key: &str,
+    content_hash: &str,
+) -> bool {
+    let Some(value) = recovery_state_value(workspace_path) else {
+        return false;
+    };
+    if value.get("state").and_then(serde_json::Value::as_str)
+        != Some(WRITE_SPOOL_RECOVERY_STATE_REPLAY_REQUIRED)
+    {
+        return false;
+    }
+    let Some(operation) = value.get("operation") else {
+        return false;
+    };
+    let idempotency_key_hash = recovery_identity_hash(idempotency_key);
+    operation.get("kind").and_then(serde_json::Value::as_str) == Some("remember")
+        && operation
+            .get("memoryId")
+            .and_then(serde_json::Value::as_str)
+            == Some(memory_id)
+        && operation
+            .get("idempotencyKeyHash")
+            .and_then(serde_json::Value::as_str)
+            == Some(idempotency_key_hash.as_str())
+        && operation
+            .get("contentHash")
+            .and_then(serde_json::Value::as_str)
+            == Some(content_hash)
+}
+
+pub fn remember_write_replay_identity(
+    workspace_path: &Path,
+) -> Option<RememberWriteReplayIdentity> {
+    let value = recovery_state_value(workspace_path)?;
+    if value.get("schema").and_then(serde_json::Value::as_str)
+        != Some(WRITE_SPOOL_RECOVERY_STATE_SCHEMA_V1)
+        || value.get("state").and_then(serde_json::Value::as_str)
+            != Some(WRITE_SPOOL_RECOVERY_STATE_REPLAY_REQUIRED)
+    {
+        return None;
+    }
+    let operation = value.get("operation")?.as_object()?;
+    if operation.get("kind").and_then(serde_json::Value::as_str) != Some("remember") {
+        return None;
+    }
+    let memory_id = operation.get("memoryId")?.as_str()?.trim().to_owned();
+    let idempotency_key_hash = operation
+        .get("idempotencyKeyHash")?
+        .as_str()?
+        .trim()
+        .to_owned();
+    let content_hash = operation.get("contentHash")?.as_str()?.trim().to_owned();
+    if memory_id.is_empty()
+        || !canonical_recovery_blake3_hash(&idempotency_key_hash)
+        || !canonical_recovery_blake3_hash(&content_hash)
+    {
+        return None;
+    }
+    Some(RememberWriteReplayIdentity {
+        memory_id,
+        idempotency_key_hash,
+        content_hash,
+    })
+}
+
+/// Return true when an explicit remember recovery may reconcile this marker.
+///
+/// New operation-scoped markers must match the exact memory, key, and content
+/// identity. Legacy markers written before operation identity was persisted are
+/// admitted only when they contain no `operation` payload; the recovery caller
+/// must independently verify the existing memory row and canonical content.
+#[must_use]
+pub fn workspace_write_replay_allows_remember_recovery(
+    workspace_path: &Path,
+    memory_id: &str,
+    idempotency_key: &str,
+    content_hash: &str,
+) -> bool {
+    let Some(value) = recovery_state_value(workspace_path) else {
+        return false;
+    };
+    if value.get("state").and_then(serde_json::Value::as_str)
+        != Some(WRITE_SPOOL_RECOVERY_STATE_REPLAY_REQUIRED)
+    {
+        return false;
+    }
+    match value.get("operation") {
+        None => true,
+        Some(_) => workspace_write_replay_matches_remember(
+            workspace_path,
+            memory_id,
+            idempotency_key,
+            content_hash,
+        ),
+    }
+}
+
+fn recovery_state_value(workspace_path: &Path) -> Option<serde_json::Value> {
+    let path = write_spool_recovery_state_path(workspace_path);
+    if recovery_state_path_has_symlink_component(&path).unwrap_or(true) {
+        return None;
+    }
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return None;
+    };
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    // Refuse oversized recovery-state files at stat time. The
+    // recovery JSON is well under 200 bytes; anything over the 4 KiB
+    // cap is corrupt or hostile and is treated like a missing/
+    // unreadable file rather than allocated into memory.
+    if metadata.len() > RECOVERY_STATE_MAX_BYTES {
+        return None;
+    }
+    let Ok(raw) = read_recovery_state_file(&path) else {
+        return None;
+    };
+    serde_json::from_str::<serde_json::Value>(&raw).ok()
+}
+
+fn recovery_identity_hash(value: &str) -> String {
+    format!("blake3:{}", blake3::hash(value.as_bytes()).to_hex())
+}
+
+fn canonical_recovery_blake3_hash(value: &str) -> bool {
+    value.strip_prefix("blake3:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    })
 }
 
 fn read_recovery_state_file(path: &Path) -> io::Result<String> {
@@ -297,7 +454,11 @@ fn recovery_state_file_sync_is_unsupported(_error: &io::Error) -> bool {
     false
 }
 
-fn write_recovery_state(workspace_path: &Path, state: &str) -> std::io::Result<()> {
+fn write_recovery_state(
+    workspace_path: &Path,
+    state: &str,
+    operation: Option<&serde_json::Value>,
+) -> std::io::Result<()> {
     let path = write_spool_recovery_state_path(workspace_path);
     ensure_recovery_state_path_has_no_symlink_components(&path)?;
     if let Some(parent) = path.parent() {
@@ -305,9 +466,19 @@ fn write_recovery_state(workspace_path: &Path, state: &str) -> std::io::Result<(
     }
     ensure_recovery_state_path_has_no_symlink_components(&path)?;
     ensure_recovery_state_final_path_is_regular_or_missing(&path)?;
-    let payload = format!(
-        "{{\"schema\":\"{WRITE_SPOOL_RECOVERY_STATE_SCHEMA_V1}\",\"state\":\"{state}\"}}\n"
-    );
+    let payload = match operation {
+        Some(operation) => format!(
+            "{}\n",
+            serde_json::json!({
+                "schema": WRITE_SPOOL_RECOVERY_STATE_SCHEMA_V1,
+                "state": state,
+                "operation": operation,
+            })
+        ),
+        None => format!(
+            "{{\"schema\":\"{WRITE_SPOOL_RECOVERY_STATE_SCHEMA_V1}\",\"state\":\"{state}\"}}\n"
+        ),
+    };
 
     for _ in 0..WRITE_SPOOL_RECOVERY_TEMP_CREATE_ATTEMPTS {
         let temp_path = unique_recovery_state_temp_path(&path)?;

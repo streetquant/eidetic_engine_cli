@@ -1282,10 +1282,20 @@ impl DbConnection {
         F: FnOnce() -> std::result::Result<T, E>,
         M: FnOnce(DbError) -> E,
     {
-        let _write_owner = self
-            .reject_read_only_write(DbOperation::BeginTransaction)
-            .and_then(|()| lock_file_write_owner_gate(&self.location))
-            .map_err(map_error)?;
+        // Independent in-memory FrankenSQLite connections do not share a
+        // database. They must not contend on the process-wide Memory gate;
+        // with_transaction already follows this same FILE-only ownership
+        // contract. File-backed connections retain both the process mutex and
+        // the cross-process flock.
+        let _write_owner = if matches!(&self.location, DatabaseLocation::Memory) {
+            self.reject_read_only_write(DbOperation::BeginTransaction)
+                .map(|()| None)
+        } else {
+            self.reject_read_only_write(DbOperation::BeginTransaction)
+                .and_then(|()| lock_file_write_owner_gate(&self.location))
+                .map(Some)
+        }
+        .map_err(map_error)?;
         f()
     }
 
@@ -2489,6 +2499,7 @@ fn sqlite_contention_message_is_retryable(message: &str) -> bool {
         || message.contains("database is locked")
         || message.contains("database table is locked")
         || message.contains("snapshot conflict")
+        || message.contains("database schema has changed")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23024,6 +23035,28 @@ impl DbConnection {
         rows.first()
             .map(stored_remember_idempotency_key_from_row)
             .transpose()
+    }
+
+    /// List idempotency identities attached to one memory in deterministic order.
+    ///
+    /// Recovery uses this workspace-local lookup to prove that a replay marker
+    /// names a committed operation without retaining its raw key in the marker.
+    pub fn list_remember_idempotency_keys_for_memory(
+        &self,
+        workspace_id: &str,
+        memory_id: &str,
+    ) -> Result<Vec<StoredRememberIdempotencyKey>> {
+        let rows = self.query_for(
+            DbOperation::Query,
+            "SELECT workspace_id, idempotency_key, content_hash, memory_id, created_at FROM remember_idempotency_keys WHERE workspace_id = ?1 AND memory_id = ?2 ORDER BY idempotency_key ASC",
+            &[
+                Value::Text(workspace_id.to_string()),
+                Value::Text(memory_id.to_string()),
+            ],
+        )?;
+        rows.iter()
+            .map(stored_remember_idempotency_key_from_row)
+            .collect()
     }
 
     /// Find an active (non-tombstoned) memory whose content exactly matches,
@@ -58191,7 +58224,7 @@ mod tests {
     }
 
     #[test]
-    fn with_write_owner_fence_serializes_process_threads() -> TestResult {
+    fn with_write_owner_fence_does_not_serialize_independent_memory_connections() -> TestResult {
         let (outer_entered_tx, outer_entered_rx) = mpsc::channel();
         let (outer_release_tx, outer_release_rx) = mpsc::channel();
         let outer = thread::spawn(move || -> std::result::Result<(), String> {
@@ -58213,16 +58246,13 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .map_err(|error| TestFailure::new(format!("outer fence did not start: {error}")))?;
 
-        let (contender_state_tx, contender_state_rx) = mpsc::channel();
+        let (contender_entered_tx, contender_entered_rx) = mpsc::channel();
         let contender = thread::spawn(move || -> std::result::Result<(), String> {
             let connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
-            contender_state_tx
-                .send("attempting")
-                .map_err(|error| format!("announce fence attempt: {error}"))?;
             connection.with_write_owner_fence(
                 |error| error.to_string(),
                 || {
-                    contender_state_tx
+                    contender_entered_tx
                         .send("entered")
                         .map_err(|error| format!("announce fence entry: {error}"))
                 },
@@ -58230,19 +58260,19 @@ mod tests {
         });
 
         ensure_equal(
-            &contender_state_rx
+            &contender_entered_rx
                 .recv_timeout(Duration::from_secs(2))
-                .map_err(|error| TestFailure::new(format!("contender did not start: {error}")))?,
-            &"attempting",
-            "contender state before owner release",
+                .map_err(|error| {
+                    TestFailure::new(format!("independent memory fence did not enter: {error}"))
+                })?,
+            &"entered",
+            "independent memory fence enters while another memory connection is held",
         )?;
-        ensure(
-            matches!(
-                contender_state_rx.try_recv(),
-                Err(mpsc::TryRecvError::Empty)
-            ),
-            "contender must not enter while the outer thread owns the fence",
-        )?;
+
+        contender
+            .join()
+            .map_err(|_| TestFailure::new("contender fence thread panicked"))?
+            .map_err(TestFailure::new)?;
 
         outer_release_tx
             .send(())
@@ -58251,17 +58281,7 @@ mod tests {
             .join()
             .map_err(|_| TestFailure::new("outer fence thread panicked"))?
             .map_err(TestFailure::new)?;
-        ensure_equal(
-            &contender_state_rx
-                .recv_timeout(Duration::from_secs(2))
-                .map_err(|error| TestFailure::new(format!("contender never entered: {error}")))?,
-            &"entered",
-            "contender state after owner release",
-        )?;
-        contender
-            .join()
-            .map_err(|_| TestFailure::new("contender fence thread panicked"))?
-            .map_err(TestFailure::new)
+        Ok(())
     }
 
     #[test]

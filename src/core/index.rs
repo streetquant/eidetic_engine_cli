@@ -3619,8 +3619,14 @@ fn collect_workspace_index_source_snapshot(
     workspace_id: &str,
 ) -> Result<WorkspaceIndexSourceSnapshot, IndexRebuildError> {
     db.with_transaction_error(|| {
-        let captured_generation = db.get_workspace_generation(workspace_id)?;
-        let memories = db.list_memories_for_retrieval_with_global(workspace_id, None, false)?;
+        let captured_generation =
+            crate::core::workspace::workspace_memory_scope_generation(db, workspace_id)?;
+        let memories = crate::core::workspace::list_memories_for_workspace_memory_scope(
+            db,
+            workspace_id,
+            None,
+            false,
+        )?;
         let artifacts = db.list_artifacts(workspace_id, None)?;
         let memory_docs = memory_documents_with_anchors(db, &memories)?;
         let mut session_docs = Vec::new();
@@ -6987,7 +6993,12 @@ fn current_index_corpus_counts_with_snapshot(
     workspace_id: &str,
     caller_holds_snapshot: bool,
 ) -> Result<(IndexDocumentCounts, EvidenceAdmissionReport), DbError> {
-    let memories = db.list_memories_for_retrieval_with_global(workspace_id, None, false)?;
+    let memories = crate::core::workspace::list_memories_for_workspace_memory_scope(
+        db,
+        workspace_id,
+        None,
+        false,
+    )?;
     let mut indexable_memory_count = 0_usize;
     for memory in &memories {
         if !memory_has_seal_sidecar(db, memory)? {
@@ -8150,8 +8161,7 @@ fn get_db_stats(
     } else {
         current_index_corpus_counts(db, workspace_id)?
     };
-    let generation = db
-        .get_workspace_generation(workspace_id)?
+    let generation = crate::core::workspace::workspace_memory_scope_generation(db, workspace_id)?
         .or(Some(u64::from(counts.total())));
     Ok((counts, evidence_admission, generation))
 }

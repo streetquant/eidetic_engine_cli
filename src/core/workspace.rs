@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{
@@ -40,8 +40,8 @@ use crate::core::swarm_brief::{
 };
 use crate::core::symbol_graph::SymbolGraphExtractor;
 use crate::db::{
-    CreateAuditInput, CreateWorkspaceInput, DatabaseConfig, DbConnection, StoredWorkspace,
-    WorkspaceScopeFields, generate_audit_id,
+    CreateAuditInput, CreateWorkspaceInput, DatabaseConfig, DbConnection, StoredMemory,
+    StoredWorkspace, WorkspaceScopeFields, generate_audit_id,
 };
 use crate::models::degradation::{
     WORKSPACE_HYGIENE_AGENT_MAIL_UNAVAILABLE_CODE, WORKSPACE_HYGIENE_OUTPUT_TRUNCATED_CODE,
@@ -58,12 +58,14 @@ use crate::runtime::determinism::{Deterministic, Seed};
 pub const WORKSPACE_REGISTRY_SCHEMA_V1: &str = "ee.workspace.registry.v1";
 pub const WORKSPACE_ALIAS_SCHEMA_V1: &str = "ee.workspace.alias.v1";
 pub const WORKSPACE_RESOLVE_SCHEMA_V1: &str = "ee.workspace.resolve.v1";
+pub const WORKSPACE_MEMORY_SCOPE_ADOPTION_SCHEMA_V1: &str = "ee.workspace.memory_scope_adoption.v1";
 pub const WORKSPACE_HYGIENE_SCHEMA_V1: &str = "ee.workspace_hygiene.v1";
 pub const WORKSPACE_HYGIENE_SYMBOL_RISK_SCHEMA_V1: &str = "ee.workspace_hygiene.symbol_risk.v1";
 pub const WORKSPACE_REGISTRY_ENV_VAR: &str = EnvVar::WorkspaceRegistry.name();
 
 const WORKSPACE_ALIAS_SET_ACTION: &str = "workspace.alias.set";
 const WORKSPACE_ALIAS_CLEAR_ACTION: &str = "workspace.alias.clear";
+const WORKSPACE_MEMORY_SCOPE_ADOPT_ACTION: &str = "workspace.memory_scope.adopt";
 pub const WORKSPACE_HYGIENE_MAX_PATH_CLASSIFICATIONS: usize = 10_000;
 pub const WORKSPACE_HYGIENE_MAX_PATHS_PER_LIST: usize = 10_000;
 pub const WORKSPACE_HYGIENE_MAX_PATHS_PER_STAGING_GROUP: usize = 10_000;
@@ -93,6 +95,17 @@ pub struct WorkspaceAliasOptions {
     pub clear: bool,
     pub dry_run: bool,
     pub registry_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceMemoryScopeAdoptionOptions {
+    pub workspace_path: Option<PathBuf>,
+    pub database_path: Option<PathBuf>,
+    pub adopted_workspace_id: String,
+    pub reason: String,
+    pub evidence_hash: String,
+    pub dry_run: bool,
+    pub actor: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -160,6 +173,35 @@ pub struct WorkspaceAliasReport {
     pub dry_run: bool,
     pub persisted: bool,
     pub audit_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceMemoryScopeAdoptionReport {
+    pub schema: &'static str,
+    pub command: &'static str,
+    pub status: &'static str,
+    pub database_path: String,
+    pub owner_workspace_id: String,
+    pub owner_workspace_path: String,
+    pub adopted_workspace_id: String,
+    pub adopted_workspace_path: String,
+    pub owner_live_memory_count: u64,
+    pub adopted_live_memory_count: u64,
+    pub scoped_live_memory_count: u64,
+    pub reason: String,
+    pub evidence_hash: String,
+    pub dry_run: bool,
+    pub persisted: bool,
+    pub audit_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceMemoryScopeAdoptionDetails {
+    schema: String,
+    owner_workspace_id: String,
+    adopted_workspace_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -2031,6 +2073,262 @@ fn workspace_git_error(error: crate::core::swarm_brief::SwarmBriefCommandError) 
     }
 }
 
+/// Return the owner workspace plus each explicitly adopted workspace ID.
+///
+/// Adoption is keyed by stable workspace IDs in the audit chain, so changing a
+/// physical path does not require rewriting any memory row. Invalid or stale
+/// adoption records are ignored fail-closed; they never broaden a search scope.
+pub fn workspace_memory_scope_ids(
+    connection: &DbConnection,
+    owner_workspace_id: &str,
+) -> crate::db::Result<Vec<String>> {
+    let mut adopted = BTreeSet::new();
+    for entry in connection.list_audit_by_action(WORKSPACE_MEMORY_SCOPE_ADOPT_ACTION, None)? {
+        if entry.workspace_id.as_deref() != Some(owner_workspace_id)
+            || entry.target_type.as_deref() != Some("workspace")
+        {
+            continue;
+        }
+        let Some(target_id) = entry.target_id.as_deref() else {
+            continue;
+        };
+        let Some(details_text) = entry.details.as_deref() else {
+            continue;
+        };
+        let Ok(details) = serde_json::from_str::<WorkspaceMemoryScopeAdoptionDetails>(details_text)
+        else {
+            continue;
+        };
+        if details.schema != WORKSPACE_MEMORY_SCOPE_ADOPTION_SCHEMA_V1
+            || details.owner_workspace_id != owner_workspace_id
+            || details.adopted_workspace_id != target_id
+            || details.adopted_workspace_id == owner_workspace_id
+        {
+            continue;
+        }
+        if connection.get_workspace(target_id)?.is_some() {
+            adopted.insert(target_id.to_owned());
+        }
+    }
+
+    let mut ids = Vec::with_capacity(adopted.len() + 1);
+    ids.push(owner_workspace_id.to_owned());
+    ids.extend(adopted);
+    Ok(ids)
+}
+
+/// Return the highest source generation across an adopted memory scope.
+///
+/// The adoption count is folded into the generation so a newly recorded
+/// mapping cannot look index-ready until the owner index has been rebuilt.
+pub fn workspace_memory_scope_generation(
+    connection: &DbConnection,
+    owner_workspace_id: &str,
+) -> crate::db::Result<Option<u64>> {
+    let ids = workspace_memory_scope_ids(connection, owner_workspace_id)?;
+    let mut generation = None;
+    for workspace_id in &ids {
+        if let Some(value) = connection.get_workspace_generation(workspace_id)? {
+            let total = generation.unwrap_or(0_u64).saturating_add(value);
+            generation = Some(total);
+        }
+    }
+    // The membership term makes a newly adopted zero-generation workspace
+    // stale the owner's index immediately; the sum keeps every member write
+    // visible even when another member has a higher generation.
+    Ok(generation.map(|value| value.saturating_add(ids.len().saturating_sub(1) as u64)))
+}
+
+/// Load the memory corpus admitted by an owner and its explicit adopted scope.
+///
+/// Each source row keeps its original workspace ID, provenance, tags, links,
+/// and audit history. Global and house-rule rows are deduplicated by memory ID.
+pub fn list_memories_for_workspace_memory_scope(
+    connection: &DbConnection,
+    owner_workspace_id: &str,
+    level: Option<&str>,
+    include_tombstoned: bool,
+) -> crate::db::Result<Vec<StoredMemory>> {
+    let mut memories = BTreeMap::new();
+    for workspace_id in workspace_memory_scope_ids(connection, owner_workspace_id)? {
+        for memory in connection.list_memories_for_retrieval_with_global(
+            &workspace_id,
+            level,
+            include_tombstoned,
+        )? {
+            memories.entry(memory.id.clone()).or_insert(memory);
+        }
+    }
+    Ok(memories.into_values().collect())
+}
+
+/// Persist one explicit owner-to-workspace adoption after validating both rows.
+///
+/// This operation never rewrites memories.workspace_id; it only records the
+/// approved scope relationship and an audit proof. A reason and evidence hash
+/// are mandatory to prevent an accidental blanket merge.
+pub fn adopt_workspace_memory_scope(
+    options: &WorkspaceMemoryScopeAdoptionOptions,
+) -> Result<WorkspaceMemoryScopeAdoptionReport, DomainError> {
+    let reason = options.reason.trim();
+    if reason.is_empty() {
+        return Err(DomainError::Usage {
+            message: "workspace adoption requires a non-empty --reason".to_owned(),
+            repair: Some(
+                "Provide the operator-approved same-store rationale with --reason.".to_owned(),
+            ),
+        });
+    }
+    let evidence_hash = options.evidence_hash.trim();
+    if evidence_hash.is_empty() {
+        return Err(DomainError::Usage {
+            message: "workspace adoption requires a non-empty --evidence-hash".to_owned(),
+            repair: Some(
+                "Provide the metadata-only identity proof hash with --evidence-hash.".to_owned(),
+            ),
+        });
+    }
+
+    let adopted_workspace_id = options.adopted_workspace_id.trim();
+    if !adopted_workspace_id.starts_with("wsp_") || adopted_workspace_id.len() < 8 {
+        return Err(DomainError::Usage {
+            message: format!("invalid adopted workspace id: {adopted_workspace_id}"),
+            repair: Some("Use an ID returned by 'ee workspace list --json'.".to_owned()),
+        });
+    }
+
+    let selected_path = options
+        .workspace_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
+    let workspace_root = canonical_or_lexical(&selected_path);
+    let database_path = options
+        .database_path
+        .clone()
+        .unwrap_or_else(|| workspace_root.join(".ee").join("ee.db"));
+    let connection = if options.dry_run {
+        DbConnection::open_file_read_only(&database_path)
+    } else {
+        DbConnection::open_file(&database_path)
+    }
+    .map_err(|error| storage_error("failed to open workspace database", error))?;
+
+    if !options.dry_run {
+        connection
+            .migrate()
+            .map_err(|error| storage_error("failed to migrate workspace database", error))?;
+    }
+
+    let requested_owner_id = stable_workspace_id(&workspace_root);
+    let owner = select_adoption_owner_workspace_row(
+        &connection,
+        &requested_owner_id,
+        &[selected_path.as_path(), workspace_root.as_path()],
+    )?
+    .ok_or_else(|| DomainError::NotFound {
+        resource: "workspace owner".to_owned(),
+        id: requested_owner_id.clone(),
+        repair: Some("Run 'ee init --workspace .' before adopting a scope.".to_owned()),
+    })?;
+
+    if owner.id == adopted_workspace_id {
+        return Err(DomainError::Usage {
+            message: "workspace adoption owner and adopted IDs must differ".to_owned(),
+            repair: Some("Choose the legacy workspace ID as the adopted target.".to_owned()),
+        });
+    }
+
+    let adopted = connection
+        .get_workspace(adopted_workspace_id)
+        .map_err(|error| storage_error("failed to query adopted workspace", error))?
+        .ok_or_else(|| DomainError::NotFound {
+            resource: "adopted workspace".to_owned(),
+            id: adopted_workspace_id.to_owned(),
+            repair: Some(
+                "Use an existing workspace ID from 'ee workspace list --json'.".to_owned(),
+            ),
+        })?;
+
+    let scope_ids = workspace_memory_scope_ids(&connection, &owner.id)
+        .map_err(|error| storage_error("failed to inspect existing workspace adoption", error))?;
+    let already_adopted = scope_ids.iter().any(|id| id == adopted_workspace_id);
+    let owner_live_memory_count = connection
+        .count_live_memories_for_workspace(&owner.id)
+        .map_err(|error| storage_error("failed to count owner memories", error))?;
+    let adopted_live_memory_count = connection
+        .count_live_memories_for_workspace(adopted_workspace_id)
+        .map_err(|error| storage_error("failed to count adopted memories", error))?;
+    let scoped_live_memory_count = scope_ids
+        .iter()
+        .map(|id| connection.count_live_memories_for_workspace(id))
+        .collect::<crate::db::Result<Vec<_>>>()
+        .map_err(|error| storage_error("failed to count adopted scope", error))?
+        .into_iter()
+        .fold(0_u64, u64::saturating_add);
+
+    let mut persisted = false;
+    let mut audit_id = None;
+    if !options.dry_run && !already_adopted {
+        let id = generate_audit_id();
+        let details = serde_json::json!({
+            "schema": WORKSPACE_MEMORY_SCOPE_ADOPTION_SCHEMA_V1,
+            "ownerWorkspaceId": &owner.id,
+            "adoptedWorkspaceId": &adopted.id,
+            "ownerPath": &owner.path,
+            "adoptedPath": &adopted.path,
+            "reason": reason,
+            "evidenceHash": evidence_hash,
+        })
+        .to_string();
+        connection
+            .with_transaction(|| {
+                connection.insert_audit(
+                    &id,
+                    &CreateAuditInput {
+                        workspace_id: Some(owner.id.clone()),
+                        actor: Some(options.actor.clone().unwrap_or_else(|| "ee-cli".to_owned())),
+                        action: WORKSPACE_MEMORY_SCOPE_ADOPT_ACTION.to_owned(),
+                        target_type: Some("workspace".to_owned()),
+                        target_id: Some(adopted.id.clone()),
+                        details: Some(details),
+                    },
+                )
+            })
+            .map_err(|error| storage_error("failed to persist workspace adoption", error))?;
+        persisted = true;
+        audit_id = Some(id);
+    }
+
+    Ok(WorkspaceMemoryScopeAdoptionReport {
+        schema: WORKSPACE_MEMORY_SCOPE_ADOPTION_SCHEMA_V1,
+        command: "workspace adopt",
+        status: if already_adopted {
+            "already_adopted"
+        } else if options.dry_run {
+            "would_adopt"
+        } else {
+            "adopted"
+        },
+        database_path: database_path.display().to_string(),
+        owner_workspace_id: owner.id,
+        owner_workspace_path: owner.path,
+        adopted_workspace_id: adopted.id,
+        adopted_workspace_path: adopted.path,
+        owner_live_memory_count,
+        adopted_live_memory_count,
+        scoped_live_memory_count: if already_adopted {
+            scoped_live_memory_count
+        } else {
+            scoped_live_memory_count.saturating_add(adopted_live_memory_count)
+        },
+        reason: reason.to_owned(),
+        evidence_hash: evidence_hash.to_owned(),
+        dry_run: options.dry_run,
+        persisted,
+        audit_id,
+    })
+}
+
 pub fn alias_workspace(
     options: &WorkspaceAliasOptions,
 ) -> Result<WorkspaceAliasReport, DomainError> {
@@ -2773,6 +3071,76 @@ pub(crate) fn bound_workspace_id_or_hash(
     )
 }
 
+/// Resolve an adoption owner only from an exact stable ID or an unambiguous
+/// path match. Adoption must never choose a row by live-memory count because
+/// that count is mutable data rather than identity evidence.
+fn select_adoption_owner_workspace_row(
+    connection: &DbConnection,
+    requested_workspace_id: &str,
+    workspace_paths: &[&Path],
+) -> Result<Option<StoredWorkspace>, DomainError> {
+    if let Some(exact) = connection
+        .get_workspace(requested_workspace_id)
+        .map_err(|error| DomainError::Storage {
+            message: format!("Failed to query workspace owner by id: {error}"),
+            repair: Some("ee doctor".to_owned()),
+        })?
+    {
+        return Ok(Some(exact));
+    }
+
+    let mut matches = BTreeMap::new();
+    for workspace_path in workspace_paths {
+        for key in workspace_path_lookup_keys(workspace_path) {
+            if let Some(existing) =
+                connection
+                    .get_workspace_by_path(&key)
+                    .map_err(|error| DomainError::Storage {
+                        message: format!("Failed to query workspace owner path: {error}"),
+                        repair: Some("ee doctor".to_owned()),
+                    })?
+            {
+                matches.entry(existing.id.clone()).or_insert(existing);
+            }
+        }
+    }
+    let input_keys = workspace_paths
+        .iter()
+        .flat_map(|path| workspace_path_lookup_keys(path))
+        .collect::<BTreeSet<_>>();
+    if !input_keys.is_empty() {
+        for row in connection
+            .list_workspaces()
+            .map_err(|error| DomainError::Storage {
+                message: format!("Failed to list workspace owner candidates: {error}"),
+                repair: Some("ee doctor".to_owned()),
+            })?
+        {
+            if workspace_path_lookup_keys(Path::new(&row.path))
+                .iter()
+                .any(|key| input_keys.contains(key))
+            {
+                matches.entry(row.id.clone()).or_insert(row);
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_values().next()),
+        _ => Err(DomainError::Storage {
+            message: format!(
+                "ambiguous workspace owner for adoption: {}",
+                matches.keys().cloned().collect::<Vec<_>>().join(", ")
+            ),
+            repair: Some(
+                "Record one explicit stable owner ID or remove the duplicate path rows before adoption."
+                    .to_owned(),
+            ),
+        }),
+    }
+}
+
 pub(crate) fn select_existing_workspace_row(
     connection: &DbConnection,
     requested_workspace_id: &str,
@@ -3385,6 +3753,190 @@ mod tests {
             1,
             "must not invent a second workspace row"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_memory_scope_adoption_reads_stable_ids_without_rewriting_rows() -> TestResult {
+        let connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
+        connection.migrate().map_err(|error| error.to_string())?;
+        let owner_id = "wsp_01234567890123456789012345";
+        let adopted_id = "wsp_98765432109876543210987654";
+        connection
+            .insert_workspace(
+                owner_id,
+                &CreateWorkspaceInput {
+                    path: "/tmp/ee-scope-owner".to_owned(),
+                    name: None,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .insert_workspace(
+                adopted_id,
+                &CreateWorkspaceInput {
+                    path: "/storage/codex-global/ee".to_owned(),
+                    name: None,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let details = serde_json::json!({
+            "schema": WORKSPACE_MEMORY_SCOPE_ADOPTION_SCHEMA_V1,
+            "ownerWorkspaceId": owner_id,
+            "adoptedWorkspaceId": adopted_id,
+        })
+        .to_string();
+        connection
+            .insert_audit(
+                "audit_00000000000000000000000000",
+                &CreateAuditInput {
+                    workspace_id: Some(owner_id.to_owned()),
+                    actor: Some("test".to_owned()),
+                    action: WORKSPACE_MEMORY_SCOPE_ADOPT_ACTION.to_owned(),
+                    target_type: Some("workspace".to_owned()),
+                    target_id: Some(adopted_id.to_owned()),
+                    details: Some(details),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+
+        let scope =
+            workspace_memory_scope_ids(&connection, owner_id).map_err(|error| error.to_string())?;
+        assert_eq!(scope, vec![owner_id.to_owned(), adopted_id.to_owned()]);
+        assert_eq!(
+            connection
+                .get_workspace(adopted_id)
+                .map_err(|error| error.to_string())?
+                .expect("adopted row remains separate")
+                .path,
+            "/storage/codex-global/ee"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_memory_scope_generation_tracks_nonmax_adopted_writes() -> TestResult {
+        let connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
+        connection.migrate().map_err(|error| error.to_string())?;
+        let owner_id = "wsp_01234567890123456789012345";
+        let adopted_id = "wsp_98765432109876543210987654";
+        connection
+            .insert_workspace(
+                owner_id,
+                &CreateWorkspaceInput {
+                    path: "/tmp/ee-generation-owner".to_owned(),
+                    name: None,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .insert_workspace(
+                adopted_id,
+                &CreateWorkspaceInput {
+                    path: "/tmp/ee-generation-adopted".to_owned(),
+                    name: None,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let memory = |workspace_id: &str, content: &str| crate::db::CreateMemoryInput {
+            workspace_id: workspace_id.to_owned(),
+            level: "procedural".to_owned(),
+            kind: "rule".to_owned(),
+            content: content.to_owned(),
+            workflow_id: None,
+            confidence: 0.9,
+            utility: 0.5,
+            importance: 0.5,
+            provenance_uri: None,
+            trust_class: crate::models::TrustClass::HumanExplicit.as_str().to_owned(),
+            trust_subclass: None,
+            tags: Vec::new(),
+            valid_from: None,
+            valid_to: None,
+        };
+        connection
+            .insert_memory(
+                "mem_00000000000000000000000001",
+                &memory(owner_id, "owner memory"),
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .insert_memory(
+                "mem_00000000000000000000000002",
+                &memory(adopted_id, "adopted memory one"),
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute_raw(
+                "UPDATE workspace_generations SET generation = 100 WHERE workspace_id = 'wsp_01234567890123456789012345'",
+            )
+            .map_err(|error| error.to_string())?;
+        let details = serde_json::json!({
+            "schema": WORKSPACE_MEMORY_SCOPE_ADOPTION_SCHEMA_V1,
+            "ownerWorkspaceId": owner_id,
+            "adoptedWorkspaceId": adopted_id,
+        })
+        .to_string();
+        connection
+            .insert_audit(
+                "audit_00000000000000000000000000",
+                &CreateAuditInput {
+                    workspace_id: Some(owner_id.to_owned()),
+                    actor: Some("test".to_owned()),
+                    action: WORKSPACE_MEMORY_SCOPE_ADOPT_ACTION.to_owned(),
+                    target_type: Some("workspace".to_owned()),
+                    target_id: Some(adopted_id.to_owned()),
+                    details: Some(details),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+
+        let before = workspace_memory_scope_generation(&connection, owner_id)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            before,
+            Some(102),
+            "owner 100 + adopted 1 + membership fence"
+        );
+        connection
+            .insert_memory(
+                "mem_00000000000000000000000003",
+                &memory(adopted_id, "adopted memory two"),
+            )
+            .map_err(|error| error.to_string())?;
+        let after = workspace_memory_scope_generation(&connection, owner_id)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(after, Some(103), "non-max adopted write advances the scope");
+        assert!(after > before);
+        Ok(())
+    }
+
+    #[test]
+    fn adoption_owner_selection_rejects_ambiguous_path_rows() -> TestResult {
+        let connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
+        connection.migrate().map_err(|error| error.to_string())?;
+        let path = "/tmp/ee-ambiguous-owner";
+        for (workspace_id, stored_path) in [
+            ("wsp_aaaaaaaaaaaaaaaaaaaaaaaaaa", path.to_owned()),
+            ("wsp_bbbbbbbbbbbbbbbbbbbbbbbbbb", format!("{path}/")),
+        ] {
+            connection
+                .insert_workspace(
+                    workspace_id,
+                    &CreateWorkspaceInput {
+                        path: stored_path,
+                        name: None,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        let error = select_adoption_owner_workspace_row(
+            &connection,
+            "wsp_cccccccccccccccccccccccccc",
+            &[Path::new(path)],
+        )
+        .expect_err("duplicate path rows must not be selected by mutable memory counts");
+        assert!(error.message().contains("ambiguous workspace owner"));
         Ok(())
     }
 
