@@ -65,6 +65,14 @@ fn remember_pack_guard_fixture(
     Ok(report.memory_id.to_string())
 }
 
+fn initialize_fixture_database(database_path: &Path) -> TestResult {
+    // Ordinary writes require an already-addressed store. Initialize the
+    // temporary fixture the same way `ee init` does before calling remember.
+    let connection = DbConnection::open_file(database_path).map_err(|error| error.to_string())?;
+    connection.migrate().map_err(|error| error.to_string())?;
+    connection.close().map_err(|error| error.to_string())
+}
+
 fn insert_contradiction_link(database_path: &Path, first: &str, second: &str) -> TestResult {
     let connection = DbConnection::open_file(database_path).map_err(|error| error.to_string())?;
     connection.migrate().map_err(|error| error.to_string())?;
@@ -138,6 +146,7 @@ fn production_pack_suppresses_one_side_of_explicit_contradiction() -> TestResult
     let database_path = db_path(&workspace_path);
     fs::create_dir_all(database_path.parent().ok_or("missing db parent")?)
         .map_err(|error| error.to_string())?;
+    initialize_fixture_database(&database_path)?;
 
     let first = remember_pack_guard_fixture(
         &workspace_path,
