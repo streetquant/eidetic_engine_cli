@@ -4299,9 +4299,9 @@ mod tests {
         connection_a.migrate().expect("migrate database a");
         connection_a
             .append_mesh_origin_event(&crate::db::CreateMeshOriginEventInput {
-                event_id: "mesh_oevt_route_a_000000000001".to_owned(),
-                team_id: "team-a".to_owned(),
-                origin_node_id: "node-responder-a".to_owned(),
+                event_id: "mesh_oevt_aaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                team_id: "team_route_a".to_owned(),
+                origin_node_id: "node_responder_a".to_owned(),
                 signing_key_generation: 1,
                 seq: 0,
                 prev_event_hash: None,
@@ -4320,9 +4320,9 @@ mod tests {
         connection_b.migrate().expect("migrate database b");
         connection_b
             .append_mesh_origin_event(&crate::db::CreateMeshOriginEventInput {
-                event_id: "mesh_oevt_route_b_000000000001".to_owned(),
-                team_id: "team-b".to_owned(),
-                origin_node_id: "node-responder-b".to_owned(),
+                event_id: "mesh_oevt_bbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                team_id: "team_route_b".to_owned(),
+                origin_node_id: "node_responder_b".to_owned(),
                 signing_key_generation: 1,
                 seq: 0,
                 prev_event_hash: None,
@@ -4340,13 +4340,14 @@ mod tests {
 
         let mut route_a = route(workspace_a.path().to_path_buf(), 41888);
         route_a.database_path = Some(database_a);
-        route_a.expectations.responder_node_id = "node-responder-a".to_owned();
-        route_a.expectations.responder_workspace_id = "workspace-a".to_owned();
+        route_a.expectations.team_id = "team_route_a".to_owned();
+        route_a.expectations.responder_node_id = "node_responder_a".to_owned();
+        route_a.expectations.responder_workspace_id = "wsp_persistfixture000000000001".to_owned();
         let mut route_b = route(workspace_b.path().to_path_buf(), 41888);
         route_b.database_path = Some(database_b);
-        route_b.expectations.team_id = "team-b".to_owned();
-        route_b.expectations.responder_node_id = "node-responder-b".to_owned();
-        route_b.expectations.responder_workspace_id = "workspace-b".to_owned();
+        route_b.expectations.team_id = "team_route_b".to_owned();
+        route_b.expectations.responder_node_id = "node_responder_b".to_owned();
+        route_b.expectations.responder_workspace_id = "wsp_joinworkspace0000000000001".to_owned();
         let binding_b = authenticated_binding_for(&route_b);
         let registry =
             ResponderRouteRegistry::new([route_a, route_b]).expect("valid multi-route registry");
@@ -4355,7 +4356,10 @@ mod tests {
 
         let response = load_sync_round_response(&authenticated_route, 0, 16);
         assert_eq!(response.events.len(), 1);
-        assert_eq!(response.events[0].origin_workspace_id, "workspace-b");
+        assert_eq!(
+            response.events[0].origin_workspace_id,
+            "wsp_joinworkspace0000000000001"
+        );
         assert_eq!(
             response.events[0].event_hash,
             "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -4376,7 +4380,7 @@ mod tests {
         connection_a.migrate().expect("migrate database a");
         connection_a
             .insert_workspace(
-                "workspace-a",
+                "wsp_persistfixture000000000001",
                 &crate::db::CreateWorkspaceInput {
                     path: workspace_a.path().display().to_string(),
                     name: Some("workspace a".to_owned()),
@@ -4385,7 +4389,7 @@ mod tests {
             .expect("insert workspace a");
         let created = crate::mesh::team::create_local_team(
             &connection_a,
-            "workspace-a",
+            "wsp_persistfixture000000000001",
             "Route A",
             "2026-09-01T00:00:00Z",
         )
@@ -4409,12 +4413,12 @@ mod tests {
         route_a.database_path = Some(database_a);
         route_a.expectations.team_id = created.team.team_id.clone();
         route_a.expectations.responder_node_id = created.team.origin_node_id;
-        route_a.expectations.responder_workspace_id = "workspace-a".to_owned();
+        route_a.expectations.responder_workspace_id = "wsp_persistfixture000000000001".to_owned();
         let mut route_b = route(workspace_b.path().to_path_buf(), 41888);
         route_b.database_path = Some(database_b);
-        route_b.expectations.team_id = "zzzz-team-b".to_owned();
-        route_b.expectations.responder_node_id = "node-responder-b".to_owned();
-        route_b.expectations.responder_workspace_id = "workspace-b".to_owned();
+        route_b.expectations.team_id = "team_route_b".to_owned();
+        route_b.expectations.responder_node_id = "node_responder_b".to_owned();
+        route_b.expectations.responder_workspace_id = "wsp_joinworkspace0000000000001".to_owned();
         let binding_b = authenticated_binding_for(&route_b);
         let registry =
             ResponderRouteRegistry::new([route_a, route_b]).expect("valid multi-route registry");

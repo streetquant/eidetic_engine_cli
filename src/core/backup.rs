@@ -11739,7 +11739,7 @@ mod tests {
         let manifest =
             fs::read_to_string(&report.manifest_path).map_err(|error| error.to_string())?;
         ensure(
-            manifest.contains(BACKUP_MANIFEST_SCHEMA_V1),
+            manifest.contains(BACKUP_MANIFEST_SCHEMA_V2),
             "manifest schema must be present",
         )
     }

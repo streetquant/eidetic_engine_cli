@@ -17242,7 +17242,7 @@ mod tests {
         );
 
         let assist = run_search(&SearchOptions {
-            relevance_floor: Some(f32::MAX),
+            relevance_floor: Some(1.0),
             ..base_options.clone()
         })
         .map_err(|error| format!("post-denial query-assist search failed: {error}"))?;

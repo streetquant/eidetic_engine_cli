@@ -9341,13 +9341,6 @@ mod tests {
         .expect("create");
         let team_id = created.team.team_id.clone();
         let origin_node = created.team.origin_node_id.clone();
-        let member_id = connection
-            .list_all_team_members()
-            .expect("members")
-            .into_iter()
-            .next()
-            .expect("self")
-            .member_id;
         let port = {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
             listener.local_addr().expect("addr").port()
@@ -9366,6 +9359,23 @@ mod tests {
             "wsp_joinworkspace0000000000001",
         )
         .expect("enroll");
+        // The current authenticated frame contract carries a peer whose identity
+        // was already verified locally, and binds the member to that peer node.
+        let member_id = connection
+            .list_all_team_members()
+            .expect("members")
+            .into_iter()
+            .find(|member| member.origin_node_id == joiner_node)
+            .expect("joiner member")
+            .member_id;
+        record_member_tailnet_identity(
+            &connection,
+            &member_id,
+            "alice@acme.com",
+            Some("user-1"),
+            "2026-08-13T20:00:00Z",
+        )
+        .expect("locally verified joiner identity");
         persist_pair_key(
             &workspace,
             &team_id,
