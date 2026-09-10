@@ -31,12 +31,12 @@ use crate::db::{
     StoredAuditEntry, StoredCausalEvidence, StoredCertificateRecord, StoredCurationCandidate,
     StoredCurationTtlPolicy, StoredEpisodeAction, StoredErrorFingerprint, StoredErrorRepairLink,
     StoredEvidenceSpan, StoredFeedbackEvent, StoredFeedbackQuarantine, StoredGraphAlgorithmResult,
-    StoredGraphAlgorithmWitness, StoredGraphSnapshot, StoredImportLedger, StoredJournalEntry,
-    StoredLearningObservation, StoredMemory, StoredMemoryLink, StoredOutcomeEvidence,
-    StoredPackHistory, StoredProceduralRule, StoredProcedure, StoredProcedureEvent,
-    StoredRationaleTrace, StoredRationaleTraceLink, StoredRchVerifyRun, StoredRecorderEvent,
-    StoredRecorderRun, StoredSearchIndexJob, StoredSession, StoredTaskEpisode,
-    StoredTrustQuarantine, audit_actions,
+    StoredGraphAlgorithmWitness, StoredGraphSnapshot, StoredImportLedger,
+    StoredImportLedgerWithOwner, StoredJournalEntry, StoredLearningObservation, StoredMemory,
+    StoredMemoryLink, StoredOutcomeEvidence, StoredPackHistory, StoredProceduralRule,
+    StoredProcedure, StoredProcedureEvent, StoredRationaleTrace, StoredRationaleTraceLink,
+    StoredRchVerifyRun, StoredRecorderEvent, StoredRecorderRun, StoredSearchIndexJob,
+    StoredSession, StoredTaskEpisode, StoredTrustQuarantine, audit_actions,
 };
 use crate::models::{
     BACKUP_CREATE_SCHEMA_V1, BACKUP_INSPECT_SCHEMA_V1, BACKUP_LIST_SCHEMA_V1,
@@ -66,6 +66,10 @@ const WORK_HISTORY_CHUNK_ROWS: usize = 128;
 const LEARNING_HISTORY_SCHEMA: &str = "ee.backup.learning_history.v2";
 const PACK_HISTORY_SCHEMA: &str = "ee.backup.pack_history.v1";
 const IMPORT_HISTORY_SCHEMA: &str = "ee.backup.import_history.v1";
+/// Owner recorded on import checkpoints created before V122 introduced
+/// attempt-owner compare-and-set fencing. It is a migration marker only; it
+/// never authenticates a live importer.
+const LEGACY_IMPORT_OWNER_ID: &str = "legacy";
 const CURATION_HISTORY_SCHEMA: &str = "ee.backup.curation_history.v1";
 const PROCEDURE_HISTORY_SCHEMA: &str = "ee.backup.procedure_history.v1";
 const LEARNING_SIGNALS_SCHEMA: &str = "ee.backup.learning_signals.v1";
@@ -1544,9 +1548,106 @@ struct BackupImportHistory {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BackupImportCheckpoint {
-    ledger: StoredImportLedger,
+    // Keep this as a backup wire record instead of deserializing
+    // `StoredImportLedger` directly. `ee.backup.import_history.v1` predates
+    // V122, so old authenticated chunks legitimately omit `ownerId`.
+    ledger: BackupImportLedger,
     /// Validated CASS query options, without the host-local workspace path.
     cass_query: Option<String>,
+}
+
+/// Import-ledger wire shape for the stable v1 derived artifact.
+///
+/// `owner_id` is optional only on the wire. A missing value is converted to
+/// the V122 migration marker after the entire chunk has passed authentication;
+/// retaining `None` during serialization is what lets legacy signatures verify
+/// over the exact pre-V122 bytes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BackupImportLedger {
+    id: String,
+    workspace_id: String,
+    source_kind: String,
+    source_id: String,
+    status: String,
+    cursor_json: Option<String>,
+    imported_session_count: u32,
+    imported_span_count: u32,
+    attempt_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_id: Option<String>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    metadata_json: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<StoredImportLedger> for BackupImportLedger {
+    fn from(ledger: StoredImportLedger) -> Self {
+        Self {
+            id: ledger.id,
+            workspace_id: ledger.workspace_id,
+            source_kind: ledger.source_kind,
+            source_id: ledger.source_id,
+            status: ledger.status,
+            cursor_json: ledger.cursor_json,
+            imported_session_count: ledger.imported_session_count,
+            imported_span_count: ledger.imported_span_count,
+            attempt_count: ledger.attempt_count,
+            // The public stored row intentionally has no owner. Callers that
+            // have the owner-bearing internal row use the conversion below.
+            owner_id: None,
+            error_code: ledger.error_code,
+            error_message: ledger.error_message,
+            started_at: ledger.started_at,
+            completed_at: ledger.completed_at,
+            metadata_json: ledger.metadata_json,
+            created_at: ledger.created_at,
+            updated_at: ledger.updated_at,
+        }
+    }
+}
+
+impl From<StoredImportLedgerWithOwner> for BackupImportLedger {
+    fn from(row: StoredImportLedgerWithOwner) -> Self {
+        let mut wire = Self::from(row.ledger);
+        wire.owner_id = Some(row.owner_id);
+        wire
+    }
+}
+
+impl BackupImportLedger {
+    /// Convert an authenticated wire row into the current storage shape.
+    ///
+    /// Callers must invoke this only after authenticating the enclosing chunk;
+    /// the optional owner is intentionally not defaulted during verification.
+    fn into_stored_after_auth(self) -> (StoredImportLedger, String) {
+        let owner_id = self
+            .owner_id
+            .unwrap_or_else(|| LEGACY_IMPORT_OWNER_ID.to_owned());
+        let row = StoredImportLedger {
+            id: self.id,
+            workspace_id: self.workspace_id,
+            source_kind: self.source_kind,
+            source_id: self.source_id,
+            status: self.status,
+            cursor_json: self.cursor_json,
+            imported_session_count: self.imported_session_count,
+            imported_span_count: self.imported_span_count,
+            attempt_count: self.attempt_count,
+            error_code: self.error_code,
+            error_message: self.error_message,
+            started_at: self.started_at,
+            completed_at: self.completed_at,
+            metadata_json: self.metadata_json,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        };
+        (row, owner_id)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -4620,13 +4721,53 @@ fn restore_graph_cache_workspace_from_assets(
 fn read_restored_derived_json(
     asset: &BackupRestoredDerivedAssetReport,
 ) -> Result<JsonValue, DomainError> {
-    let bytes = fs::read(&asset.restore_path).map_err(|error| DomainError::Import {
+    let mut file =
+        open_backup_artifact_for_read(Path::new(&asset.restore_path)).map_err(|error| {
+            DomainError::Import {
+                message: format!(
+                    "failed reading restored derived asset '{}': {error}",
+                    asset.restore_path
+                ),
+                repair: Some(
+                    "run ee backup verify <id-or-path> --json and retry restore".to_owned(),
+                ),
+            }
+        })?;
+    let metadata = file.metadata().map_err(|error| DomainError::Import {
         message: format!(
-            "failed reading restored derived asset '{}': {error}",
+            "failed stating restored derived asset '{}': {error}",
             asset.restore_path
         ),
         repair: Some("run ee backup verify <id-or-path> --json and retry restore".to_owned()),
     })?;
+    if !metadata.is_file() || metadata.len() > MAX_DERIVED_ASSET_BYTES {
+        return Err(DomainError::Import {
+            message: format!(
+                "restored derived asset '{}' must be a bounded regular file of at most {} bytes",
+                asset.restore_path, MAX_DERIVED_ASSET_BYTES
+            ),
+            repair: Some("inspect backup size constraints".to_owned()),
+        });
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_DERIVED_ASSET_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| DomainError::Import {
+            message: format!(
+                "failed reading restored derived asset '{}': {error}",
+                asset.restore_path
+            ),
+            repair: Some("run ee backup verify <id-or-path> --json and retry restore".to_owned()),
+        })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_DERIVED_ASSET_BYTES {
+        return Err(DomainError::Import {
+            message: format!(
+                "restored derived asset '{}' exceeds maximum allowed size of {} bytes",
+                asset.restore_path, MAX_DERIVED_ASSET_BYTES
+            ),
+            repair: Some("inspect backup size constraints".to_owned()),
+        });
+    }
     serde_json::from_slice(&bytes).map_err(|error| DomainError::Import {
         message: format!(
             "restored derived asset '{}' is not valid JSON: {error}",
@@ -6596,6 +6737,27 @@ fn valid_cass_checkpoint_query(query: &str) -> bool {
         && since.is_none_or(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
 }
 
+/// Opaque source identity used for a portable CASS query.
+///
+/// Hashing only the validated query keeps the alias stable when an authenticated
+/// backup is restored onto another workspace path. The workspace scope remains
+/// part of the ledger uniqueness key, so equal queries in distinct workspaces do
+/// not collide.
+fn portable_cass_source_alias(query: &str) -> String {
+    format!("source_{}", blake3::hash(query.as_bytes()).to_hex())
+}
+
+fn canonical_cass_source_id(workspace_path: &str, query: &str) -> String {
+    format!("cass://sessions?workspace={workspace_path}&{query}")
+}
+
+fn is_portable_cass_source_alias(source_id: &str) -> bool {
+    let Some(hash) = source_id.strip_prefix("source_") else {
+        return false;
+    };
+    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn collect_import_history_payloads(
     connection: &DbConnection,
     workspace: &ExportWorkspaceRecord,
@@ -6606,43 +6768,56 @@ fn collect_import_history_payloads(
 ) -> Result<(), DomainError> {
     let prefix = format!("cass://sessions?workspace={}&", workspace.path);
     let mut imports = Vec::new();
-    for mut ledger in connection
-        .list_import_ledgers(&workspace.workspace_id)
+    for mut stored in connection
+        .list_import_ledgers_with_owner(&workspace.workspace_id)
         .map_err(work_history_error)?
     {
-        let cass_query = ledger
+        let cass_query = stored
+            .ledger
             .source_id
             .strip_prefix(&prefix)
             .filter(|query| valid_cass_checkpoint_query(query))
             .map(str::to_owned);
-        let redacted_source = redact_content(&ledger.source_id, redaction);
-        if cass_query.is_some() || redacted_source != ledger.source_id {
-            // Preserve uniqueness without carrying the old host path. The query
-            // options restore the live source key; other sources retain an alias.
-            ledger.source_id = format!(
+        let redacted_source = redact_content(&stored.ledger.source_id, redaction);
+        if let Some(query) = cass_query.as_deref() {
+            // Keep the portable alias coupled to the query that reconstructs
+            // the canonical resume key. This makes export/restore/re-export
+            // stable without carrying the old host-local workspace path.
+            stored.ledger.source_id = portable_cass_source_alias(query);
+        } else if redacted_source != stored.ledger.source_id {
+            // Other redacted sources remain opaque history entries and never
+            // become live CASS queries during restore.
+            stored.ledger.source_id = format!(
                 "source_{}",
-                blake3::hash(ledger.source_id.as_bytes()).to_hex()
+                blake3::hash(stored.ledger.source_id.as_bytes()).to_hex()
             );
         }
-        ledger.error_message = ledger
+        stored.ledger.error_message = stored
+            .ledger
             .error_message
             .as_deref()
             .map(|s| redact_content(s, redaction));
-        ledger.error_code = ledger
+        stored.ledger.error_code = stored
+            .ledger
             .error_code
             .as_deref()
             .map(|s| redact_content(s, redaction));
-        ledger.cursor_json = ledger
+        stored.ledger.cursor_json = stored
+            .ledger
             .cursor_json
             .as_deref()
             .map(|s| redact_work_history_json(s, redaction))
             .transpose()?;
-        ledger.metadata_json = ledger
+        stored.ledger.metadata_json = stored
+            .ledger
             .metadata_json
             .as_deref()
             .map(|s| redact_work_history_json(s, redaction))
             .transpose()?;
-        imports.push(BackupImportCheckpoint { ledger, cass_query });
+        imports.push(BackupImportCheckpoint {
+            ledger: BackupImportLedger::from(stored),
+            cass_query,
+        });
     }
     imports.sort_by(|a, b| a.ledger.id.cmp(&b.ledger.id));
     let count = imports.len().div_ceil(WORK_HISTORY_CHUNK_ROWS);
@@ -6771,7 +6946,7 @@ fn restore_import_history(
     let workspace_id =
         remap_restored_workspace_id(&workspaces, Some(&source_id), "import history")?
             .ok_or_else(|| work_history_error("missing import-history workspace"))?;
-    let workspace = workspaces
+    let _workspace = workspaces
         .iter()
         .find(|w| w.id == workspace_id)
         .ok_or_else(|| work_history_error("missing restored import workspace"))?;
@@ -6779,7 +6954,7 @@ fn restore_import_history(
     let mut ids = BTreeSet::new();
     let mut sources = BTreeSet::new();
     for checkpoint in chunks.into_iter().flat_map(|c| c.imports) {
-        let mut row = checkpoint.ledger;
+        let (mut row, owner_id) = checkpoint.ledger.into_stored_after_auth();
         if row.workspace_id != source_id || !ids.insert(row.id.clone()) {
             return Err(work_history_error("foreign or duplicate import checkpoint"));
         }
@@ -6787,7 +6962,13 @@ fn restore_import_history(
             if row.source_kind != "cass" || !valid_cass_checkpoint_query(&query) {
                 return Err(work_history_error("invalid portable CASS checkpoint query"));
             }
-            row.source_id = format!("cass://sessions?workspace={}&{query}", workspace.path);
+            if is_portable_cass_source_alias(&row.source_id) {
+                // Exported portable aliases carry the validated query as their
+                // canonical resume identity. Rebind only that explicit alias;
+                // an authenticated canonical or opaque source_id stays
+                // authoritative and is never reconstructed from a hint.
+                row.source_id = canonical_cass_source_id(&_workspace.path, &query);
+            }
         }
         if !sources.insert((row.source_kind.clone(), row.source_id.clone())) {
             return Err(work_history_error("duplicate recovered import source"));
@@ -6800,12 +6981,12 @@ fn restore_import_history(
             row.started_at = None;
             row.completed_at = None;
         }
-        rows.push(row);
+        rows.push((row, owner_id));
     }
     connection
         .with_transaction(|| {
-            for row in &rows {
-                connection.insert_import_ledger_for_recovery(row)?;
+            for (row, owner_id) in &rows {
+                connection.insert_import_ledger_for_recovery_with_owner(row, owner_id)?;
             }
             Ok(())
         })
@@ -17217,6 +17398,17 @@ mod tests {
         }
     }
 
+    fn recovery_import_wire(
+        workspace: &str,
+        path: &Path,
+        n: u32,
+        owner_id: Option<&str>,
+    ) -> BackupImportLedger {
+        let mut wire = BackupImportLedger::from(recovery_import(workspace, path, n));
+        wire.owner_id = owner_id.map(str::to_owned);
+        wire
+    }
+
     #[test]
     fn default_backup_restores_import_checkpoints_and_reopens_same_source() -> TestResult {
         for redaction in [
@@ -17439,6 +17631,526 @@ mod tests {
         Ok(())
     }
 
+    fn import_history_chunk(
+        backup_id: &str,
+        workspace_id: &str,
+        chunk_index: usize,
+        chunk_count: usize,
+        ledger: BackupImportLedger,
+        cass_query: Option<&str>,
+    ) -> BackupImportHistory {
+        BackupImportHistory {
+            schema: IMPORT_HISTORY_SCHEMA.to_owned(),
+            backup_id: backup_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            chunk_index,
+            chunk_count,
+            imports: vec![BackupImportCheckpoint {
+                ledger,
+                cass_query: cass_query.map(str::to_owned),
+            }],
+            authentication: None,
+        }
+    }
+
+    fn authenticated_import_history_assets(
+        tempdir: &TempDir,
+        workspace: &Path,
+        chunks: Vec<BackupImportHistory>,
+    ) -> Result<Vec<BackupRestoredDerivedAssetReport>, String> {
+        let root = StoreAuthRoot::create(workspace_keys_dir(workspace))
+            .map_err(|error| error.to_string())?;
+        let mut payloads = chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, chunk)| {
+                serialized_payload_bytes(&chunk)
+                    .map(|bytes| {
+                        derived_payload(
+                            format!("derived/import-history/{index:08}.json"),
+                            "import_history",
+                            "2026-09-01T00:00:00Z",
+                            None,
+                            bytes,
+                        )
+                    })
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        authenticate_import_payloads(&mut payloads, Some(&root))
+            .map_err(|error| error.message())?;
+        payloads
+            .into_iter()
+            .enumerate()
+            .map(|(index, payload)| {
+                let path = tempdir
+                    .path()
+                    .join(format!("import-history-fixture-{index:02}.json"));
+                fs::write(&path, payload.bytes).map_err(|error| error.to_string())?;
+                Ok(restored_cass_asset(&path, "import_history"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn import_history_legacy_owner_default_is_authentication_gated() -> TestResult {
+        let (tempdir, workspace, database) = fixture().map_err(|error| error.message())?;
+        let source = DbConnection::open_file(&database).map_err(|error| error.to_string())?;
+        let source_workspace = source
+            .list_workspaces()
+            .map_err(|error| error.to_string())?
+            .remove(0);
+        let mut legacy_wire: BackupImportLedger =
+            recovery_import(&source_workspace.id, Path::new(&source_workspace.path), 0).into();
+        legacy_wire.owner_id = None;
+        let chunk = import_history_chunk(
+            "backup-legacy-auth-gate",
+            &source_workspace.id,
+            0,
+            1,
+            legacy_wire,
+            Some("limit=1"),
+        );
+        source.close().map_err(|error| error.to_string())?;
+
+        let assets = authenticated_import_history_assets(&tempdir, &workspace, vec![chunk])?;
+        let path = PathBuf::from(&assets[0].restore_path);
+        let mut tampered: BackupImportHistory =
+            serde_json::from_slice(&fs::read(&path).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        tampered.imports[0].ledger.status = "completed".to_owned();
+        ensure(
+            tampered.imports[0].ledger.owner_id.is_none(),
+            "tampered legacy fixture still omits ownerId",
+        )?;
+        fs::write(
+            &path,
+            serialized_payload_bytes(&tampered).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let error =
+            restore_import_history(&database, &workspace, "backup-legacy-auth-gate", &assets)
+                .err()
+                .ok_or("tampered legacy checkpoint was accepted")?;
+        ensure(
+            error.message().contains("authentication failed"),
+            format!(
+                "tampered legacy checkpoint failed at the auth boundary: {}",
+                error.message()
+            ),
+        )?;
+
+        let db = DbConnection::open_file(&database).map_err(|error| error.to_string())?;
+        ensure_equal(
+            db.count_table_rows("import_ledger")
+                .map_err(|error| error.to_string())?,
+            0,
+            "legacy owner default never reaches storage before authentication",
+        )?;
+        ensure_equal(
+            db.list_import_ledgers(&source_workspace.id)
+                .map_err(|error| error.to_string())?
+                .len(),
+            0,
+            "tampered legacy checkpoint leaves no recovered row",
+        )?;
+        db.close().map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn import_history_v1_restores_mixed_current_and_legacy_chunks() -> TestResult {
+        let (tempdir, workspace, database) = fixture().map_err(|error| error.message())?;
+        let source = DbConnection::open_file(&database).map_err(|error| error.to_string())?;
+        let source_workspace = source
+            .list_workspaces()
+            .map_err(|error| error.to_string())?
+            .remove(0);
+        let current_id =
+            recovery_import(&source_workspace.id, Path::new(&source_workspace.path), 0).id;
+        let current_wire = recovery_import_wire(
+            &source_workspace.id,
+            Path::new(&source_workspace.path),
+            0,
+            Some("owner-0"),
+        );
+        let legacy_wire = recovery_import_wire(
+            &source_workspace.id,
+            Path::new(&source_workspace.path),
+            1,
+            None,
+        );
+        let chunks = vec![
+            import_history_chunk(
+                "backup-mixed-owner-chunks",
+                &source_workspace.id,
+                0,
+                2,
+                current_wire,
+                Some("limit=1"),
+            ),
+            import_history_chunk(
+                "backup-mixed-owner-chunks",
+                &source_workspace.id,
+                1,
+                2,
+                legacy_wire,
+                Some("limit=2"),
+            ),
+        ];
+        source.close().map_err(|error| error.to_string())?;
+
+        let assets = authenticated_import_history_assets(&tempdir, &workspace, chunks)?;
+        let restored_count =
+            restore_import_history(&database, &workspace, "backup-mixed-owner-chunks", &assets)
+                .map_err(|error| error.message())?;
+        ensure_equal(restored_count, 2, "mixed current and legacy rows restored")?;
+
+        let db = DbConnection::open_file(&database).map_err(|error| error.to_string())?;
+        let actual = db
+            .list_import_ledgers_with_owner(&source_workspace.id)
+            .map_err(|error| error.to_string())?;
+        ensure_equal(actual.len(), 2, "mixed chunks produce two rows")?;
+        let current = actual
+            .iter()
+            .find(|row| row.ledger.id == current_id)
+            .ok_or("current checkpoint missing")?;
+        ensure_equal(
+            current.owner_id.as_str(),
+            "owner-0",
+            "current owner survives mixed restore",
+        )?;
+        let legacy = actual
+            .iter()
+            .find(|row| row.ledger.id != current_id)
+            .ok_or("legacy checkpoint missing")?;
+        ensure_equal(
+            legacy.owner_id.as_str(),
+            LEGACY_IMPORT_OWNER_ID,
+            "legacy owner default applies after mixed-chunk authentication",
+        )?;
+        db.close().map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn import_history_tampered_mixed_chunks_leave_zero_writes() -> TestResult {
+        let (tempdir, workspace, database) = fixture().map_err(|e| e.message())?;
+        let source = DbConnection::open_file(&database).map_err(|e| e.to_string())?;
+        let source_workspace = source
+            .list_workspaces()
+            .map_err(|e| e.to_string())?
+            .remove(0);
+        let current_wire = recovery_import_wire(
+            &source_workspace.id,
+            Path::new(&source_workspace.path),
+            0,
+            Some("owner-0"),
+        );
+        let legacy_wire = recovery_import_wire(
+            &source_workspace.id,
+            Path::new(&source_workspace.path),
+            1,
+            None,
+        );
+        let chunks = vec![
+            import_history_chunk(
+                "backup-mixed-tampered",
+                &source_workspace.id,
+                0,
+                2,
+                current_wire,
+                Some("limit=1"),
+            ),
+            import_history_chunk(
+                "backup-mixed-tampered",
+                &source_workspace.id,
+                1,
+                2,
+                legacy_wire,
+                Some("limit=2"),
+            ),
+        ];
+        source.close().map_err(|e| e.to_string())?;
+
+        let assets = authenticated_import_history_assets(&tempdir, &workspace, chunks)?;
+        let path = PathBuf::from(&assets[1].restore_path);
+        let mut tampered: BackupImportHistory =
+            serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        tampered.imports[0].ledger.status = "completed".to_owned();
+        ensure(
+            tampered.imports[0].ledger.owner_id.is_none(),
+            "tampered legacy chunk retains its omitted ownerId",
+        )?;
+        fs::write(
+            &path,
+            serialized_payload_bytes(&tampered).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let error = restore_import_history(&database, &workspace, "backup-mixed-tampered", &assets)
+            .err()
+            .ok_or("tampered mixed import history was accepted")?;
+        ensure(
+            error.message().contains("authentication failed"),
+            format!(
+                "tampered mixed chunk fails before storage: {}",
+                error.message()
+            ),
+        )?;
+
+        let db = DbConnection::open_file(&database).map_err(|e| e.to_string())?;
+        ensure_equal(
+            db.count_table_rows("import_ledger")
+                .map_err(|e| e.to_string())?,
+            0,
+            "tampered mixed chunks leave no recovered rows",
+        )?;
+        ensure_equal(
+            db.list_import_ledgers(&source_workspace.id)
+                .map_err(|e| e.to_string())?
+                .len(),
+            0,
+            "tampered mixed chunks leave no source-workspace rows",
+        )?;
+        db.close().map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn import_history_export_restore_reexport_preserves_wire_rows() -> TestResult {
+        let (tempdir, workspace, database) = fixture().map_err(|error| error.message())?;
+        let source = DbConnection::open_file(&database).map_err(|error| error.to_string())?;
+        let source_workspace_id = source
+            .list_workspaces()
+            .map_err(|error| error.to_string())?
+            .remove(0)
+            .id;
+        let mut current = recovery_import(&source_workspace_id, &workspace, 0);
+        current.source_kind = "cass".to_owned();
+        current.source_id = "fixture-current-source".to_owned();
+        let mut legacy = recovery_import(&source_workspace_id, &workspace, 5);
+        legacy.source_kind = "cass".to_owned();
+        legacy.source_id = "fixture-legacy-source".to_owned();
+        source
+            .with_transaction(|| {
+                source.insert_import_ledger_for_recovery_with_owner(&current, "owner-current")?;
+                source.insert_import_ledger_for_recovery_with_owner(
+                    &legacy,
+                    LEGACY_IMPORT_OWNER_ID,
+                )?;
+                Ok(())
+            })
+            .map_err(|error| error.to_string())?;
+        source.close().map_err(|error| error.to_string())?;
+
+        let first = create_backup(&BackupCreateOptions {
+            workspace_path: workspace.clone(),
+            database_path: Some(database.clone()),
+            output_dir: Some(workspace.join("backup-export")),
+            label: Some("import-wire-parity".to_owned()),
+            redaction_level: RedactionLevel::None,
+            include_derived: false,
+            include_graph_cache: false,
+            dry_run: false,
+        })
+        .map_err(|error| error.message())?;
+        let first_asset = first
+            .derived
+            .iter()
+            .find(|asset| asset.kind == "import_history")
+            .ok_or("first export omitted import history")?;
+        let first_chunk: BackupImportHistory = serde_json::from_slice(
+            &fs::read(Path::new(&first.backup_path).join(&first_asset.path))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        ensure(
+            first_chunk.authentication.is_some(),
+            "first export authenticates import history",
+        )?;
+        ensure_equal(
+            first_chunk.imports.len(),
+            2,
+            "first export contains both owner formats",
+        )?;
+
+        let side_path = tempdir.path().join("import-wire-parity-side");
+        let restored = restore_backup_to_side_path(&BackupRestoreOptions {
+            workspace_path: workspace.clone(),
+            backup_path: PathBuf::from(&first.backup_path),
+            side_path: side_path.clone(),
+            restore_graph_cache: false,
+            dry_run: false,
+        })
+        .map_err(|error| error.message())?;
+        ensure_equal(
+            restored.restored_import_ledger_count,
+            2,
+            "full restore retains both import checkpoints",
+        )?;
+        StoreAuthRoot::open_or_create(workspace_keys_dir(&side_path))
+            .map_err(|error| error.message())?;
+
+        let second = create_backup(&BackupCreateOptions {
+            workspace_path: side_path.clone(),
+            database_path: Some(PathBuf::from(&restored.restored_database_path)),
+            output_dir: Some(side_path.join("backup-reexport")),
+            label: Some("import-wire-parity-reexport".to_owned()),
+            redaction_level: RedactionLevel::None,
+            include_derived: false,
+            include_graph_cache: false,
+            dry_run: false,
+        })
+        .map_err(|error| error.message())?;
+        let second_asset = second
+            .derived
+            .iter()
+            .find(|asset| asset.kind == "import_history")
+            .ok_or("re-export omitted import history")?;
+        let second_chunk: BackupImportHistory = serde_json::from_slice(
+            &fs::read(Path::new(&second.backup_path).join(&second_asset.path))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        ensure(
+            second_chunk.authentication.is_some(),
+            "re-export authenticates import history",
+        )?;
+        ensure_equal(
+            second_chunk.chunk_index,
+            first_chunk.chunk_index,
+            "re-export preserves chunk index",
+        )?;
+        ensure_equal(
+            second_chunk.chunk_count,
+            first_chunk.chunk_count,
+            "re-export preserves chunk count",
+        )?;
+        let mut expected_imports = first_chunk.imports.clone();
+        for checkpoint in &mut expected_imports {
+            checkpoint.ledger.workspace_id = second_chunk.workspace_id.clone();
+        }
+        ensure_equal(
+            second_chunk.imports.clone(),
+            expected_imports,
+            "export-restore-re-export preserves import wire rows after workspace remap",
+        )?;
+        ensure(
+            second_chunk.imports.iter().any(|checkpoint| {
+                checkpoint.ledger.owner_id.as_deref() == Some(LEGACY_IMPORT_OWNER_ID)
+            }),
+            "re-export preserves the legacy owner migration marker",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn import_history_v1_restores_legacy_owner_and_preserves_current_wire_shape() -> TestResult {
+        let (tempdir, workspace, database) = fixture().map_err(|e| e.message())?;
+        let source = DbConnection::open_file(&database).map_err(|e| e.to_string())?;
+        let source_workspace = source
+            .list_workspaces()
+            .map_err(|e| e.to_string())?
+            .remove(0);
+        let original = recovery_import(&source_workspace.id, Path::new(&source_workspace.path), 0);
+        source.close().map_err(|e| e.to_string())?;
+
+        // A current row must serialize byte-for-byte through the backup wire
+        // record. This guards the compatibility adapter from changing the
+        // authenticated current-format representation.
+        let current_wire = recovery_import_wire(
+            &source_workspace.id,
+            Path::new(&source_workspace.path),
+            0,
+            Some("owner-0"),
+        );
+        ensure(
+            current_wire.owner_id.is_some(),
+            "current import checkpoint wire carries its owner",
+        )?;
+
+        // This is the pre-V122 fixture: ownerId was not present in the signed
+        // v1 checkpoint row. Keep the missing field through authentication so
+        // the legacy signature covers the exact historical JSON bytes.
+        let mut legacy_wire = current_wire;
+        legacy_wire.owner_id = None;
+        let chunk = BackupImportHistory {
+            schema: IMPORT_HISTORY_SCHEMA.to_owned(),
+            backup_id: "backup-legacy-import-history".to_owned(),
+            workspace_id: source_workspace.id.clone(),
+            chunk_index: 0,
+            chunk_count: 1,
+            imports: vec![BackupImportCheckpoint {
+                ledger: legacy_wire,
+                cass_query: Some("limit=1".to_owned()),
+            }],
+            authentication: None,
+        };
+        let legacy_bytes = serialized_payload_bytes(&chunk).map_err(|e| e.to_string())?;
+        ensure(
+            !String::from_utf8_lossy(&legacy_bytes).contains("\"ownerId\""),
+            "legacy fixture must omit ownerId before signing",
+        )?;
+
+        let root =
+            StoreAuthRoot::create(workspace_keys_dir(&workspace)).map_err(|e| e.to_string())?;
+        let mut payloads = vec![derived_payload(
+            "derived/import-history/00000000.json",
+            "import_history",
+            "2026-09-01T00:00:00Z",
+            None,
+            legacy_bytes,
+        )];
+        authenticate_import_payloads(&mut payloads, Some(&root)).map_err(|e| e.message())?;
+        let signed_bytes = payloads[0].bytes.clone();
+        ensure(
+            !String::from_utf8_lossy(&signed_bytes).contains("\"ownerId\""),
+            "authenticated legacy fixture must retain its historical wire shape",
+        )?;
+        let signed: BackupImportHistory =
+            serde_json::from_slice(&signed_bytes).map_err(|e| e.to_string())?;
+        ensure(
+            signed.authentication.is_some(),
+            "legacy fixture must carry an authentication header",
+        )?;
+
+        let path = tempdir.path().join("legacy-import-history.json");
+        fs::write(&path, signed_bytes).map_err(|e| e.to_string())?;
+        let restored_count = restore_import_history(
+            &database,
+            &workspace,
+            "backup-legacy-import-history",
+            &[restored_cass_asset(&path, "import_history")],
+        )
+        .map_err(|e| e.message())?;
+        ensure_equal(restored_count, 1, "legacy checkpoint restored")?;
+
+        let db = DbConnection::open_file(&database).map_err(|e| e.to_string())?;
+        let actual = db
+            .list_import_ledgers(&source_workspace.id)
+            .map_err(|e| e.to_string())?;
+        ensure_equal(actual.len(), 1, "one legacy checkpoint remains")?;
+        let restored = actual
+            .into_iter()
+            .next()
+            .ok_or("legacy checkpoint missing")?;
+        ensure_equal(
+            &restored,
+            &original,
+            "legacy owner defaults only after authentication and stored data is preserved",
+        )?;
+        let owner = db
+            .get_import_ledger_with_owner(&restored.id)
+            .map_err(|e| e.to_string())?
+            .ok_or("legacy owner row missing")?;
+        ensure_equal(
+            owner.owner_id,
+            LEGACY_IMPORT_OWNER_ID.to_owned(),
+            "legacy owner is stored through the internal owner boundary",
+        )?;
+        db.close().map_err(|e| e.to_string())
+    }
+
     #[test]
     fn import_history_rejects_tampering_and_rolls_back() -> TestResult {
         for defect in [
@@ -17458,14 +18170,17 @@ mod tests {
             let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(1)).to_string();
             let mut records = (0..2)
                 .map(|n| BackupImportCheckpoint {
-                    ledger: recovery_import(&workspace_id, &workspace, n),
+                    ledger: recovery_import(&workspace_id, &workspace, n).into(),
                     cass_query: Some(format!("limit={}", n + 1)),
                 })
                 .collect::<Vec<_>>();
             match defect {
                 "foreign_workspace" => records[1].ledger.workspace_id = "wsp_foreign".to_owned(),
                 "duplicate_id" => records[1].ledger.id = records[0].ledger.id.clone(),
-                "duplicate_source" => records[1].cass_query = records[0].cass_query.clone(),
+                "duplicate_source" => {
+                    records[1].ledger.source_id = records[0].ledger.source_id.clone();
+                    records[1].cass_query = records[0].cass_query.clone();
+                }
                 "invalid_query" => {
                     records[1].cass_query = Some("limit=2&source=/private/secret".to_owned())
                 }
