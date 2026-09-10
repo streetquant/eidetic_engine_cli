@@ -12,21 +12,23 @@ Bead lineage: `bd-1n0np.7` (feature), `7.1` (ADR + `ConflictCluster` model),
 (audited resolution), `7.5` (pack guard + forced mode), `7.6` (tests), `7.8`
 (docs/capabilities/help).
 
-## The six explicit signals
+## The six explicit signals and the body signal
 
-A [`ConflictEdge`](../../src/core/contradiction_detect.rs) is one explicit,
-DB-recorded conflict relationship between two memories — never an inferred guess.
-Each signal carries a load-bearing weight (milli-units): how strongly it
-implicates a genuine contradiction.
+A ConflictEdge carries the two original memory IDs. Link-backed edges are
+explicit DB evidence; the body_contradiction edge is a conservative exact-body
+inference for the same workspace and identified claim. Discovery preserves both
+bodies and never merges or deletes evidence. Each signal carries a load-bearing
+weight (milli-units): how strongly it implicates a genuine contradiction.
 
-| Signal (`ExplicitConflictSignal`) | Weight | Evidence the store already holds |
+| Signal (ExplicitConflictSignal) | Weight | Evidence the store already holds |
 |---|---:|---|
-| `contradiction_link` | 1000 | a direct `contradicts` memory link |
-| `supersession` | 900 | one memory supersedes the other |
-| `duplicate_divergent` | 700 | near-duplicate content that nonetheless diverges |
-| `validity_window_overlap` | 600 | validity windows overlap while asserting different things |
-| `trust_outcome_split` | 500 | trust / outcome evidence points in opposite directions |
-| `repeated_co_selection` | 300 | repeatedly co-selected into the same packs |
+| contradiction_link | 1000 | a direct contradicts memory link |
+| supersession | 900 | one memory supersedes the other |
+| duplicate_divergent | 700 | near-duplicate content that nonetheless diverges |
+| validity_window_overlap | 600 | validity windows overlap while asserting different things |
+| trust_outcome_split | 500 | trust / outcome evidence points in opposite directions |
+| repeated_co_selection | 300 | repeatedly co-selected into the same packs |
+| body_contradiction | 650 | exact same-scope body claim with explicit opposite polarity |
 
 The heaviest signals (`contradiction_link`, `supersession`) are sparse, explicit
 graph links; the lighter ones are derived from existing rows. A pair backed by

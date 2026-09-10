@@ -29,15 +29,20 @@ use fnx_runtime::CompatibilityMode;
 
 use serde::Serialize;
 
-use crate::db::{DbConnection, MemoryLinkRelation};
+use crate::core::contradiction_guard::{
+    ContradictionPrecedence, authority_subclass_rank, confidence_rank_milli,
+    decide_contradiction_survivor_with_precedence, recency_rank, verification_status_rank,
+};
+use crate::db::{DbConnection, MemoryLinkRelation, StoredMemory};
 use crate::graph::health::{
     ContradictionCluster, ContradictionClusterPolicy, ContradictionSeverity,
     detect_contradiction_clusters_with_policy,
 };
 use crate::models::TrustClass;
 
-/// An explicit, DB-recorded conflict signal between two memories. Each variant is
-/// evidence the store already holds — never an inferred/fuzzy guess.
+/// A conflict signal between two memories. Link-backed variants are explicit DB
+/// evidence; `BodyContradiction` is a conservative exact-body inference kept
+/// separate so callers can distinguish its evidence source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum ExplicitConflictSignal {
     /// A direct `contradicts` link between the two memories.
@@ -52,6 +57,8 @@ pub enum ExplicitConflictSignal {
     TrustOutcomeSplit,
     /// They are repeatedly co-selected into the same packs (co-occurrence).
     RepeatedCoSelection,
+    /// Opposite explicit polarities for one exact entity/claim identity.
+    BodyContradiction,
 }
 
 impl ExplicitConflictSignal {
@@ -65,6 +72,7 @@ impl ExplicitConflictSignal {
             Self::DuplicateDivergent => "duplicate_divergent",
             Self::TrustOutcomeSplit => "trust_outcome_split",
             Self::RepeatedCoSelection => "repeated_co_selection",
+            Self::BodyContradiction => "body_contradiction",
         }
     }
 
@@ -80,6 +88,9 @@ impl ExplicitConflictSignal {
             Self::ValidityWindowOverlap => 600,
             Self::TrustOutcomeSplit => 500,
             Self::RepeatedCoSelection => 300,
+            // Inferred body evidence remains below durable contradiction and
+            // supersession links, but above weaker deferred signals.
+            Self::BodyContradiction => 650,
         }
     }
 }
@@ -164,6 +175,554 @@ fn canonical_pair(edge: &ConflictEdge) -> Option<(String, String)> {
     } else {
         Some((b.to_string(), a.to_string()))
     }
+}
+
+/// Polarity recognized by the conservative body pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum BodyClaimPolarity {
+    Positive,
+    Negative,
+}
+
+/// Exact grouping key for a body claim. Entity and claim are required fields;
+/// workspace and optional scope prevent cross-context pairings.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct BodyClaimKey {
+    workspace_id: String,
+    scope: String,
+    entity: String,
+    claim: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BodyClaim {
+    key: BodyClaimKey,
+    polarity: BodyClaimPolarity,
+}
+
+/// Return the polarity of a recognized opposition token and, for paired values,
+/// the canonical positive value to retain in the claim identity.
+fn body_claim_polarity_token(token: &str) -> Option<(BodyClaimPolarity, Option<&'static str>)> {
+    use BodyClaimPolarity::{Negative, Positive};
+
+    match token {
+        "not" | "no" | "never" | "without" | "cannot" | "cant" | "wont" | "dont" | "doesnt"
+        | "didnt" | "shouldnt" | "mustnt" | "couldnt" | "wouldnt" | "none" => {
+            Some((Negative, None))
+        }
+        "disabled" | "deactivated" | "inactive" => Some((Negative, Some("enabled"))),
+        "off" => Some((Negative, Some("on"))),
+        "false" => Some((Negative, Some("true"))),
+        "denied" | "denies" | "deny" | "disallowed" | "forbidden" | "forbid" => {
+            Some((Negative, Some("allowed")))
+        }
+        "rejected" | "rejects" | "reject" => Some((Negative, Some("accepted"))),
+        "absent" | "missing" | "unavailable" => Some((Negative, Some("present"))),
+        "closed" => Some((Negative, Some("open"))),
+        "failed" | "fails" | "failure" => Some((Negative, Some("succeeded"))),
+        // These are explicit positive counterparts to `never`, `not`, etc. The
+        // modal itself is not part of the claim identity.
+        "always" | "must" | "should" => Some((Positive, None)),
+        "enabled" | "activated" | "active" => Some((Positive, Some("enabled"))),
+        "on" => Some((Positive, Some("on"))),
+        "true" => Some((Positive, Some("true"))),
+        "allowed" | "allows" | "allow" => Some((Positive, Some("allowed"))),
+        "accepted" | "accepts" | "accept" => Some((Positive, Some("accepted"))),
+        "present" | "available" => Some((Positive, Some("present"))),
+        "open" => Some((Positive, Some("open"))),
+        "succeeded" | "succeeds" | "success" => Some((Positive, Some("succeeded"))),
+        _ => None,
+    }
+}
+
+fn canonical_body_claim_word(token: &str) -> &str {
+    match token {
+        "is" | "are" | "was" | "were" | "be" | "been" | "being" => "be",
+        "does" | "did" => "do",
+        "uses" | "using" | "used" => "use",
+        "runs" | "running" | "ran" => "run",
+        "requires" | "requiring" | "required" => "require",
+        "supports" | "supporting" | "supported" => "support",
+        "contains" | "containing" | "contained" => "contain",
+        "allows" => "allow",
+        "denies" => "deny",
+        "accepts" => "accept",
+        "succeeds" => "succeed",
+        _ => token,
+    }
+}
+
+fn tokenize_body_claim(content: &str) -> Vec<String> {
+    let normalized = content
+        .to_lowercase()
+        .replace("doesn't", "does not")
+        .replace("didn't", "did not")
+        .replace("don't", "do not")
+        .replace("can't", "cannot")
+        .replace("couldn't", "could not")
+        .replace("shouldn't", "should not")
+        .replace("wouldn't", "would not")
+        .replace("mustn't", "must not")
+        .replace("isn't", "is not")
+        .replace("aren't", "are not")
+        .replace("wasn't", "was not")
+        .replace("weren't", "were not")
+        .replace("won't", "will not");
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for character in normalized.chars() {
+        if character.is_alphanumeric() || matches!(character, '_' | '-' | ':') {
+            current.push(character);
+        } else if !current.is_empty() {
+            tokens.push(canonical_body_claim_word(&current).to_owned());
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(canonical_body_claim_word(&current).to_owned());
+    }
+    tokens
+}
+
+const BODY_CLAIM_STOP_WORDS: &[&str] = &[
+    "a",
+    "an",
+    "the",
+    "this",
+    "that",
+    "these",
+    "those",
+    "fact",
+    "claim",
+    "assertion",
+    "statement",
+    "memory",
+    "rule",
+    "decision",
+    "convention",
+    "note",
+    "according",
+    "said",
+    "says",
+    "to",
+    "of",
+    "in",
+    "at",
+    "for",
+    "from",
+    "by",
+    "with",
+    "as",
+    "into",
+    "about",
+    "and",
+    "or",
+    "but",
+    "be",
+    "do",
+    "can",
+    "could",
+    "should",
+    "would",
+    "may",
+    "might",
+    "must",
+    "shall",
+    "will",
+    "only",
+    "just",
+];
+
+fn normalize_body_identity_component(raw: &str) -> String {
+    let mut normalized = String::new();
+    let mut previous_was_space = false;
+    for character in raw.trim().to_lowercase().chars() {
+        if character.is_alphanumeric() || matches!(character, '_' | '-' | ':' | '/') {
+            normalized.push(character);
+            previous_was_space = false;
+        } else if !normalized.is_empty() && !previous_was_space {
+            normalized.push(' ');
+            previous_was_space = true;
+        }
+    }
+    normalized.trim().to_owned()
+}
+
+/// Find one explicitly labeled value (`Entity: atlas; Claim: port`). A label
+/// must have a boundary and `:`/`=` separator so prose containing “subject” or
+/// “claim” cannot accidentally become an identity.
+fn extract_body_labeled_field(content: &str, labels: &[&str]) -> Option<String> {
+    let lower = content.to_ascii_lowercase();
+    for label in labels {
+        let mut search_from = 0;
+        while let Some(relative) = lower[search_from..].find(label) {
+            let start = search_from + relative;
+            let before_ok = start == 0
+                || (!lower.as_bytes()[start - 1].is_ascii_alphanumeric()
+                    && lower.as_bytes()[start - 1] != b'_'
+                    && lower.as_bytes()[start - 1] != b'-');
+            let mut cursor = start + label.len();
+            let after_ok = cursor == lower.len()
+                || (!lower.as_bytes()[cursor].is_ascii_alphanumeric()
+                    && lower.as_bytes()[cursor] != b'_'
+                    && lower.as_bytes()[cursor] != b'-');
+            if before_ok && after_ok {
+                while cursor < lower.len() && lower.as_bytes()[cursor].is_ascii_whitespace() {
+                    cursor += 1;
+                }
+                if cursor < lower.len() && matches!(lower.as_bytes()[cursor], b':' | b'=') {
+                    cursor += 1;
+                    while cursor < lower.len() && lower.as_bytes()[cursor].is_ascii_whitespace() {
+                        cursor += 1;
+                    }
+                    let mut end = content.len();
+                    for (offset, character) in content[cursor..].char_indices() {
+                        if matches!(character, ';' | '|' | '\n' | '\r' | ',') {
+                            end = cursor + offset;
+                            break;
+                        }
+                        if character == '.'
+                            && content[cursor + offset + character.len_utf8()..]
+                                .chars()
+                                .next()
+                                .map_or(true, char::is_whitespace)
+                        {
+                            end = cursor + offset;
+                            break;
+                        }
+                    }
+                    let value = content[cursor..end]
+                        .trim()
+                        .trim_matches(['"', '\'', '`'])
+                        .trim_end_matches(['.', ',']);
+                    if !value.is_empty() {
+                        return Some(value.to_owned());
+                    }
+                }
+            }
+            search_from = start.saturating_add(label.len()).max(search_from + 1);
+        }
+    }
+    None
+}
+
+fn body_claim_polarity_marker(raw: &str) -> Option<BodyClaimPolarity> {
+    match normalize_body_identity_component(raw).as_str() {
+        "positive" | "affirmed" | "affirmative" | "present" | "current" | "true" | "yes"
+        | "enabled" | "on" | "support" | "supported" | "allow" | "allowed" => {
+            Some(BodyClaimPolarity::Positive)
+        }
+        "negative" | "negated" | "opposed" | "opposite" | "contradiction" | "conflict"
+        | "false" | "no" | "not" | "disabled" | "off" | "deny" | "denied" => {
+            Some(BodyClaimPolarity::Negative)
+        }
+        _ => None,
+    }
+}
+
+fn claim_identity_and_polarity(claim: &str) -> Option<(String, Option<BodyClaimPolarity>)> {
+    use BodyClaimPolarity::{Negative, Positive};
+    let mut identity_tokens = Vec::new();
+    let mut generic_negative_count = 0_u8;
+    let mut value_polarity = None;
+    for token in tokenize_body_claim(claim) {
+        if let Some((polarity, canonical_value)) = body_claim_polarity_token(&token) {
+            if canonical_value.is_none() && polarity == Negative {
+                generic_negative_count = generic_negative_count.saturating_add(1);
+            }
+            if canonical_value.is_some() {
+                if let Some(existing) = value_polarity {
+                    if existing != polarity {
+                        return None;
+                    }
+                } else {
+                    value_polarity = Some(polarity);
+                }
+            }
+            if let Some(canonical_value) = canonical_value {
+                identity_tokens.push(canonical_value.to_owned());
+            }
+            continue;
+        }
+        if !BODY_CLAIM_STOP_WORDS.contains(&token.as_str()) {
+            identity_tokens.push(token);
+        }
+    }
+    if generic_negative_count > 1 {
+        return None;
+    }
+    let polarity = match (generic_negative_count, value_polarity) {
+        (0, Some(value)) => Some(value),
+        (0, None) => None,
+        (1, Some(Negative)) => None,
+        (1, Some(Positive)) => Some(Negative),
+        (1, None) => Some(Negative),
+        // More than one generic negation is ambiguous (for example, "not
+        // never"). Keep the inference fail-closed even when the counter has
+        // saturated at its upper bound.
+        (2_u8..=u8::MAX, _) => None,
+    };
+    let identity = identity_tokens.join(" ");
+    (!identity.is_empty()).then_some((identity, polarity))
+}
+
+fn json_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+) -> Option<String> {
+    names.iter().find_map(|name| {
+        object.iter().find_map(|(key, value)| {
+            (key.eq_ignore_ascii_case(name))
+                .then(|| value.as_str().map(str::to_owned))
+                .flatten()
+        })
+    })
+}
+
+fn json_bool_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+) -> Option<bool> {
+    names.iter().find_map(|name| {
+        object.iter().find_map(|(key, value)| {
+            (key.eq_ignore_ascii_case(name))
+                .then(|| value.as_bool())
+                .flatten()
+        })
+    })
+}
+
+fn json_body_claim_fields(
+    content: &str,
+) -> Option<(
+    String,
+    String,
+    Option<String>,
+    Option<BodyClaimPolarity>,
+    bool,
+)> {
+    let serde_json::Value::Object(object) = serde_json::from_str(content).ok()? else {
+        return None;
+    };
+    let claim_key = object
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("claim_key"))
+        .and_then(|(_, value)| value.as_object());
+    let entity = json_string_field(&object, &["entity", "entity_id", "entityid", "subject"])
+        .or_else(|| {
+            claim_key.and_then(|nested| json_string_field(nested, &["subject", "entity"]))
+        })?;
+    let claim = json_string_field(
+        &object,
+        &[
+            "claim",
+            "claim_key",
+            "predicate",
+            "claim_predicate",
+            "claimpredicate",
+        ],
+    )
+    .or_else(|| claim_key.and_then(|nested| json_string_field(nested, &["predicate", "claim"])))?;
+    let standard_marker = json_string_field(
+        &object,
+        &["polarity", "marker", "signal", "status", "state"],
+    );
+    let opposition_marker = json_string_field(
+        &object,
+        &["opposition", "negated", "negative", "opposed", "conflict"],
+    );
+    let bool_marker = json_bool_field(
+        &object,
+        &[
+            "negated",
+            "negative",
+            "opposed",
+            "opposes",
+            "conflict",
+            "opposition",
+        ],
+    );
+    let (typed_polarity, typed_present) = if let Some(marker) = standard_marker {
+        (body_claim_polarity_marker(&marker), true)
+    } else if let Some(marker) = opposition_marker {
+        (body_opposition_marker(&marker), true)
+    } else if let Some(negative) = bool_marker {
+        (
+            Some(if negative {
+                BodyClaimPolarity::Negative
+            } else {
+                BodyClaimPolarity::Positive
+            }),
+            true,
+        )
+    } else {
+        (None, false)
+    };
+    let scope = json_string_field(&object, &["scope", "scope_id", "scopeid"]);
+    Some((entity, claim, scope, typed_polarity, typed_present))
+}
+
+/// Interpret a marker whose field name itself means opposition. String and
+/// boolean encodings are accepted, but unknown values remain unparseable so a
+/// malformed marker cannot create a false contradiction.
+fn body_opposition_marker(raw: &str) -> Option<BodyClaimPolarity> {
+    match normalize_body_identity_component(raw).as_str() {
+        "true" | "yes" | "1" => Some(BodyClaimPolarity::Negative),
+        "false" | "no" | "0" => Some(BodyClaimPolarity::Positive),
+        normalized => body_claim_polarity_marker(normalized),
+    }
+}
+
+fn text_body_claim_fields(
+    content: &str,
+) -> Option<(
+    String,
+    String,
+    Option<String>,
+    Option<BodyClaimPolarity>,
+    bool,
+)> {
+    let entity =
+        extract_body_labeled_field(content, &["entity", "entity_id", "entityid", "subject"])?;
+    let claim = extract_body_labeled_field(
+        content,
+        &[
+            "claim",
+            "claim_key",
+            "predicate",
+            "claim_predicate",
+            "claimpredicate",
+        ],
+    )?;
+    let scope = extract_body_labeled_field(content, &["scope", "scope_id", "scopeid"]);
+    let opposition_marker = extract_body_labeled_field(
+        content,
+        &["opposition", "negated", "negative", "opposed", "conflict"],
+    );
+    let standard_marker = extract_body_labeled_field(
+        content,
+        &["polarity", "marker", "signal", "status", "state"],
+    );
+    let (typed_polarity, typed_present) = if let Some(marker) = opposition_marker {
+        (body_opposition_marker(&marker), true)
+    } else if let Some(marker) = standard_marker {
+        (body_claim_polarity_marker(&marker), true)
+    } else {
+        (None, false)
+    };
+    Some((entity, claim, scope, typed_polarity, typed_present))
+}
+
+fn parse_body_claim(memory: &StoredMemory) -> Option<BodyClaim> {
+    if memory.id.trim().is_empty()
+        || memory.workspace_id.trim().is_empty()
+        || memory.tombstoned_at.is_some()
+        || !body_memory_is_current(memory)
+    {
+        return None;
+    }
+    let (entity, claim, scope, typed_polarity, typed_present) =
+        json_body_claim_fields(&memory.content)
+            .or_else(|| text_body_claim_fields(&memory.content))?;
+    if typed_present && typed_polarity.is_none() {
+        return None;
+    }
+    let entity = normalize_body_identity_component(&entity);
+    if entity.is_empty() {
+        return None;
+    }
+    let (claim, claim_polarity) = claim_identity_and_polarity(&claim)?;
+    let polarity = match (claim_polarity, typed_polarity) {
+        (Some(claim), Some(typed)) if claim != typed => return None,
+        (Some(claim), _) => claim,
+        (_, Some(typed)) => typed,
+        // A plain labeled claim is the positive side; a counterpart must still
+        // carry explicit negative/opposition evidence to form a pair.
+        (None, None) => BodyClaimPolarity::Positive,
+    };
+    Some(BodyClaim {
+        key: BodyClaimKey {
+            workspace_id: memory.workspace_id.trim().to_owned(),
+            scope: scope
+                .as_deref()
+                .map(normalize_body_identity_component)
+                .unwrap_or_default(),
+            entity,
+            claim,
+        },
+        polarity,
+    })
+}
+
+fn body_memory_is_current(memory: &StoredMemory) -> bool {
+    let now = chrono::Utc::now();
+    let valid_from = match memory.valid_from.as_deref() {
+        Some(raw) => chrono::DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|value| value.with_timezone(&chrono::Utc)),
+        None => None,
+    };
+    let valid_to = match memory.valid_to.as_deref() {
+        Some(raw) => chrono::DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|value| value.with_timezone(&chrono::Utc)),
+        None => None,
+    };
+    if memory.valid_from.is_some() && valid_from.is_none()
+        || memory.valid_to.is_some() && valid_to.is_none()
+    {
+        return false;
+    }
+    !valid_from.is_some_and(|start| start > now) && !valid_to.is_some_and(|end| end <= now)
+}
+
+/// Discover only exact same-workspace/entity/claim pairs with opposite explicit
+/// polarity. This is read-only: every original ID remains available to callers,
+/// and no body/evidence row is merged, deleted, or rewritten.
+#[must_use]
+pub fn detect_body_contradiction_pairs(memories: &[StoredMemory]) -> Vec<ConflictEdge> {
+    let mut grouped: BTreeMap<BodyClaimKey, (BTreeSet<String>, BTreeSet<String>)> = BTreeMap::new();
+    for memory in memories {
+        let Some(claim) = parse_body_claim(memory) else {
+            continue;
+        };
+        let entry = grouped
+            .entry(claim.key)
+            .or_insert_with(|| (BTreeSet::new(), BTreeSet::new()));
+        match claim.polarity {
+            BodyClaimPolarity::Positive => {
+                entry.0.insert(memory.id.trim().to_owned());
+            }
+            BodyClaimPolarity::Negative => {
+                entry.1.insert(memory.id.trim().to_owned());
+            }
+        }
+    }
+    let mut pairs = BTreeSet::new();
+    for (_key, (positive_ids, negative_ids)) in grouped {
+        for positive_id in &positive_ids {
+            for negative_id in &negative_ids {
+                if positive_id != negative_id {
+                    let pair = if positive_id < negative_id {
+                        (positive_id.clone(), negative_id.clone())
+                    } else {
+                        (negative_id.clone(), positive_id.clone())
+                    };
+                    pairs.insert(pair);
+                }
+            }
+        }
+    }
+    pairs
+        .into_iter()
+        .map(|(memory_a, memory_b)| {
+            ConflictEdge::new(
+                &memory_a,
+                &memory_b,
+                ExplicitConflictSignal::BodyContradiction,
+            )
+        })
+        .collect()
 }
 
 /// Detect contradiction clusters from explicit conflict evidence (bd-1n0np.7.2).
@@ -278,21 +837,38 @@ fn rank_cluster(
 /// detector uses for its deferred fuzzy pass.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GatheredConflictEdges {
-    /// The explicit conflict edges, ready to feed [`detect_explicit_contradictions`].
+    /// Conflict edges from durable links, ready to feed the detector.
     pub edges: Vec<ConflictEdge>,
-    /// Explicit signal kinds this gather covered.
+    /// Read-only body-derived edges for exact, same-scope claims with opposite
+    /// polarity. Kept separate from link evidence for honest reporting.
+    pub automatic_body_edges: Vec<ConflictEdge>,
+    /// Explicit signal kinds this gather covered; body-derived edges are
+    /// reported separately above.
     pub gathered: Vec<ExplicitConflictSignal>,
     /// Explicit signal kinds deferred to a later DB-gather slice (reported, not
     /// silently dropped).
     pub deferred: Vec<ExplicitConflictSignal>,
-    /// Set when the link read failed: the gather degrades to no edges rather than
-    /// panicking, and the read failure is reported instead of being swallowed.
+    /// Set when a link, workspace, or memory read failed: the gather degrades to
+    /// evidence it could read, and the read failure is reported instead of being
+    /// swallowed.
     pub read_error: Option<String>,
     /// Canonical pairs a reviewed `both-valid` resolution marked as legitimate
     /// tension (`ee conflict resolve --verb both-valid` writes a `related` link
     /// with `resolution=both_valid` metadata): suppressed from the actionable
     /// pair surface, bd-3a1op.4.
     pub both_valid_resolved: std::collections::BTreeSet<(String, String)>,
+}
+
+impl GatheredConflictEdges {
+    /// Return durable-link and body-derived edges in deterministic order.
+    #[must_use]
+    pub fn all_edges(&self) -> Vec<ConflictEdge> {
+        self.edges
+            .iter()
+            .chain(self.automatic_body_edges.iter())
+            .cloned()
+            .collect()
+    }
 }
 
 /// Explicit signal kinds the v1 DB-gather covers (the link-based, least-ambiguous
@@ -315,9 +891,8 @@ const DEFERRED_SIGNAL_KINDS: [ExplicitConflictSignal; 4] = [
 /// Gather explicit conflict edges from the database (bd-1n0np.7.2 DB-gather).
 ///
 /// v1 gathers the **link-based** explicit signals — the heaviest, least-ambiguous
-/// evidence the store records directly: `contradicts` links
-/// ([`ExplicitConflictSignal::ContradictionLink`]) and `supersedes` links
-/// ([`ExplicitConflictSignal::Supersession`]). It reuses the exact same
+/// evidence the store records directly — and runs a conservative body pass over
+/// current memory rows. It reuses the exact same
 /// [`DbConnection::list_all_memory_links`] load that `graph::health` uses, so the
 /// contradiction graph stays consistent with structural health.
 ///
@@ -328,25 +903,21 @@ const DEFERRED_SIGNAL_KINDS: [ExplicitConflictSignal; 4] = [
 /// treated as absent. The fuzzy embedding-opposition detector remains opt-in and
 /// out of scope here (the explicit graph is the gate).
 ///
-/// Deterministic: links are loaded in the connection's deterministic order and
-/// mapped 1:1; canonicalization/dedup happens downstream in
-/// [`detect_explicit_contradictions`].
+/// Deterministic: links and body rows are loaded in the connection's deterministic
+/// order; canonicalization/dedup happens downstream in
+/// [`detect_explicit_contradictions`]. A body read failure suppresses only inferred
+/// body edges; already-read direct links remain usable.
 #[must_use]
 pub fn gather_explicit_conflict_edges(connection: &DbConnection) -> GatheredConflictEdges {
     let gathered = GATHERED_SIGNAL_KINDS.to_vec();
     let deferred = DEFERRED_SIGNAL_KINDS.to_vec();
 
-    let links = match connection.list_all_memory_links(None) {
-        Ok(links) => links,
-        Err(error) => {
-            return GatheredConflictEdges {
-                edges: Vec::new(),
-                gathered,
-                deferred,
-                read_error: Some(format!("memory links could not be read: {error}")),
-                both_valid_resolved: std::collections::BTreeSet::new(),
-            };
-        }
+    let (links, link_error) = match connection.list_all_memory_links(None) {
+        Ok(links) => (links, None),
+        Err(error) => (
+            Vec::new(),
+            Some(format!("memory links could not be read: {error}")),
+        ),
     };
 
     let mut edges = Vec::new();
@@ -387,11 +958,51 @@ pub fn gather_explicit_conflict_edges(connection: &DbConnection) -> GatheredConf
         ));
     }
 
+    let mut read_errors = Vec::new();
+    if let Some(error) = link_error {
+        read_errors.push(error);
+    }
+    let mut current_memories = Vec::new();
+    let mut body_inference_read_error = false;
+    match connection.list_workspaces() {
+        Ok(workspaces) => {
+            for workspace in workspaces {
+                match connection.list_memories(&workspace.id, None, false) {
+                    Ok(memories) => current_memories.extend(memories),
+                    Err(error) => {
+                        body_inference_read_error = true;
+                        read_errors.push(format!(
+                            "memories for workspace {} could not be read: {error}",
+                            workspace.id
+                        ));
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            body_inference_read_error = true;
+            read_errors.push(format!("workspaces could not be read: {error}"));
+        }
+    }
+    // An incomplete semantic corpus cannot prove that inferred pairs are
+    // complete. Fail closed for unknown body evidence while retaining all
+    // usable direct link edges gathered above.
+    let automatic_body_edges = if body_inference_read_error {
+        Vec::new()
+    } else {
+        detect_body_contradiction_pairs(&current_memories)
+    };
+
     GatheredConflictEdges {
         edges,
+        automatic_body_edges,
         gathered,
         deferred,
-        read_error: None,
+        read_error: if read_errors.is_empty() {
+            None
+        } else {
+            Some(read_errors.join("; "))
+        },
         both_valid_resolved,
     }
 }
@@ -407,7 +1018,8 @@ pub fn detect_explicit_contradictions_from_connection(
     config: ContradictionDetectionConfig,
 ) -> (ContradictionDetectionReport, GatheredConflictEdges) {
     let gathered = gather_explicit_conflict_edges(connection);
-    let report = detect_explicit_contradictions(&gathered.edges, config);
+    let all_edges = gathered.all_edges();
+    let report = detect_explicit_contradictions(&all_edges, config);
     (report, gathered)
 }
 
@@ -562,26 +1174,82 @@ fn member_view(memory: &crate::db::StoredMemory, preferred: bool) -> ConflictMem
     }
 }
 
-/// Decide the preferred (higher-trust, else fresher) side of a pair.
-/// Returns `("a"|"b"|"tie", reason, a_preferred, b_preferred)`.
-fn preferred_side(
-    a: &crate::db::StoredMemory,
-    b: &crate::db::StoredMemory,
-) -> (&'static str, &'static str, bool, bool) {
-    let (ra, rb) = (
-        trust_class_rank(&a.trust_class),
-        trust_class_rank(&b.trust_class),
-    );
-    if ra > rb {
-        ("a", "higher_trust", true, false)
-    } else if rb > ra {
-        ("b", "higher_trust", false, true)
-    } else if a.updated_at > b.updated_at {
-        ("a", "fresher", true, false)
-    } else if b.updated_at > a.updated_at {
-        ("b", "fresher", false, true)
+fn memory_currentness_rank(memory: &StoredMemory) -> i64 {
+    let now = chrono::Utc::now();
+    let valid_from = match memory.valid_from.as_deref() {
+        Some(value) => match chrono::DateTime::parse_from_rfc3339(value) {
+            Ok(parsed) => Some(parsed.with_timezone(&chrono::Utc)),
+            Err(_) => return 0,
+        },
+        None => None,
+    };
+    let valid_to = match memory.valid_to.as_deref() {
+        Some(value) => match chrono::DateTime::parse_from_rfc3339(value) {
+            Ok(parsed) => Some(parsed.with_timezone(&chrono::Utc)),
+            Err(_) => return 0,
+        },
+        None => None,
+    };
+    if valid_from.is_some_and(|start| start > now) || valid_to.is_some_and(|end| end <= now) {
+        0
     } else {
-        ("tie", "tie_no_signal", false, false)
+        1
+    }
+}
+
+fn memory_precedence(memory: &StoredMemory) -> ContradictionPrecedence {
+    let (recency_epoch, recency_known) = recency_rank(Some(&memory.updated_at));
+    ContradictionPrecedence {
+        memory_id: memory.id.clone(),
+        trust_rank: i64::from(trust_class_rank(&memory.trust_class)) * 1_000,
+        authority_rank: authority_subclass_rank(memory.trust_subclass.as_deref()),
+        verification_rank: verification_status_rank(&memory.provenance_verification_status),
+        validity_rank: memory_currentness_rank(memory),
+        confidence_milli: confidence_rank_milli(memory.confidence),
+        recency_epoch,
+        recency_known,
+    }
+}
+
+/// Decide the preferred side using the same MEM-03 precedence as the pack
+/// guard: trust, authority, verification, validity, confidence, then recency.
+/// Returns `("a"|"b"|"tie", reason, a_preferred, b_preferred)`.
+#[must_use]
+pub fn preferred_side(
+    a: &StoredMemory,
+    b: &StoredMemory,
+) -> (&'static str, &'static str, bool, bool) {
+    let left = memory_precedence(a);
+    let right = memory_precedence(b);
+    let decision = decide_contradiction_survivor_with_precedence(&left, &right);
+    if decision.basis == crate::core::contradiction_guard::SuppressionBasis::DeterministicTieBreak
+        && left.trust_rank == right.trust_rank
+        && left.authority_rank == right.authority_rank
+        && left.verification_rank == right.verification_rank
+        && left.validity_rank == right.validity_rank
+        && left.confidence_milli == right.confidence_milli
+        && left.recency_epoch == right.recency_epoch
+        && left.recency_known == right.recency_known
+    {
+        return ("tie", "tie_no_signal", false, false);
+    }
+    let reason = match decision.basis {
+        crate::core::contradiction_guard::SuppressionBasis::HigherTrust => "higher_trust",
+        crate::core::contradiction_guard::SuppressionBasis::HigherAuthority => "higher_authority",
+        crate::core::contradiction_guard::SuppressionBasis::HigherVerification => {
+            "higher_verification"
+        }
+        crate::core::contradiction_guard::SuppressionBasis::CurrentValidity => "current_validity",
+        crate::core::contradiction_guard::SuppressionBasis::HigherConfidence => "higher_confidence",
+        crate::core::contradiction_guard::SuppressionBasis::Fresher => "fresher",
+        crate::core::contradiction_guard::SuppressionBasis::DeterministicTieBreak => {
+            "tie_no_signal"
+        }
+    };
+    if decision.kept_memory_id == a.id {
+        ("a", reason, true, false)
+    } else {
+        ("b", reason, false, true)
     }
 }
 
@@ -607,7 +1275,8 @@ pub fn assemble_conflict_surface(
 
     // Deduplicate to canonical pairs, keeping the heaviest signal per pair.
     let mut pair_signal: BTreeMap<(String, String), ExplicitConflictSignal> = BTreeMap::new();
-    for edge in &gathered.edges {
+    let all_edges = gathered.all_edges();
+    for edge in &all_edges {
         if let Some(pair) = canonical_pair(edge) {
             pair_signal
                 .entry(pair)
@@ -1028,8 +1697,9 @@ mod tests {
     use super::{
         CONFLICT_SURFACE_SCHEMA_V1, ConflictEdge, ContradictionDetectionConfig,
         ExplicitConflictSignal, assemble_conflict_surface, canonical_pair,
-        detect_explicit_contradictions, detect_explicit_contradictions_from_connection,
-        gather_explicit_conflict_edges, trust_class_rank,
+        detect_body_contradiction_pairs, detect_explicit_contradictions,
+        detect_explicit_contradictions_from_connection, gather_explicit_conflict_edges,
+        preferred_side, trust_class_rank,
     };
     use crate::db::{
         CreateMemoryInput, CreateMemoryLinkInput, CreateWorkspaceInput, DbConnection,
@@ -1088,6 +1758,30 @@ mod tests {
                 },
             )
             .expect("insert memory");
+    }
+
+    fn seed_claim_memory(connection: &DbConnection, memory_id: &str, content: &str) {
+        connection
+            .insert_memory(
+                memory_id,
+                &CreateMemoryInput {
+                    workspace_id: WS_ID.to_owned(),
+                    level: "semantic".to_owned(),
+                    kind: "fact".to_owned(),
+                    content: content.to_owned(),
+                    workflow_id: None,
+                    confidence: 0.9,
+                    utility: 0.8,
+                    importance: 0.7,
+                    provenance_uri: None,
+                    trust_class: "agent_assertion".to_owned(),
+                    trust_subclass: None,
+                    tags: Vec::new(),
+                    valid_from: None,
+                    valid_to: None,
+                },
+            )
+            .expect("insert claim memory");
     }
 
     fn seed_link(
@@ -1372,6 +2066,143 @@ mod tests {
         let gathered = gather_explicit_conflict_edges(&connection);
         assert!(gathered.read_error.is_none());
         assert!(gathered.edges.is_empty(), "no links -> no conflict edges");
+    }
+
+    #[test]
+    fn body_contradictions_pair_exact_claims_and_preserve_unrelated_evidence() {
+        let connection = open_seeded_db();
+        seed_claim_memory(
+            &connection,
+            MEM_A,
+            "Entity: deployment; Claim: uses SQLite.",
+        );
+        seed_claim_memory(
+            &connection,
+            MEM_B,
+            "Entity: deployment; Claim: does not use SQLite.",
+        );
+        seed_claim_memory(
+            &connection,
+            MEM_C,
+            "Entity: unrelated-service; Claim: does not use SQLite.",
+        );
+
+        let gathered = gather_explicit_conflict_edges(&connection);
+        assert!(gathered.read_error.is_none());
+        assert!(
+            gathered.edges.is_empty(),
+            "the fixture has no conflict links"
+        );
+        assert_eq!(gathered.automatic_body_edges.len(), 1);
+        assert_eq!(
+            gathered.automatic_body_edges[0],
+            ConflictEdge::new(MEM_A, MEM_B, ExplicitConflictSignal::BodyContradiction)
+        );
+
+        let memories = [
+            connection
+                .get_memory(MEM_A)
+                .expect("read A")
+                .expect("A exists"),
+            connection
+                .get_memory(MEM_B)
+                .expect("read B")
+                .expect("B exists"),
+            connection
+                .get_memory(MEM_C)
+                .expect("read C")
+                .expect("C exists"),
+        ];
+        let direct = detect_body_contradiction_pairs(&memories);
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].memory_a, MEM_A);
+        assert_eq!(direct[0].memory_b, MEM_B);
+
+        let surface =
+            assemble_conflict_surface(&connection, ContradictionDetectionConfig::default());
+        assert_eq!(
+            surface.pairs.len(),
+            1,
+            "only the identified claim is paired"
+        );
+        let pair = &surface.pairs[0];
+        assert_eq!(pair.signal, "body_contradiction");
+        assert_eq!(pair.memory_a.id, MEM_A);
+        assert_eq!(pair.memory_b.id, MEM_B);
+        assert!(pair.memory_a.content.contains("SQLite"));
+        assert!(pair.memory_b.content.contains("not use SQLite"));
+        assert!(
+            connection
+                .get_memory(MEM_C)
+                .expect("read unrelated memory")
+                .is_some(),
+            "discovery must not delete unrelated evidence"
+        );
+    }
+
+    #[test]
+    fn body_contradictions_require_explicit_identity_and_opposition() {
+        let connection = open_seeded_db();
+        seed_claim_memory(&connection, MEM_A, "deployment uses SQLite");
+        seed_claim_memory(&connection, MEM_B, "deployment does not use SQLite");
+        seed_claim_memory(
+            &connection,
+            MEM_C,
+            "Entity: deployment; Claim: maybe uses SQLite.",
+        );
+        let memories = [
+            connection
+                .get_memory(MEM_A)
+                .expect("read A")
+                .expect("A exists"),
+            connection
+                .get_memory(MEM_B)
+                .expect("read B")
+                .expect("B exists"),
+            connection
+                .get_memory(MEM_C)
+                .expect("read C")
+                .expect("C exists"),
+        ];
+        assert!(
+            detect_body_contradiction_pairs(&memories).is_empty(),
+            "unlabeled prose and an ambiguous claim must not become inferred contradictions"
+        );
+    }
+
+    #[test]
+    fn preferred_side_uses_shared_precedence_facets() {
+        let connection = open_seeded_db();
+        seed_memory_trust(&connection, MEM_A, "agent_assertion");
+        seed_memory_trust(&connection, MEM_B, "agent_assertion");
+        let mut a = connection
+            .get_memory(MEM_A)
+            .expect("read A")
+            .expect("A exists");
+        let mut b = connection
+            .get_memory(MEM_B)
+            .expect("read B")
+            .expect("B exists");
+        a.confidence = 0.9;
+        b.confidence = 0.2;
+        a.updated_at = "2020-01-01T00:00:00Z".to_owned();
+        b.updated_at = "2030-01-01T00:00:00Z".to_owned();
+        let (side, reason, a_preferred, b_preferred) = preferred_side(&a, &b);
+        assert_eq!(side, "a");
+        assert_eq!(reason, "higher_confidence");
+        assert!(a_preferred && !b_preferred);
+
+        b.valid_to = Some("2020-01-01T00:00:00Z".to_owned());
+        let (side, reason, _, _) = preferred_side(&a, &b);
+        assert_eq!(side, "a");
+        assert_eq!(reason, "current_validity");
+
+        b.valid_to = None;
+        b.trust_class = "human_explicit".to_owned();
+        b.confidence = 0.1;
+        let (side, reason, _, _) = preferred_side(&a, &b);
+        assert_eq!(side, "b");
+        assert_eq!(reason, "higher_trust");
     }
 
     #[test]

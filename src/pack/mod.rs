@@ -8,7 +8,10 @@ use tiktoken_rs::{CoreBPE, cl100k_base};
 
 use crate::cache::{CacheBudget, MemoryPressure, assess_pressure};
 use crate::config::MeshCommandMode;
-use crate::core::contradiction_guard::{GuardedMemory, decide_contradiction_survivor};
+use crate::core::contradiction_guard::{
+    ContradictionPrecedence, authority_subclass_rank,
+    decide_contradiction_survivor_with_precedence, validity_status_rank,
+};
 use crate::core::degraded_aggregation::{
     AggregatedDegradation, DegradationAggregationInput, aggregate_degraded_entries,
 };
@@ -1789,6 +1792,14 @@ fn finite_unit_float(value: f32) -> f32 {
 pub struct PackTrustSignal {
     pub class: TrustClass,
     pub subclass: Option<String>,
+    /// Authority/verification/confidence/recency facets used by the shared
+    /// contradiction preference comparator. Defaults stay neutral for synthetic
+    /// candidates that do not carry a stored-memory row.
+    pub authority_rank: i64,
+    pub verification_rank: i64,
+    pub confidence_milli: i64,
+    pub recency_epoch: i64,
+    pub recency_known: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1807,6 +1818,11 @@ impl PackTrustSignal {
             subclass: subclass
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            authority_rank: 0,
+            verification_rank: 0,
+            confidence_milli: 0,
+            recency_epoch: 0,
+            recency_known: false,
         }
     }
 
@@ -1944,6 +1960,28 @@ impl PackCandidate {
     }
 }
 
+impl PackTrustSignal {
+    /// Attach the stored-memory standing facets used by the contradiction guard.
+    /// Keeping this metadata on the trust signal lets every pack candidate carry
+    /// the same preference inputs without changing the public candidate shape.
+    #[must_use]
+    pub fn with_contradiction_precedence(
+        mut self,
+        authority_rank: i64,
+        verification_rank: i64,
+        confidence_milli: i64,
+        recency_epoch: i64,
+        recency_known: bool,
+    ) -> Self {
+        self.authority_rank = authority_rank;
+        self.verification_rank = verification_rank;
+        self.confidence_milli = confidence_milli;
+        self.recency_epoch = recency_epoch;
+        self.recency_known = recency_known;
+        self
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PackSelectionAudit {
     pub profile: ContextPackProfile,
@@ -2037,8 +2075,8 @@ impl PackDraft {
     /// side of each unresolved hard-contradiction pair among the selected items,
     /// recording it as a [`PackOmissionReason::ContradictionSuppressed`] omission,
     /// so a pack never carries both sides of an unresolved contradiction.
-    /// Standing is higher trust class, then better (lower) selection rank, then a
-    /// deterministic id tie-break (via [`decide_contradiction_survivor`]). A no-op
+    /// Standing follows the shared trust, authority, verification, validity,
+    /// confidence, recency, and deterministic-id precedence. A no-op
     /// in `forced` mode (the caller surfaces both sides under a `## Contradictions`
     /// header instead). `unresolved_pairs` come from the 7.2 detector minus 7.4
     /// resolutions. Returns the number of items suppressed.
@@ -2050,18 +2088,44 @@ impl PackDraft {
         if forced || unresolved_pairs.is_empty() || self.items.len() < 2 {
             return 0;
         }
-        let standing: std::collections::BTreeMap<String, GuardedMemory> = self
+        let standing: std::collections::BTreeMap<String, ContradictionPrecedence> = self
             .items
             .iter()
             .map(|item| {
                 let id = item.memory_id.to_string();
+                let (fallback_recency, fallback_known) = (-i64::from(item.rank), true);
+                let (recency_epoch, recency_known) = if item.trust.recency_known {
+                    (item.trust.recency_epoch, true)
+                } else {
+                    (fallback_recency, fallback_known)
+                };
+                let validity_rank = item.lifecycle.as_ref().map_or(1, |lifecycle| {
+                    if lifecycle.validity_window_kind == "unbounded"
+                        && lifecycle.validity_status == "unknown"
+                    {
+                        // The context hydrator uses `unknown` for an
+                        // unbounded window; that is an active, current
+                        // claim, not an invalid temporal row.
+                        1
+                    } else {
+                        validity_status_rank(&lifecycle.validity_status)
+                    }
+                });
                 (
                     id.clone(),
-                    GuardedMemory {
+                    ContradictionPrecedence {
                         memory_id: id,
-                        trust_milli: trust_class_rank_milli(item.trust.class),
-                        // Lower selection rank = stronger standing -> higher key.
-                        freshness_epoch: -i64::from(item.rank),
+                        trust_rank: trust_class_rank_milli(item.trust.class),
+                        authority_rank: if item.trust.authority_rank != 0 {
+                            item.trust.authority_rank
+                        } else {
+                            authority_subclass_rank(item.trust.subclass.as_deref())
+                        },
+                        verification_rank: item.trust.verification_rank,
+                        validity_rank,
+                        confidence_milli: item.trust.confidence_milli,
+                        recency_epoch,
+                        recency_known,
                     },
                 )
             })
@@ -2075,7 +2139,8 @@ impl PackDraft {
             let (Some(ga), Some(gb)) = (standing.get(a), standing.get(b)) else {
                 continue;
             };
-            suppressed.insert(decide_contradiction_survivor(ga, gb).suppressed_memory_id);
+            suppressed
+                .insert(decide_contradiction_survivor_with_precedence(ga, gb).suppressed_memory_id);
         }
         if suppressed.is_empty() {
             return 0;
@@ -4038,7 +4103,7 @@ fn is_direct_conflict(left: &PackDraftItem, right: &PackDraftItem) -> bool {
     left_polarity != ClaimPolarity::Unknown
         && right_polarity != ClaimPolarity::Unknown
         && left_polarity != right_polarity
-        && content_similarity(&left.content, &right.content) >= 0.2
+        && claim_identity(&left.content) == claim_identity(&right.content)
 }
 
 fn is_stale_replacement_conflict(left: &PackDraftItem, right: &PackDraftItem) -> bool {
@@ -4070,35 +4135,129 @@ enum ClaimPolarity {
 }
 
 fn claim_polarity(content: &str) -> ClaimPolarity {
-    let content = format!(" {} ", content.to_ascii_lowercase());
-    if [
-        " never ",
-        " not ",
-        " no ",
-        " don't ",
-        " do not ",
-        " forbid ",
-        " forbidden ",
-    ]
-    .iter()
-    .any(|needle| content.contains(needle))
-    {
+    let tokens = pack_claim_tokens(content);
+    if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "never"
+                | "not"
+                | "no"
+                | "dont"
+                | "forbid"
+                | "forbidden"
+                | "avoid"
+                | "deny"
+                | "denied"
+                | "reject"
+                | "rejected"
+                | "disable"
+                | "disabled"
+                | "inactive"
+                | "off"
+                | "false"
+                | "absent"
+                | "missing"
+                | "unavailable"
+                | "unsupported"
+                | "fail"
+                | "failed"
+        )
+    }) {
         ClaimPolarity::Negative
-    } else if [
-        " always ",
-        " must ",
-        " should ",
-        " use ",
-        " run ",
-        " require ",
-    ]
-    .iter()
-    .any(|needle| content.contains(needle))
-    {
+    } else if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "always"
+                | "must"
+                | "should"
+                | "use"
+                | "run"
+                | "require"
+                | "allow"
+                | "allowed"
+                | "accept"
+                | "accepted"
+                | "enable"
+                | "enabled"
+                | "active"
+                | "on"
+                | "true"
+                | "present"
+                | "succeed"
+                | "succeeded"
+                | "prefer"
+                | "support"
+                | "supported"
+                | "available"
+        )
+    }) {
         ClaimPolarity::Positive
     } else {
         ClaimPolarity::Unknown
     }
+}
+
+fn pack_claim_tokens(content: &str) -> Vec<String> {
+    let normalized = content
+        .to_ascii_lowercase()
+        .replace("doesn't", "does not")
+        .replace("didn't", "did not")
+        .replace("don't", "do not")
+        .replace("can't", "cannot")
+        .replace("couldn't", "could not")
+        .replace("shouldn't", "should not")
+        .replace("wouldn't", "would not")
+        .replace("mustn't", "must not")
+        .replace("isn't", "is not")
+        .replace("aren't", "are not")
+        .replace("wasn't", "was not")
+        .replace("weren't", "were not")
+        .replace("won't", "will not");
+    normalized
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| match token {
+            "is" | "are" | "was" | "were" | "been" | "being" => "be",
+            "does" | "did" => "do",
+            "uses" | "using" | "used" => "use",
+            "runs" | "running" | "ran" => "run",
+            "requires" | "requiring" | "required" => "require",
+            "supports" | "supporting" | "supported" => "support",
+            "contains" | "containing" | "contained" => "contain",
+            "allows" => "allow",
+            "denies" => "deny",
+            "accepts" => "accept",
+            "succeeds" => "succeed",
+            other => other,
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Normalize the asserted subject/claim text after removing only the
+/// opposition marker. `analyze_pack_consensus_conflicts` already groups items
+/// by subject, but similarity alone is too permissive: two unrelated claims
+/// can share enough common words to look like a direct contradiction. Exact
+/// identity is required for the direct kind; partial-overlap diagnostics retain
+/// their separate, deliberately weaker semantics.
+fn claim_identity(content: &str) -> Vec<String> {
+    pack_claim_tokens(content)
+        .into_iter()
+        .filter_map(|token| match token.as_str() {
+            "always" | "must" | "should" | "never" | "not" | "no" | "dont" | "do" | "avoid"
+            | "prefer" | "positive" | "affirmed" | "affirmative" | "yes" | "current"
+            | "polarity" | "opposition" | "marker" | "signal" | "status" | "state" => None,
+            "forbid" | "forbidden" | "deny" | "denied" | "disallowed" => Some("allowed".to_owned()),
+            "reject" | "rejected" => Some("accepted".to_owned()),
+            "disable" | "deactivated" | "disabled" | "inactive" => Some("enabled".to_owned()),
+            "off" => Some("on".to_owned()),
+            "false" => Some("true".to_owned()),
+            "absent" | "missing" | "unavailable" => Some("present".to_owned()),
+            "unsupported" => Some("supported".to_owned()),
+            "failed" | "fail" => Some("succeeded".to_owned()),
+            _ => Some(token),
+        })
+        .collect()
 }
 
 fn version_marker(content: &str) -> Option<String> {
@@ -9360,11 +9519,11 @@ mod tests {
         PackArenaWorkspaceKey, PackAssemblyOptions, PackAssemblySlo, PackAssemblySloActuals,
         PackAssemblySloStatus, PackCacheGovernor, PackCacheStatus, PackCandidate,
         PackCandidateInput, PackDraft, PackDraftItem, PackHotset, PackHotsetEntry,
-        PackHotsetEntryKind, PackItemRedaction, PackOmissionReason, PackProvenance,
-        PackRejectionStage, PackResourceProfile, PackRevisionMeshMetadata, PackScoreBreakdown,
-        PackSection, PackSelectedItem, PackSelectionAudit, PackSelectionObjective,
-        PackSelectionPhase, PackTrustPosture, PackTrustSignal, PackValidationError, SectionQuota,
-        SectionQuotas, TokenBudget, TokenEstimationStrategy,
+        PackHotsetEntryKind, PackItemLifecycle, PackItemRedaction, PackOmissionReason,
+        PackProvenance, PackRejectionStage, PackResourceProfile, PackRevisionMeshMetadata,
+        PackScoreBreakdown, PackSection, PackSelectedItem, PackSelectionAudit,
+        PackSelectionObjective, PackSelectionPhase, PackTrustPosture, PackTrustSignal,
+        PackValidationError, SectionQuota, SectionQuotas, TokenBudget, TokenEstimationStrategy,
         WORD_HEURISTIC_TOKEN_MULTIPLIER_DENOMINATOR, WORD_HEURISTIC_TOKEN_MULTIPLIER_NUMERATOR,
         assemble_draft, assemble_draft_with_cache_governor, assemble_draft_with_profile,
         assemble_draft_with_profile_and_options, assemble_draft_with_profile_and_options_seeded,
@@ -12131,6 +12290,105 @@ mod tests {
             &report.conflicts[0].conflicting_memory_ids,
             &vec![memory_id(1), memory_id(3)],
             "conflict memory id order",
+        )
+    }
+
+    #[test]
+    fn direct_pack_conflicts_require_exact_claim_identity() -> TestResult {
+        let same_claim_left =
+            candidate_with_content(10, 0.8, 0.5, 10, "Always use SQLite for deployment.")?
+                .with_diversity_key("deployment-policy");
+        let same_claim_right =
+            candidate_with_content(11, 0.8, 0.5, 10, "Never use SQLite for deployment.")?
+                .with_diversity_key("deployment-policy");
+        assert!(super::is_direct_conflict(
+            &PackDraftItem::from_selected_candidate(
+                1,
+                same_claim_left,
+                Vec::new(),
+                PackSelectionPhase::StrictMmr,
+            ),
+            &PackDraftItem::from_selected_candidate(
+                2,
+                same_claim_right,
+                Vec::new(),
+                PackSelectionPhase::StrictMmr,
+            ),
+        ));
+
+        let unrelated_left =
+            candidate_with_content(12, 0.8, 0.5, 10, "Always use SQLite for deployment.")?
+                .with_diversity_key("deployment-policy");
+        let unrelated_right =
+            candidate_with_content(13, 0.8, 0.5, 10, "Never use Redis for telemetry.")?
+                .with_diversity_key("deployment-policy");
+        assert!(!super::is_direct_conflict(
+            &PackDraftItem::from_selected_candidate(
+                1,
+                unrelated_left,
+                Vec::new(),
+                PackSelectionPhase::StrictMmr,
+            ),
+            &PackDraftItem::from_selected_candidate(
+                2,
+                unrelated_right,
+                Vec::new(),
+                PackSelectionPhase::StrictMmr,
+            ),
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn pack_guard_uses_validity_and_confidence_facets_before_recency() -> TestResult {
+        let current =
+            candidate_with_content(20, 0.8, 0.5, 10, "Entity: deployment; Claim: uses SQLite.")?
+                .with_trust_signal(
+                    PackTrustSignal::new(TrustClass::AgentAssertion, None)
+                        .with_contradiction_precedence(0, 1, 900, 1, true),
+                )
+                .with_lifecycle(PackItemLifecycle {
+                    validity_status: "current".to_owned(),
+                    validity_window_kind: "bounded".to_owned(),
+                    valid_from: None,
+                    valid_to: None,
+                });
+        let expired = candidate_with_content(
+            21,
+            0.8,
+            0.5,
+            10,
+            "Entity: deployment; Claim: does not use SQLite.",
+        )?
+        .with_trust_signal(
+            PackTrustSignal::new(TrustClass::AgentAssertion, None)
+                .with_contradiction_precedence(0, 1, 100, 9_999, true),
+        )
+        .with_lifecycle(PackItemLifecycle {
+            validity_status: "expired".to_owned(),
+            validity_window_kind: "bounded".to_owned(),
+            valid_from: None,
+            valid_to: None,
+        });
+        let mut draft = draft_from_candidates(vec![current, expired])?;
+        let suppressed = draft.apply_contradiction_guard(
+            &[(memory_id(20).to_string(), memory_id(21).to_string())],
+            false,
+        );
+        ensure_equal(&suppressed, &1, "one lower-standing pack side suppressed")?;
+        ensure(
+            draft
+                .items
+                .iter()
+                .any(|item| item.memory_id == memory_id(20)),
+            "current high-confidence side remains in the pack",
+        )?;
+        ensure(
+            draft
+                .items
+                .iter()
+                .all(|item| item.memory_id != memory_id(21)),
+            "expired side is omitted despite its newer timestamp",
         )
     }
 

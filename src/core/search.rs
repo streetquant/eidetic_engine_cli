@@ -12,6 +12,9 @@ use serde::Serialize;
 
 use crate::config::MeshCommandMode;
 use crate::config::env_registry::{EnvVar, read};
+use crate::core::contradiction_guard::{
+    authority_subclass_rank, confidence_rank_milli, recency_rank, verification_status_rank,
+};
 use crate::core::why::{DedupLinkEvidence, find_embed_dedup_link};
 #[cfg(test)]
 use crate::db::generate_audit_id_seeded;
@@ -5693,7 +5696,20 @@ fn search_hit_pack_trust(metadata: &serde_json::Value) -> PackTrustSignal {
     let producer = metadata_string(metadata, "trust_subclass")
         .or_else(|| metadata_string(metadata, "producerAgent"))
         .map(str::to_string);
-    PackTrustSignal::new(trust_class, producer)
+    let verification_status = metadata_string(metadata, "provenance_verification_status")
+        .or_else(|| metadata_string(metadata, "provenanceVerificationStatus"))
+        .unwrap_or("unverified");
+    let confidence = metadata_f32(metadata, "confidence").unwrap_or(0.0);
+    let updated_at =
+        metadata_string(metadata, "updated_at").or_else(|| metadata_string(metadata, "updatedAt"));
+    let (recency_epoch, recency_known) = recency_rank(updated_at);
+    PackTrustSignal::new(trust_class, producer.clone()).with_contradiction_precedence(
+        authority_subclass_rank(producer.as_deref()),
+        verification_status_rank(verification_status),
+        confidence_rank_milli(confidence),
+        recency_epoch,
+        recency_known,
+    )
 }
 
 fn search_hit_pack_lifecycle(metadata: &serde_json::Value) -> Option<PackItemLifecycle> {

@@ -56,6 +56,9 @@ use crate::config::{
     parse_env_bool_flag, read_env_var,
 };
 use crate::core::budget::RequestBudget;
+use crate::core::contradiction_guard::{
+    authority_subclass_rank, confidence_rank_milli, recency_rank, verification_status_rank,
+};
 use crate::core::focus::{focus_state_hash, focus_state_path, read_active_focus_state};
 use crate::core::index::{
     index_corpus_compatibility_is_current, prepare_search_embedder_for_workspace,
@@ -8264,18 +8267,11 @@ fn candidates_from_search_with_metrics(
                     // Procedural-rule hits hydrate through their source
                     // memories the same way artifact hits hydrate through
                     // their memory links (bd-3h6bz).
-                    .or_else(|| {
-                        rule_linked_memory_id(connection, workspace_path, hit, degraded)
-                    })
+                    .or_else(|| rule_linked_memory_id(connection, workspace_path, hit, degraded))
                     // Imported evidence hits hydrate through the memory the
                     // span was distilled into, when one exists (bd-16imy).
                     .or_else(|| {
-                        evidence_linked_memory_id(
-                            connection,
-                            workspace_path,
-                            hit,
-                            degraded,
-                        )
+                        evidence_linked_memory_id(connection, workspace_path, hit, degraded)
                     })
             }
         };
@@ -11590,9 +11586,17 @@ fn candidate_from_hit_preloaded(
             source.validity_reference_time,
         ));
     if let Some(rule) = promoted_rule {
+        let (recency_epoch, recency_known) = recency_rank(Some(&memory.updated_at));
         candidate.trust = PackTrustSignal::new(
             TrustClass::from_str(&rule.trust_class).unwrap_or(TrustClass::AgentValidated),
             Some("procedural_rule".to_owned()),
+        )
+        .with_contradiction_precedence(
+            authority_subclass_rank(Some("procedural_rule")),
+            verification_status_rank(&memory.provenance_verification_status),
+            confidence_rank_milli(rule.confidence),
+            recency_epoch,
+            recency_known,
         );
     }
     let candidate = match memory.tombstoned_at.as_ref() {
@@ -12601,7 +12605,14 @@ fn trust_signal_for_memory(
             TrustClass::AgentAssertion
         }
     };
-    PackTrustSignal::new(trust_class, memory.trust_subclass.clone())
+    let (recency_epoch, recency_known) = recency_rank(Some(&memory.updated_at));
+    PackTrustSignal::new(trust_class, memory.trust_subclass.clone()).with_contradiction_precedence(
+        authority_subclass_rank(memory.trust_subclass.as_deref()),
+        verification_status_rank(&memory.provenance_verification_status),
+        confidence_rank_milli(memory.confidence),
+        recency_epoch,
+        recency_known,
+    )
 }
 
 fn provenance_for_memory(
@@ -12770,17 +12781,21 @@ fn apply_context_pack_contradiction_guard(connection: &DbConnection, draft: &mut
         tracing::warn!(
             target: "ee::pack::contradiction_guard",
             error = read_error,
-            "skipping context pack contradiction guard because memory links could not be read"
+            "context pack contradiction guard is using every conflict edge that remained readable"
         );
-        return;
     }
     let detected = gathered
-        .edges
+        .all_edges()
         .iter()
         .map(|edge| (edge.memory_a.clone(), edge.memory_b.clone()))
         .collect::<Vec<_>>();
+    let resolved = gathered
+        .both_valid_resolved
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
     let unresolved =
-        crate::core::contradiction_guard::unresolved_contradiction_pairs(&detected, &[]);
+        crate::core::contradiction_guard::unresolved_contradiction_pairs(&detected, &resolved);
     let suppressed = draft.apply_contradiction_guard(&unresolved, false);
     if suppressed > 0 {
         tracing::debug!(

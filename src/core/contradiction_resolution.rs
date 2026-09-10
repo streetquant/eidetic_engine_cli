@@ -75,7 +75,8 @@ impl ContradictionResolutionKind {
             ExplicitConflictSignal::ContradictionLink
             | ExplicitConflictSignal::Supersession
             | ExplicitConflictSignal::TrustOutcomeSplit
-            | ExplicitConflictSignal::RepeatedCoSelection => Self::Supersede,
+            | ExplicitConflictSignal::RepeatedCoSelection
+            | ExplicitConflictSignal::BodyContradiction => Self::Supersede,
             // Near-duplicate-but-divergent content consolidates.
             ExplicitConflictSignal::DuplicateDivergent => Self::Merge,
             // Both true within different windows/scopes -> scope-split.

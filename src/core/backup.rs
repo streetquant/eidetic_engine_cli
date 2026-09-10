@@ -74,6 +74,91 @@ const MAX_DERIVED_ASSET_BYTES: u64 = 250 * 1024 * 1024;
 const RECOVERY_KEYS_FILE: &str = "store-auth.recovery.json";
 const CASS_SESSION_RESTORE_METADATA_SCHEMA_V1: &str = "ee.backup.restored_cass_session_metadata.v1";
 
+/// Keep dry-run database reads off the live SQLite family. FrankenSQLite's
+/// read-only WAL path updates shared-memory read marks for some query/transaction
+/// shapes, so opening the live family can change `-shm` even when no SQL write is
+/// issued. A private family copy keeps that implementation detail away from the
+/// addressed workspace while retaining the WAL-backed view for the preview.
+fn stage_dry_run_database_family(
+    database_path: &Path,
+) -> Result<(tempfile::TempDir, PathBuf), DomainError> {
+    const SIDECAR_SUFFIXES: &[&str] = &[
+        "",
+        "-wal",
+        "-shm",
+        "-journal",
+        "-fsqlite-ns-gate",
+        "-fsqlite-ns-use",
+        "-wal-cert",
+        "-wal-cert-head",
+        ".fsqlite-migration-state",
+        ".fsqlite-history",
+        ".fsqlite-history-idx",
+    ];
+
+    let stage_root = tempfile::tempdir().map_err(|error| DomainError::Storage {
+        message: format!("failed to create a private dry-run database staging directory: {error}"),
+        repair: Some("check temporary storage and rerun the dry-run".to_owned()),
+    })?;
+    let file_name = database_path
+        .file_name()
+        .ok_or_else(|| DomainError::Storage {
+            message: format!(
+                "database path '{}' has no file name for dry-run staging",
+                database_path.display()
+            ),
+            repair: Some("select a regular database file for --database".to_owned()),
+        })?;
+    let staged_database = stage_root.path().join(file_name);
+
+    for suffix in SIDECAR_SUFFIXES {
+        let source = if suffix.is_empty() {
+            database_path.to_path_buf()
+        } else {
+            PathBuf::from(format!("{}{}", database_path.display(), suffix))
+        };
+        let metadata = match fs::symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(DomainError::Storage {
+                    message: format!(
+                        "failed to inspect dry-run database family member '{}': {error}",
+                        source.display()
+                    ),
+                    repair: Some("check database readability and rerun the dry-run".to_owned()),
+                });
+            }
+        };
+        if !metadata.file_type().is_file() {
+            return Err(DomainError::Storage {
+                message: format!(
+                    "dry-run database family member '{}' is not a regular file",
+                    source.display()
+                ),
+                repair: Some(
+                    "repair the database sidecar family before previewing a backup".to_owned(),
+                ),
+            });
+        }
+        let destination = if suffix.is_empty() {
+            staged_database.clone()
+        } else {
+            PathBuf::from(format!("{}{}", staged_database.display(), suffix))
+        };
+        fs::copy(&source, &destination).map_err(|error| DomainError::Storage {
+            message: format!(
+                "failed to stage dry-run database family member '{}' at '{}': {error}",
+                source.display(),
+                destination.display()
+            ),
+            repair: Some("check temporary storage and rerun the dry-run".to_owned()),
+        })?;
+    }
+
+    Ok((stage_root, staged_database))
+}
+
 /// Explicit key recovery stays separate from ordinary redacted data backups.
 #[derive(Clone, Debug)]
 pub enum BackupKeyRecoveryAction {
@@ -2060,10 +2145,18 @@ pub fn create_backup(options: &BackupCreateOptions) -> Result<BackupCreateReport
         return Err(crate::core::storeless_workspace_error(&database_path));
     }
 
-    let database_config = if options.dry_run {
-        DatabaseConfig::read_only_file(database_path.clone())
+    // Keep the temporary directory alive until the connection is dropped. The
+    // staged family is private, so WAL/SHM read marks cannot alter the source.
+    let (_dry_run_database_stage, database_path_for_open) = if options.dry_run {
+        let (stage, staged_database) = stage_dry_run_database_family(&database_path)?;
+        (Some(stage), staged_database)
     } else {
-        DatabaseConfig::file(database_path.clone())
+        (None, database_path.clone())
+    };
+    let database_config = if options.dry_run {
+        DatabaseConfig::schema_only(database_path_for_open)
+    } else {
+        DatabaseConfig::file(database_path_for_open)
     };
     let connection = DbConnection::open(database_config).map_err(|error| DomainError::Storage {
         message: error.to_string(),
@@ -2220,26 +2313,30 @@ pub fn create_backup(options: &BackupCreateOptions) -> Result<BackupCreateReport
     // A dry-run must not initialize the key store merely to preview an
     // artifact, so it only opens an already-existing root.
     let store_auth = load_store_auth_for_backup(&workspace_path, options.dry_run, &mut degraded);
-    if !options.dry_run
-        && store_auth.is_none()
-        && derived_payloads.iter().any(|p| {
-            matches!(
-                p.report.kind.as_str(),
-                "learning_history"
-                    | "pack_history"
-                    | "import_history"
-                    | "procedure_history"
-                    | "learning_signals"
-                    | "recorded_history"
-                    | "error_recall"
-            ) || (p.report.kind == "curation_history"
-                && serde_json::from_slice::<BackupCurationHistory>(&p.bytes)
-                    .is_ok_and(|chunk| !chunk.candidates.is_empty()))
-        })
-    {
-        return Err(work_history_error(
-            "learned rules, feedback, pack history, import checkpoints, curation history, procedures, learning signals, recorded history, and error recall require source-store authentication; repair the workspace key store before creating this backup",
-        ));
+    let curation_auth_required = derived_payloads.iter().any(|p| {
+        p.report.kind == "curation_history"
+            && serde_json::from_slice::<BackupCurationHistory>(&p.bytes)
+                .is_ok_and(|chunk| !chunk.candidates.is_empty())
+    });
+    let other_auth_required = derived_payloads.iter().any(|p| {
+        matches!(
+            p.report.kind.as_str(),
+            "learning_history"
+                | "pack_history"
+                | "import_history"
+                | "procedure_history"
+                | "learning_signals"
+                | "recorded_history"
+                | "error_recall"
+        )
+    });
+    if !options.dry_run && store_auth.is_none() && (curation_auth_required || other_auth_required) {
+        let message = if curation_auth_required {
+            "curation history require source-store authentication; repair the workspace key store before creating this backup"
+        } else {
+            "learned rules, feedback, pack history, import checkpoints, procedures, learning signals, recorded history, and error recall require source-store authentication; repair the workspace key store before creating this backup"
+        };
+        return Err(work_history_error(message));
     }
     authenticate_learning_payloads(&mut derived_payloads, store_auth.as_ref())?;
     authenticate_pack_payloads(&mut derived_payloads, store_auth.as_ref())?;

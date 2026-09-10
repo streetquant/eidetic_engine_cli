@@ -51,12 +51,13 @@
                   "validity_window_overlap",
                   "duplicate_divergent",
                   "trust_outcome_split",
-                  "repeated_co_selection"
+                  "repeated_co_selection",
+                  "body_contradiction"
                 ]
               },
               "loadBearingMilli": {"type": "integer", "minimum": 0},
               "preferredSide": {"type": "string", "enum": ["a", "b", "tie"]},
-              "preferredReason": {"type": "string", "enum": ["higher_trust", "fresher", "tie_no_signal"]},
+              "preferredReason": {"type": "string", "enum": ["higher_trust", "higher_authority", "higher_verification", "current_validity", "higher_confidence", "fresher", "tie_no_signal"]},
               "memoryA": {"$ref": "#/$defs/conflictMember"},
               "memoryB": {"$ref": "#/$defs/conflictMember"}
             }

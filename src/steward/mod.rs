@@ -1681,6 +1681,21 @@ impl JobBudgetState {
     pub fn add_budget(&mut self, budget: ResourceBudget) {
         self.budgets.push(budget);
     }
+    /// Set a caller-owned budget, replacing the job default for the same
+    /// resource. Defaults remain in force when the caller does not provide an
+    /// override, while an explicit CLI limit is the one hard constraint used
+    /// for the complete job.
+    pub fn set_budget(&mut self, budget: ResourceBudget) {
+        if let Some(existing) = self
+            .budgets
+            .iter_mut()
+            .find(|existing| existing.resource == budget.resource)
+        {
+            *existing = budget;
+        } else {
+            self.budgets.push(budget);
+        }
+    }
 
     /// Record consumption of a resource.
     pub fn record(&mut self, resource: ResourceType, amount: u64) {
@@ -1880,6 +1895,8 @@ impl BudgetSummary {
     }
 }
 
+const INDEX_COALESCE_DEFAULT_TIME_LIMIT_MS: u64 = 120_000;
+
 /// Default budgets for different job types.
 #[must_use]
 pub fn default_budgets_for_job_type(job_type: JobType) -> Vec<ResourceBudget> {
@@ -1889,7 +1906,7 @@ pub fn default_budgets_for_job_type(job_type: JobType) -> Vec<ResourceBudget> {
             ResourceBudget::item_limit(100_000),
         ],
         JobType::IndexCoalesce => vec![
-            ResourceBudget::time_limit_ms(120_000), // 2 minutes
+            ResourceBudget::time_limit_ms(INDEX_COALESCE_DEFAULT_TIME_LIMIT_MS), // 2 minutes
             ResourceBudget::item_limit(10_000),
         ],
         JobType::DecaySweep => vec![
@@ -3351,11 +3368,20 @@ impl ManualRunner {
         job.start(now);
 
         let mut budget = create_job_budget(job_id, job_type, now);
-        if let Some(time_limit) = self.options.time_limit_ms {
-            budget.add_budget(ResourceBudget::time_limit_ms(time_limit));
-        }
-        if let Some(item_limit) = self.options.item_limit {
-            budget.add_budget(ResourceBudget::item_limit(item_limit));
+        if job_type == JobType::IndexCoalesce {
+            if let Some(time_limit) = self.options.time_limit_ms {
+                budget.set_budget(ResourceBudget::time_limit_ms(time_limit));
+            }
+            if let Some(item_limit) = self.options.item_limit {
+                budget.set_budget(ResourceBudget::item_limit(item_limit));
+            }
+        } else {
+            if let Some(time_limit) = self.options.time_limit_ms {
+                budget.add_budget(ResourceBudget::time_limit_ms(time_limit));
+            }
+            if let Some(item_limit) = self.options.item_limit {
+                budget.add_budget(ResourceBudget::item_limit(item_limit));
+            }
         }
 
         let (outcome, items, error, details) = self.execute_job_work(job_type, &mut budget);
@@ -3598,6 +3624,43 @@ impl ManualRunner {
         )
     }
 
+    fn run_index_coalesce_preflight(
+        options: &crate::core::index::IndexProcessingOptions,
+        timeout: Duration,
+    ) -> Result<crate::core::index::IndexProcessingReport, crate::core::index::IndexRebuildError>
+    {
+        let options = options.clone();
+        crate::core::run_cli_with_cx(timeout, |cx| async move {
+            crate::core::index::process_index_jobs_with_cx(&cx, &options).await
+        })
+        .map_err(|error| {
+            crate::core::index::IndexRebuildError::Index(format!(
+                "Failed to start index coalesce preflight runtime: {error}"
+            ))
+        })?
+    }
+
+    fn run_index_coalesce_durable(
+        options: &crate::core::index::IndexProcessingOptions,
+        timeout: Duration,
+    ) -> Result<crate::core::index::IndexProcessingReport, crate::core::index::IndexRebuildError>
+    {
+        let options = options.clone();
+        crate::core::run_cli_with_cx(timeout, |cx| async move {
+            crate::core::index::process_index_jobs_coalesced_with_cx_bounded(
+                &cx,
+                &options,
+                u32::MAX,
+            )
+            .await
+        })
+        .map_err(|error| {
+            crate::core::index::IndexRebuildError::Index(format!(
+                "Failed to start index coalesce runtime: {error}"
+            ))
+        })?
+    }
+
     fn execute_index_coalesce(
         &self,
         budget: &mut JobBudgetState,
@@ -3656,9 +3719,25 @@ impl ManualRunner {
             dry_run: true,
             job_limit,
         };
-        let preflight = match crate::core::index::process_index_jobs(&options) {
+        let preflight_timeout = index_coalesce_runtime_timeout(budget);
+        let preflight = match Self::run_index_coalesce_preflight(&options, preflight_timeout) {
             Ok(report) => report,
             Err(error) => {
+                budget.record(ResourceType::TimeMs, millis_to_u64(started.elapsed()));
+                if index_coalesce_timeout_error(&error) {
+                    return (
+                        RunOutcome::TimedOut,
+                        None,
+                        Some(format!("Index coalesce preflight timed out: {error}")),
+                        Some(index_coalesce_timeout_details(
+                            None,
+                            None,
+                            self.options.dry_run,
+                            false,
+                            "preflight",
+                        )),
+                    );
+                }
                 let message = format!("Index coalesce preflight failed: {error}");
                 return steward_job_failure(
                     "ee.steward.index_coalesce.error.v1",
@@ -3674,6 +3753,20 @@ impl ManualRunner {
         budget.record(ResourceType::Items, u64::from(preflight.pending_jobs));
         let preflight_elapsed_ms = millis_to_u64(started.elapsed());
         budget.record(ResourceType::TimeMs, preflight_elapsed_ms);
+
+        if budget_times_out_before_mutation(budget) {
+            return (
+                RunOutcome::TimedOut,
+                Some(u64::from(preflight.pending_jobs)),
+                Some("Timed out before durable index job processing".to_owned()),
+                Some(index_coalesce_job_details(
+                    &preflight,
+                    None,
+                    self.options.dry_run,
+                    false,
+                )),
+            );
+        }
 
         if budget_cancels_before_mutation(budget) {
             return (
@@ -3711,10 +3804,50 @@ impl ManualRunner {
             options.job_limit = Some(adjusted);
         }
 
+        let durable_phase_started_ms = millis_to_u64(started.elapsed());
+        budget.record(
+            ResourceType::TimeMs,
+            durable_phase_started_ms.saturating_sub(preflight_elapsed_ms),
+        );
+        if budget_time_limit_exceeded(budget) {
+            return (
+                RunOutcome::TimedOut,
+                Some(u64::from(preflight.pending_jobs)),
+                Some("Timed out before durable index job processing".to_owned()),
+                Some(index_coalesce_timeout_details(
+                    Some(&preflight),
+                    None,
+                    self.options.dry_run,
+                    false,
+                    "durable",
+                )),
+            );
+        }
+
         options.dry_run = false;
-        let report = match crate::core::index::process_index_jobs_coalesced(&options) {
+        let durable_timeout = index_coalesce_runtime_timeout(budget);
+        let report = match Self::run_index_coalesce_durable(&options, durable_timeout) {
             Ok(report) => report,
             Err(error) => {
+                let total_elapsed_ms = millis_to_u64(started.elapsed());
+                budget.record(
+                    ResourceType::TimeMs,
+                    total_elapsed_ms.saturating_sub(durable_phase_started_ms),
+                );
+                if index_coalesce_timeout_error(&error) {
+                    return (
+                        RunOutcome::TimedOut,
+                        Some(u64::from(preflight.pending_jobs)),
+                        Some(format!("Index coalesce durable phase timed out: {error}")),
+                        Some(index_coalesce_timeout_details(
+                            Some(&preflight),
+                            None,
+                            false,
+                            false,
+                            "durable",
+                        )),
+                    );
+                }
                 let message = format!("Index coalesce failed: {error}");
                 return steward_job_failure(
                     "ee.steward.index_coalesce.error.v1",
@@ -3729,8 +3862,23 @@ impl ManualRunner {
         let total_elapsed_ms = millis_to_u64(started.elapsed());
         budget.record(
             ResourceType::TimeMs,
-            total_elapsed_ms.saturating_sub(preflight_elapsed_ms),
+            total_elapsed_ms.saturating_sub(durable_phase_started_ms),
         );
+        let durable_mutation = report.durable_mutation();
+        if budget_time_limit_exceeded(budget) {
+            return (
+                RunOutcome::TimedOut,
+                Some(u64::from(report.processed_jobs)),
+                Some("Index coalesce exceeded its time budget after durable processing".to_owned()),
+                Some(index_coalesce_timeout_details(
+                    Some(&preflight),
+                    Some(&report),
+                    false,
+                    durable_mutation,
+                    "durable",
+                )),
+            );
+        }
         let outcome = if matches!(
             report.status,
             crate::core::index::IndexProcessingStatus::Success
@@ -6694,6 +6842,52 @@ fn millis_to_u64(elapsed: std::time::Duration) -> u64 {
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn index_coalesce_runtime_timeout(budget: &JobBudgetState) -> Duration {
+    Duration::from_millis(
+        budget
+            .remaining(ResourceType::TimeMs)
+            .unwrap_or(INDEX_COALESCE_DEFAULT_TIME_LIMIT_MS),
+    )
+}
+
+fn index_coalesce_timeout_error(error: &crate::core::index::IndexRebuildError) -> bool {
+    matches!(
+        error,
+        crate::core::index::IndexRebuildError::Cancelled(reason)
+            if matches!(
+                reason.kind,
+                asupersync::CancelKind::Deadline | asupersync::CancelKind::Timeout
+            )
+    )
+}
+
+fn index_coalesce_timeout_details(
+    preflight: Option<&crate::core::index::IndexProcessingReport>,
+    report: Option<&crate::core::index::IndexProcessingReport>,
+    dry_run: bool,
+    durable_mutation: bool,
+    phase: &str,
+) -> JsonValue {
+    let mut details = match preflight {
+        Some(preflight) => index_coalesce_job_details(preflight, report, dry_run, durable_mutation),
+        None => json!({
+            "schema": "ee.steward.index_coalesce.v1",
+            "jobType": JobType::IndexCoalesce.as_str(),
+            "preflight": JsonValue::Null,
+            "result": report.map(crate::core::index::IndexProcessingReport::data_json),
+            "dryRun": dry_run,
+            "durableMutation": durable_mutation,
+        }),
+    };
+    if let Some(object) = details.as_object_mut() {
+        object.insert(
+            "timedOutPhase".to_owned(),
+            JsonValue::String(phase.to_owned()),
+        );
+    }
+    details
+}
+
 fn budget_cancels_before_mutation(budget: &JobBudgetState) -> bool {
     budget.should_cancel()
         || budget
@@ -6702,7 +6896,7 @@ fn budget_cancels_before_mutation(budget: &JobBudgetState) -> bool {
             .any(|limit| limit.on_exceed == BudgetExceedAction::Cancel && limit.limit == 0)
 }
 
-fn budget_times_out_before_mutation(budget: &JobBudgetState) -> bool {
+fn budget_time_limit_exceeded(budget: &JobBudgetState) -> bool {
     budget.check_budgets().iter().any(|violation| {
         violation.resource == ResourceType::TimeMs && violation.action == BudgetExceedAction::Cancel
     }) || budget.budgets.iter().any(|limit| {
@@ -6710,6 +6904,10 @@ fn budget_times_out_before_mutation(budget: &JobBudgetState) -> bool {
             && limit.on_exceed == BudgetExceedAction::Cancel
             && limit.limit == 0
     })
+}
+
+fn budget_times_out_before_mutation(budget: &JobBudgetState) -> bool {
+    budget_time_limit_exceeded(budget)
 }
 
 fn curation_review_job_details(
@@ -8107,8 +8305,9 @@ mod tests {
     use crate::core::graph_telemetry::CACHE_EVICT_EVENT;
     use crate::db::{
         CreateFeedbackEventInput, CreateGraphAlgorithmResultInput, CreateGraphSnapshotInput,
-        CreateMemoryInput, CreateMemoryLinkInput, CreateWorkspaceInput, DbConnection,
-        GraphSnapshotStatus, MemoryLinkRelation, MemoryLinkSource, audit_actions,
+        CreateMemoryInput, CreateMemoryLinkInput, CreateSearchIndexJobInput, CreateWorkspaceInput,
+        DbConnection, GraphSnapshotStatus, MemoryLinkRelation, MemoryLinkSource,
+        SearchIndexJobStatus, SearchIndexJobType, audit_actions,
     };
     use asupersync::runtime::JoinError;
     use asupersync::{Budget, CancelReason, Cx, LabConfig, LabRuntime, Outcome};
@@ -8125,6 +8324,48 @@ mod tests {
     const SCORE_MEMORY_A: &str = "mem_scoredecay0000000000000001";
     const SCORE_MEMORY_B: &str = "mem_scoredecay0000000000000002";
 
+    const INDEX_COALESCE_JOB_ID: &str = "sidx_stewardcoalesce00000000000";
+
+    fn seed_index_coalesce_database(
+        root: &Path,
+        pending: bool,
+    ) -> Result<(PathBuf, PathBuf), String> {
+        let workspace = root.join("workspace");
+        let database = workspace.join(".ee").join("ee.db");
+        std::fs::create_dir_all(
+            database
+                .parent()
+                .ok_or_else(|| "database path has no parent".to_owned())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let connection = DbConnection::open_file(&database).map_err(|error| error.to_string())?;
+        connection.migrate().map_err(|error| error.to_string())?;
+        connection
+            .insert_workspace(
+                SCORE_WORKSPACE_ID,
+                &CreateWorkspaceInput {
+                    path: workspace.to_string_lossy().into_owned(),
+                    name: Some("index-coalesce-budget".to_owned()),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        if pending {
+            connection
+                .insert_search_index_job(
+                    INDEX_COALESCE_JOB_ID,
+                    &CreateSearchIndexJobInput {
+                        workspace_id: SCORE_WORKSPACE_ID.to_owned(),
+                        job_type: SearchIndexJobType::FullRebuild,
+                        document_source: None,
+                        document_id: None,
+                        documents_total: 0,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        connection.close().map_err(|error| error.to_string())?;
+        Ok((workspace, database))
+    }
     fn ensure<T: std::fmt::Debug + PartialEq>(actual: T, expected: T, ctx: &str) -> TestResult {
         if actual == expected {
             Ok(())
@@ -9623,6 +9864,57 @@ mod tests {
         assert_eq!(state.budgets[0].limit, 999);
         assert_eq!(state.budgets[1].limit, 42);
     }
+    #[test]
+    fn index_coalesce_slow_preflight_uses_caller_budget() {
+        let mut budget = create_job_budget(
+            "job-index-coalesce",
+            JobType::IndexCoalesce,
+            "2026-09-09T00:00:00Z",
+        );
+        assert_eq!(
+            budget
+                .budgets
+                .iter()
+                .find(|limit| limit.resource == ResourceType::TimeMs)
+                .map(|limit| limit.limit),
+            Some(120_000)
+        );
+
+        budget.set_budget(ResourceBudget::time_limit_ms(900_000));
+        assert_eq!(
+            budget
+                .budgets
+                .iter()
+                .filter(|limit| limit.resource == ResourceType::TimeMs)
+                .count(),
+            1
+        );
+        assert_eq!(
+            index_coalesce_runtime_timeout(&budget),
+            Duration::from_secs(900)
+        );
+        budget.record(ResourceType::TimeMs, 120_001);
+        assert_eq!(budget.remaining(ResourceType::TimeMs), Some(779_999));
+        assert_eq!(
+            index_coalesce_runtime_timeout(&budget),
+            Duration::from_millis(779_999)
+        );
+        assert!(!budget_times_out_before_mutation(&budget));
+    }
+
+    #[test]
+    fn index_coalesce_budget_timeout_is_deterministic() {
+        let mut budget = create_job_budget(
+            "job-index-coalesce-timeout",
+            JobType::IndexCoalesce,
+            "2026-09-09T00:00:00Z",
+        );
+        budget.set_budget(ResourceBudget::time_limit_ms(1_000));
+        budget.record(ResourceType::TimeMs, 1_001);
+
+        assert!(budget_times_out_before_mutation(&budget));
+        assert!(budget.should_cancel());
+    }
 
     #[test]
     fn budget_human_summary_format() {
@@ -11041,6 +11333,138 @@ mod tests {
         ensure(create_audits, 0, "cancel before mutation leaves no audit")
     }
 
+    #[test]
+    fn manual_runner_index_coalesce_timeout_leaves_pending_job_unchanged() -> TestResult {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let (workspace, database_path) = seed_index_coalesce_database(temp.path(), true)?;
+        let index_dir = workspace.join(".ee").join("index");
+
+        let opts = RunnerOptions::new()
+            .with_workspace_path(workspace)
+            .with_database_path(database_path.clone())
+            .with_workspace_id(SCORE_WORKSPACE_ID)
+            .with_time_limit(0)
+            .with_actor("index-coalesce-budget-test");
+        let mut runner = ManualRunner::new(opts);
+        let result = runner.run_job_type(
+            JobType::IndexCoalesce,
+            Some("zero index coalesce budget".to_owned()),
+        );
+
+        ensure(
+            result.outcome,
+            RunOutcome::TimedOut,
+            "index coalesce timeout outcome",
+        )?;
+        ensure(
+            result.items_processed.is_none_or(|items| items == 1),
+            true,
+            "preflight item count",
+        )?;
+        ensure(
+            result.error.as_deref().is_some_and(|message| {
+                message.contains("Index coalesce preflight timed out")
+                    || message.contains("Timed out before durable index job processing")
+            }),
+            true,
+            "timeout reason",
+        )?;
+        let details = result
+            .details
+            .ok_or_else(|| "index coalesce timeout details missing".to_owned())?;
+        if details["preflight"].is_null() {
+            ensure(
+                details["timedOutPhase"].as_str(),
+                Some("preflight"),
+                "timeout phase",
+            )?;
+        } else {
+            ensure(
+                details["preflight"]["status"].as_str(),
+                Some("dry_run"),
+                "preflight status",
+            )?;
+        }
+        ensure(details["result"].is_null(), true, "durable result absent")?;
+        ensure(
+            details["durableMutation"].as_bool(),
+            Some(false),
+            "durable mutation",
+        )?;
+        ensure(
+            index_dir.exists(),
+            false,
+            "index directory remains unpublished",
+        )?;
+
+        let connection =
+            DbConnection::open_file(database_path).map_err(|error| error.to_string())?;
+        let job = connection
+            .get_search_index_job(INDEX_COALESCE_JOB_ID)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "pending index job missing".to_owned())?;
+        ensure(
+            job.status_enum(),
+            Some(SearchIndexJobStatus::Pending),
+            "pending index job status",
+        )?;
+        ensure(job.started_at, None, "preflight must not claim index job")?;
+        connection.close().map_err(|error| error.to_string())
+    }
+    #[test]
+    fn manual_runner_index_coalesce_no_pending_succeeds_with_caller_budget() -> TestResult {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let (workspace, database_path) = seed_index_coalesce_database(temp.path(), false)?;
+
+        let opts = RunnerOptions::new()
+            .with_workspace_path(workspace)
+            .with_database_path(database_path)
+            .with_workspace_id(SCORE_WORKSPACE_ID)
+            .with_time_limit(900_000)
+            .with_actor("index-coalesce-budget-test");
+        let mut runner = ManualRunner::new(opts);
+        let result = runner.run_job_type(
+            JobType::IndexCoalesce,
+            Some("caller budget no pending jobs".to_owned()),
+        );
+
+        ensure(
+            result.outcome,
+            RunOutcome::Success,
+            "index coalesce success outcome",
+        )?;
+        ensure(result.error, None, "index coalesce success error")?;
+        let budget = result
+            .budget_summary
+            .ok_or_else(|| "index coalesce budget summary missing".to_owned())?;
+        ensure(
+            budget
+                .resources
+                .iter()
+                .find(|resource| resource.resource == ResourceType::TimeMs)
+                .map(|resource| resource.limit),
+            Some(900_000),
+            "caller time limit",
+        )?;
+        let details = result
+            .details
+            .ok_or_else(|| "index coalesce success details missing".to_owned())?;
+        ensure(
+            details["preflight"]["status"].as_str(),
+            Some("dry_run"),
+            "preflight status",
+        )?;
+        ensure(
+            details["result"]["status"].as_str(),
+            Some("no_pending_jobs"),
+            "durable result status",
+        )?;
+        ensure(
+            details["durableMutation"].as_bool(),
+            Some(false),
+            "no pending durable mutation",
+        )
+    }
     #[test]
     fn manual_runner_decay_sweep_zero_time_budget_times_out_before_mutation() -> TestResult {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
