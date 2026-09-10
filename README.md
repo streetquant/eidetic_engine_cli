@@ -1521,6 +1521,35 @@ outcomes, and timestamps are preserved; free text follows the backup's redaction
 level. Ordinary error codes remain searchable under full redaction. Recovery
 does not execute repairs or claim that historical proofs were rerun.
 
+Artifact registry metadata, snippets, and evidence links are also recovered before
+the search index is rebuilt. Artifact inspection, listing, and lexical search work
+against the restored store. Original file hashes and timestamps are retained;
+valid snippet hashes follow redaction with an audit trail. Invalid hashes are
+retained in that audit and cleared from changed snippets, so redaction cannot
+turn a bad hash into apparent proof. Registry recovery preserves references to external files and does
+not copy or verify their raw bytes. Backup metadata redaction scans both JSON
+keys and values, including short or numeric credentials identified by their field
+names, preserving distinct fields or rejecting a collision.
+
+Authenticated learning-history backups also retain per-agent context profiles:
+helpful, harmful, and ignored counts, cached weights, and last-seen timestamps.
+Restored packs use these learned counts immediately; recovery does not replay
+feedback. Agent keys use the same redaction mapping as pack baselines, with
+distinct opaque names when redacted. Full redaction changes those names, so a
+harness must use the restored identity to retrieve its profile. Conflicting
+identities or profile links outside the recovered workspace reject recovery.
+This uses learning-history format v2; recreate backups containing v1 learning
+history before relying on the new recovery path.
+
+Default backups also retain authenticated rationale traces, their extra evidence
+links, and causal contribution records. Restored `ee why` and `ee causal trace`
+commands use this history immediately, with original confidence, scores, and
+timestamps. Summaries, authors, and external references follow the selected
+redaction level. Recovery preserves recorded claims; it does not validate them
+or replay decisions. Missing memory references, conflicting records, and unsafe
+rationale summaries reject recovery. These records require the source signing
+keys, just like the other authenticated history above.
+
 ### Diagnostics, eval, ops
 
 | Command | Purpose |
@@ -2319,6 +2348,15 @@ artifacts, creation returns `status: "partial"`, verification posture is
 `incomplete_source_coverage`, and `degraded[]` names the affected tables. Do
 not treat that artifact as a complete recovery point.
 
+Authenticated backup assets also preserve memory seals (including reveal
+history), source quarantine and release history, certificate records, and the
+durable agent registry. Restore retains their original chronology. Sealed
+content remains withheld and excluded from search and packs even under full
+redaction. Restoring a certificate preserves a historical claim; it does not
+verify its payload or signature. Referenced certificate files are not copied.
+Source quarantines retain their diagnostic and release state. Redaction that
+would merge distinct source identities is rejected rather than dropping history.
+
 By default, `ee backup create` also includes graph-cache derived assets: graph
 snapshots, graph algorithm witnesses, and graph algorithm result-cache rows.
 Use `--include-graph-cache=false` when those rebuildable assets are unnecessary,
@@ -2639,13 +2677,66 @@ directory triggers a fresh ~531 MB download, and an existing
 
 **Other tools.** [cass-memory](https://github.com/Dicklesworthstone/cass_memory_system)
 (`cm`) embeds with `Xenova/all-MiniLM-L6-v2` (384-d ONNX via transformers.js),
-a different model family, so today no artifact is byte-compatible between the
-two and their vectors are not comparable; `ee` cannot load `cm`'s model and
-vice versa. `ee` also has no remote embedding backend: the Frankensearch
-build it links omits the `api` provider feature, nothing in the stack speaks
-Ollama, and `ee doctor` reports `OPENAI_API_KEY` / `EMBEDDING_MODEL` as
-present-but-ignored. A shared Ollama daemon therefore only helps tools that
-support it (`cm` does, via `embeddingBackend: "ollama"`), not `ee`.
+a different model family from `ee`'s pinned Model2Vec artifact. No file is
+byte-compatible between the two local caches, and vectors from one are not
+comparable with vectors from the other. Sharing a *file* is therefore not
+possible — but sharing a *server* is.
+
+**The shared-server recipe.** Point both tools at one OpenAI-compatible
+`/v1/embeddings` endpoint. One local Ollama serving `all-minilm` is enough, and
+neither tool then downloads a model of its own:
+
+```bash
+# once, on the machine that will host the embeddings
+ollama serve                 # listens on 127.0.0.1:11434
+ollama pull all-minilm       # 384-d, ~45 MB
+
+# ee: switch to the remote backend and re-embed
+export EE_EMBED_BACKEND=remote
+export EE_EMBED_REMOTE_URL=http://127.0.0.1:11434/v1
+export EE_EMBED_REMOTE_MODEL=all-minilm
+ee doctor --workspace .            # probes the endpoint and reports the dimension
+ee index rebuild --workspace .     # re-embeds into the new 384-d space
+ee model status --workspace .      # Backend: remote_api
+```
+
+On the `cm` side set `embeddingBackend: "ollama"` (and `embeddingModel:
+"all-minilm"`) in its config; `cm` talks to the same daemon. The two tools keep
+separate indexes — they are separate products — but there is now one model
+artifact, one download, and one process holding it in memory.
+
+Accepted URL forms are the base (`http://127.0.0.1:11434/v1`) and the full
+endpoint (`http://127.0.0.1:11434/v1/embeddings`); only `http` and `https` are
+supported. `EE_EMBED_REMOTE_API_KEY` adds an `Authorization: Bearer` header for
+a hosted endpoint that needs one — a local Ollama does not. The dimension is
+discovered from the first response; set `EE_EMBED_REMOTE_DIMENSION` to pin it
+and skip that round trip.
+
+**What the remote backend does and does not promise.** These vectors are
+trusted because you pointed `ee` at the endpoint, not because the endpoint
+proved anything: `ee` records no verified embedding identity for them (a stock
+Ollama signs nothing, and Frankensearch's `ApiEmbedder` fail-closes without a
+pinned producer key, which is why `ee` implements this backend itself). What
+`ee` does guarantee is that the space cannot be silently mixed. The index
+stamps the embedder id (`remote-api:all-minilm`) and the dimension into
+`meta.json`, and changing the model, the dimension, or the backend makes the
+existing index incompatible with a named error rather than blending two
+embedding spaces:
+
+```
+index metadata '.../meta.json' was built at 384d by embedder
+'remote-api:all-minilm', but the active embedder 'potion-multilingual-128M'
+produces 256d vectors; embedding dimensions cannot be mixed and a full index
+rebuild is required
+```
+
+`ee model status` reports the active `Backend:` (`neural_local`, `remote_api`,
+or `hash_fallback`), and `ee doctor` carries a `remote_embedding_endpoint`
+check that probes the endpoint whenever `EE_EMBED_BACKEND=remote`. If the
+endpoint is unreachable, retrieval degrades to the deterministic-hash tier and
+both surfaces say so — it never silently pretends to be semantic. Because the
+remote model can change underneath you, `ee model status` reports
+`deterministic=false` for this backend.
 
 ### `ee doctor` reports a repair plan
 

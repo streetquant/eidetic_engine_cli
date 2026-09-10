@@ -12,6 +12,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::{Deserialize, Deserializer, Serialize};
+
 // ============================================================================
 // Schema Constants
 // ============================================================================
@@ -471,7 +473,8 @@ impl RecorderPayload {
 // ============================================================================
 
 /// Redaction status for privacy-sensitive data.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RedactionStatus {
     #[default]
     None,
@@ -606,7 +609,8 @@ impl RedactionStatusSnapshot {
 ///
 /// These are concise user/agent-visible summaries. They are not raw private
 /// model chain-of-thought, scratchpads, or complete hidden transcripts.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RationaleTraceKind {
     Hypothesis,
     Decision,
@@ -676,7 +680,8 @@ impl FromStr for RationaleTraceKind {
 }
 
 /// Evidence posture for a rationale trace.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RationaleTracePosture {
     Asserted,
     Supported,
@@ -728,7 +733,8 @@ impl FromStr for RationaleTracePosture {
 }
 
 /// Visibility/redaction posture for a rationale trace.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RationaleTraceVisibility {
     Public,
     Redacted,
@@ -829,9 +835,11 @@ impl fmt::Display for RationaleTraceValidationError {
 impl std::error::Error for RationaleTraceValidationError {}
 
 /// A safe, evidence-linked rationale summary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RationaleTrace {
-    pub schema: &'static str,
+    #[serde(deserialize_with = "deserialize_rationale_schema")]
+    pub schema: String,
     pub trace_id: String,
     pub kind: RationaleTraceKind,
     pub author: String,
@@ -851,6 +859,19 @@ pub struct RationaleTrace {
     pub created_at: String,
 }
 
+fn deserialize_rationale_schema<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let schema = String::deserialize(deserializer)?;
+    if schema != RATIONALE_TRACE_SCHEMA_V1 {
+        return Err(serde::de::Error::custom(
+            "unsupported rationale trace schema",
+        ));
+    }
+    Ok(schema)
+}
+
 impl RationaleTrace {
     /// Create a safe rationale trace.
     ///
@@ -866,7 +887,7 @@ impl RationaleTrace {
         let summary = summary.into();
         validate_rationale_summary(&summary)?;
         Ok(Self {
-            schema: RATIONALE_TRACE_SCHEMA_V1,
+            schema: RATIONALE_TRACE_SCHEMA_V1.to_owned(),
             trace_id: trace_id.into(),
             kind,
             author: author.into(),
@@ -1019,6 +1040,33 @@ fn contains_secret_like_marker(value: &str) -> bool {
     .any(|needle| lowered.contains(needle))
     {
         return true;
+    }
+
+    // Recognize credential assignments in shell, JSON, and configuration text,
+    // including whitespace and quoted keys. A bare mention of a key is safe.
+    for (offset, separator) in lowered.char_indices() {
+        if !matches!(separator, '=' | ':') {
+            continue;
+        }
+        let before = lowered[..offset]
+            .trim_end_matches(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '\'' | '"'));
+        let key = before
+            .rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))
+            .next()
+            .unwrap_or_default();
+        if [
+            "api_key", "api-key", "apikey", "password", "token", "secret",
+        ]
+        .iter()
+        .any(|name| {
+            key == *name
+                || key
+                    .strip_suffix(*name)
+                    .is_some_and(|prefix| prefix.ends_with('_') || prefix.ends_with('-'))
+        }) && !lowered[offset + 1..].trim().is_empty()
+        {
+            return true;
+        }
     }
 
     value.split(secret_token_boundary).any(|token| {
@@ -2091,6 +2139,39 @@ mod tests {
     }
 
     #[test]
+    fn rationale_trace_serde_preserves_metadata_and_rejects_unknown_schema() -> TestResult {
+        let original = trace(RationaleTrace::new(
+            "rat_json",
+            RationaleTraceKind::Decision,
+            "Agent",
+            "Use the pinned toolchain.",
+            "2026-09-01T00:00:00Z",
+        ))?
+        .with_memory_id("mem_001")
+        .with_posture(RationaleTracePosture::Supported);
+        let value = serde_json::to_value(&original).map_err(|e| e.to_string())?;
+        ensure(
+            serde_json::from_value::<RationaleTrace>(value.clone()).map_err(|e| e.to_string())?,
+            original,
+            "serde roundtrip",
+        )?;
+        let mut invalid = value.clone();
+        invalid["schema"] = serde_json::json!("ee.rationale_trace.v999");
+        ensure(
+            serde_json::from_value::<RationaleTrace>(invalid).is_err(),
+            true,
+            "unknown schema refused",
+        )?;
+        let mut invalid = value;
+        invalid["unrecognizedField"] = serde_json::json!(true);
+        ensure(
+            serde_json::from_value::<RationaleTrace>(invalid).is_err(),
+            true,
+            "unknown field refused",
+        )
+    }
+
+    #[test]
     fn rationale_trace_builder_sorts_links_and_sets_safety_defaults() -> TestResult {
         let trace = trace(RationaleTrace::new(
             "rat_001",
@@ -2119,7 +2200,7 @@ mod tests {
         .supersedes_trace("rat_000")
         .contradicted_by_trace("rat_009");
 
-        ensure(trace.schema, RATIONALE_TRACE_SCHEMA_V1, "schema")?;
+        ensure(trace.schema.as_str(), RATIONALE_TRACE_SCHEMA_V1, "schema")?;
         ensure(trace.kind, RationaleTraceKind::Hypothesis, "kind")?;
         ensure(trace.posture, RationaleTracePosture::Supported, "posture")?;
         ensure(
@@ -2189,6 +2270,23 @@ mod tests {
             key_like.map_err(|error| error.kind),
             Err(RationaleTraceValidationErrorKind::SecretLikeContent)
         );
+
+        for assignment in [
+            "api_key=unsafe-secret-value",
+            "API_KEY = unsafe-secret-value",
+            "OPENAI_API_KEY = unsafe-secret-value",
+            "api-key: unsafe-secret-value",
+            r#"{"apikey": "unsafe-secret-value"}"#,
+            r#"{"password" : "unsafe-secret-value"}"#,
+            "token \n = unsafe-secret-value",
+            "secret : unsafe-secret-value",
+        ] {
+            assert_eq!(
+                validate_rationale_summary(assignment).map_err(|error| error.kind),
+                Err(RationaleTraceValidationErrorKind::SecretLikeContent),
+                "credential assignment was accepted: {assignment}",
+            );
+        }
     }
 
     #[test]
@@ -2198,6 +2296,8 @@ mod tests {
         )
         .map_err(|error| error.to_string())?;
         validate_rationale_summary("The literal sk- prefix was mentioned without a key body.")
+            .map_err(|error| error.to_string())?;
+        validate_rationale_summary("Rotate the API key and password after revoking the old token.")
             .map_err(|error| error.to_string())
     }
 

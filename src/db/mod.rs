@@ -10999,7 +10999,8 @@ pub struct CreateCertificateInput {
 }
 
 /// Stored certificate verification state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredCertificateRecord {
     pub id: String,
     pub workspace_id: String,
@@ -11034,7 +11035,8 @@ pub struct UpsertTrustQuarantineInput {
 }
 
 /// Stored source-level trust quarantine summary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredTrustQuarantine {
     pub workspace_id: String,
     pub source_uri: String,
@@ -11048,7 +11050,86 @@ pub struct StoredTrustQuarantine {
     pub updated_at: String,
 }
 
+/// Durable agent identity, distinct from a rediscoverable harness installation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoredAgent {
+    pub id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub model: Option<String>,
+    pub created_at: String,
+    pub last_seen_at: String,
+}
+
 impl DbConnection {
+    /// Read the complete durable registry in stable order for recovery.
+    pub fn list_agents_for_recovery(&self, workspace_id: &str) -> Result<Vec<StoredAgent>> {
+        self.query_for(DbOperation::Query,
+            "SELECT id, workspace_id, name, model, created_at, last_seen_at FROM agents WHERE workspace_id = ?1 ORDER BY id",
+            &[Value::Text(workspace_id.to_owned())])?.iter().map(|row| Ok(StoredAgent {
+                id: required_text(row, 0, DbOperation::Query, "id")?.to_owned(),
+                workspace_id: required_text(row, 1, DbOperation::Query, "workspace_id")?.to_owned(),
+                name: required_text(row, 2, DbOperation::Query, "name")?.to_owned(),
+                model: optional_text(row, 3)?.map(str::to_owned),
+                created_at: required_text(row, 4, DbOperation::Query, "created_at")?.to_owned(),
+                last_seen_at: required_text(row, 5, DbOperation::Query, "last_seen_at")?.to_owned(),
+            })).collect()
+    }
+
+    /// Restore without replacing existing identities or changing chronology.
+    pub fn insert_agent_for_recovery(&self, row: &StoredAgent) -> Result<()> {
+        self.execute_for(DbOperation::Execute,
+            "INSERT INTO agents (id, workspace_id, name, model, created_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[Value::Text(row.id.clone()), Value::Text(row.workspace_id.clone()),
+                Value::Text(row.name.clone()), row.model.clone().map_or(Value::Null, Value::Text),
+                Value::Text(row.created_at.clone()), Value::Text(row.last_seen_at.clone())])?;
+        Ok(())
+    }
+
+    /// Read all certificate history, including revoked and expired records.
+    pub fn list_certificates_for_recovery(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<StoredCertificateRecord>> {
+        self.query_for(DbOperation::Query,
+            "SELECT id, workspace_id, target_kind, target_id, hash_algo, content_hash, signature, signature_algorithm, signer, signed_at, verified_at, status, manifest_path, payload_path, metadata_json, created_at, updated_at FROM certificates WHERE workspace_id = ?1 ORDER BY id",
+            &[Value::Text(workspace_id.to_owned())])?.iter().map(stored_certificate_from_row).collect()
+    }
+
+    /// Restore a historical claim; this does not verify its payload or signature.
+    pub fn insert_certificate_for_recovery(&self, row: &StoredCertificateRecord) -> Result<()> {
+        self.execute_for(DbOperation::Execute,
+            "INSERT INTO certificates (id, workspace_id, target_kind, target_id, hash_algo, content_hash, signature, signature_algorithm, signer, signed_at, verified_at, status, manifest_path, payload_path, metadata_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            &[Value::Text(row.id.clone()), Value::Text(row.workspace_id.clone()),
+                Value::Text(row.target_kind.clone()), Value::Text(row.target_id.clone()),
+                Value::Text(row.hash_algo.clone()), Value::Text(row.content_hash.clone()),
+                row.signature.clone().map_or(Value::Null, Value::Text),
+                row.signature_algorithm.clone().map_or(Value::Null, Value::Text),
+                row.signer.clone().map_or(Value::Null, Value::Text),
+                row.signed_at.clone().map_or(Value::Null, Value::Text),
+                row.verified_at.clone().map_or(Value::Null, Value::Text),
+                Value::Text(row.status.clone()),
+                row.manifest_path.clone().map_or(Value::Null, Value::Text),
+                row.payload_path.clone().map_or(Value::Null, Value::Text),
+                Value::Text(row.metadata_json.clone()), Value::Text(row.created_at.clone()),
+                Value::Text(row.updated_at.clone())])?;
+        Ok(())
+    }
+
+    /// Restore quarantine/release history without merging counters or timestamps.
+    pub fn insert_trust_quarantine_for_recovery(&self, row: &StoredTrustQuarantine) -> Result<()> {
+        self.execute_for(DbOperation::Execute,
+            "INSERT INTO trust_quarantine (workspace_id, source_uri, first_event_at, last_event_at, harmful_event_count, quarantined_until, reason, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            &[Value::Text(row.workspace_id.clone()), Value::Text(row.source_uri.clone()),
+                Value::Text(row.first_event_at.clone()), Value::Text(row.last_event_at.clone()),
+                Value::BigInt(i64::from(row.harmful_event_count)),
+                row.quarantined_until.clone().map_or(Value::Null, Value::Text),
+                Value::Text(row.reason.clone()), Value::Text(row.status.clone()),
+                Value::Text(row.created_at.clone()), Value::Text(row.updated_at.clone())])?;
+        Ok(())
+    }
+
     /// Insert or update a certificate row without mutating target artifacts.
     pub fn upsert_certificate(&self, id: &str, input: &CreateCertificateInput) -> Result<()> {
         let now = Utc::now().to_rfc3339();
@@ -11236,6 +11317,35 @@ impl DbConnection {
     }
 }
 
+fn stored_memory_seal_from_row(row: &Row) -> Result<MemorySeal> {
+    let verified = optional_u64(row, 4, DbOperation::Query, "reveal_verified")?;
+    if verified.is_some_and(|value| value > 1) {
+        return Err(DbError::MalformedRow {
+            operation: DbOperation::Query,
+            message: "memory_seals row contains invalid verification flag".to_owned(),
+        });
+    }
+    let seal = MemorySeal {
+        memory_id: required_text(row, 0, DbOperation::Query, "memory_id")?.to_owned(),
+        content_commitment: required_text(row, 1, DbOperation::Query, "content_commitment")?
+            .to_owned(),
+        sealed_at: required_text(row, 2, DbOperation::Query, "sealed_at")?.to_owned(),
+        revealed_at: optional_text(row, 3)?.map(str::to_owned),
+        reveal_verified: verified.map(|value| value == 1),
+    };
+    validate_attestation_seal_fields(
+        &seal.content_commitment,
+        &seal.sealed_at,
+        seal.revealed_at.as_deref(),
+        seal.reveal_verified,
+    )
+    .map_err(|_| DbError::MalformedRow {
+        operation: DbOperation::Query,
+        message: "memory_seals row contains invalid public seal evidence".to_owned(),
+    })?;
+    Ok(seal)
+}
+
 fn stored_certificate_from_row(row: &Row) -> Result<StoredCertificateRecord> {
     Ok(StoredCertificateRecord {
         id: required_text(row, 0, DbOperation::Query, "id")?.to_string(),
@@ -11293,7 +11403,8 @@ pub struct CreateArtifactInput {
 }
 
 /// Stored coding artifact metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredArtifact {
     pub id: String,
     pub workspace_id: String,
@@ -11325,7 +11436,8 @@ pub struct CreateArtifactLinkInput {
 }
 
 /// Stored artifact link row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredArtifactLink {
     pub artifact_id: String,
     pub target_type: String,
@@ -11408,6 +11520,41 @@ impl DbConnection {
             ],
         )?;
 
+        Ok(())
+    }
+
+    /// Recover metadata without refreshing timestamps or overwriting an identity.
+    pub(crate) fn insert_artifact_for_recovery(&self, row: &StoredArtifact) -> Result<()> {
+        let size = i64::try_from(row.size_bytes).map_err(|_| DbError::MalformedRow {
+            operation: DbOperation::Execute,
+            message: "recovered artifact size exceeds SQLite integer storage".to_owned(),
+        })?;
+        self.execute_for(DbOperation::Execute,
+            "INSERT INTO artifacts (id, workspace_id, source_kind, artifact_type, original_path, canonical_path, external_ref, content_hash, media_type, size_bytes, redaction_status, snippet, snippet_hash, provenance_uri, metadata_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            &[
+                Value::Text(row.id.clone()), Value::Text(row.workspace_id.clone()),
+                Value::Text(row.source_kind.clone()), Value::Text(row.artifact_type.clone()),
+                row.original_path.clone().map_or(Value::Null, Value::Text),
+                row.canonical_path.clone().map_or(Value::Null, Value::Text),
+                row.external_ref.clone().map_or(Value::Null, Value::Text),
+                Value::Text(row.content_hash.clone()), Value::Text(row.media_type.clone()), Value::BigInt(size),
+                Value::Text(row.redaction_status.clone()), row.snippet.clone().map_or(Value::Null, Value::Text),
+                row.snippet_hash.clone().map_or(Value::Null, Value::Text),
+                row.provenance_uri.clone().map_or(Value::Null, Value::Text), Value::Text(row.metadata_json.clone()),
+                Value::Text(row.created_at.clone()), Value::Text(row.updated_at.clone()),
+            ])?;
+        Ok(())
+    }
+
+    /// Recovery must reject duplicate link identities instead of ignoring them.
+    pub(crate) fn insert_artifact_link_for_recovery(&self, row: &StoredArtifactLink) -> Result<()> {
+        self.execute_for(DbOperation::Execute,
+            "INSERT INTO artifact_links (artifact_id, target_type, target_id, relation, created_at, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[
+                Value::Text(row.artifact_id.clone()), Value::Text(row.target_type.clone()),
+                Value::Text(row.target_id.clone()), Value::Text(row.relation.clone()),
+                Value::Text(row.created_at.clone()), row.metadata_json.clone().map_or(Value::Null, Value::Text),
+            ])?;
         Ok(())
     }
 
@@ -14976,7 +15123,8 @@ pub struct UpsertAgentContextProfileInput {
 }
 
 /// Stored agent_context_profiles row.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredAgentContextProfile {
     pub workspace_id: String,
     pub agent_name: String,
@@ -16374,6 +16522,57 @@ impl DbConnection {
             ],
         )?;
         Ok(())
+    }
+
+    /// Read every learned profile in a workspace, including inactive agents.
+    pub(crate) fn list_agent_context_profiles_for_recovery(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<StoredAgentContextProfile>> {
+        self.query_for(
+            DbOperation::Query,
+            "SELECT workspace_id, agent_name, memory_id, helpful_count, harmful_count,
+                    ignored_count, last_seen_at, weight_cached
+             FROM agent_context_profiles WHERE workspace_id = ?1
+             ORDER BY agent_name, memory_id",
+            &[Value::Text(workspace_id.to_owned())],
+        )?
+        .iter()
+        .map(stored_agent_context_profile_from_row)
+        .collect()
+    }
+
+    /// Restore exact learned counts without replaying events or merging rows.
+    /// The recovery caller owns the transaction and validates workspace links.
+    pub(crate) fn insert_agent_context_profile_for_recovery(
+        &self,
+        profile: &StoredAgentContextProfile,
+    ) -> Result<()> {
+        if !profile.weight_cached.is_finite()
+            || profile.weight_cached.abs() > AGENT_PROFILE_BIAS_CAP
+        {
+            return Err(DbError::MalformedRow {
+                operation: DbOperation::Execute,
+                message: "invalid recovered agent context profile weight".to_owned(),
+            });
+        }
+        self.execute_for(
+            DbOperation::Execute,
+            "INSERT INTO agent_context_profiles (workspace_id, agent_name, memory_id,
+                helpful_count, harmful_count, ignored_count, last_seen_at, weight_cached)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            &[
+                Value::Text(profile.workspace_id.clone()),
+                Value::Text(profile.agent_name.clone()),
+                Value::Text(profile.memory_id.clone()),
+                Value::BigInt(i64::from(profile.counts.helpful_count)),
+                Value::BigInt(i64::from(profile.counts.harmful_count)),
+                Value::BigInt(i64::from(profile.counts.ignored_count)),
+                Value::Text(profile.last_seen_at.clone()),
+                Value::Double(profile.weight_cached),
+            ],
+        )?;
+        self.clear_agent_context_profile_pack_cache(DbOperation::Execute)
     }
 
     /// Insert or update one per-agent profile row for a memory.
@@ -19038,6 +19237,9 @@ impl DbConnection {
             ("import_ledger", "id"),
             ("rch_verify_runs", "id"),
             ("error_repair_links", "link_id"),
+            ("artifacts", "id"),
+            ("rationale_traces", "trace_id"),
+            ("causal_evidence", "id"),
         ] {
             let rows = self.query_for(
                 DbOperation::Query,
@@ -22358,35 +22560,46 @@ impl DbConnection {
             "SELECT memory_id, content_commitment, sealed_at, revealed_at, reveal_verified FROM memory_seals WHERE memory_id = ?1",
             &[Value::Text(memory_id.to_string())],
         )?;
-        rows.first()
-            .map(|row| {
-                let seal = MemorySeal {
-                    memory_id: required_text(row, 0, DbOperation::Query, "memory_id")?.to_string(),
-                    content_commitment: required_text(
-                        row,
-                        1,
-                        DbOperation::Query,
-                        "content_commitment",
-                    )?
-                    .to_string(),
-                    sealed_at: required_text(row, 2, DbOperation::Query, "sealed_at")?.to_string(),
-                    revealed_at: optional_text(row, 3)?.map(str::to_string),
-                    reveal_verified: optional_u64(row, 4, DbOperation::Query, "reveal_verified")?
-                        .map(|value| value == 1),
-                };
-                validate_attestation_seal_fields(
-                    &seal.content_commitment,
-                    &seal.sealed_at,
-                    seal.revealed_at.as_deref(),
-                    seal.reveal_verified,
-                )
-                .map_err(|_| DbError::MalformedRow {
-                    operation: DbOperation::Query,
-                    message: "memory_seals row contains invalid public seal evidence".to_owned(),
-                })?;
+        rows.first().map(stored_memory_seal_from_row).transpose()
+    }
+
+    /// Include sealed and revealed history, including tombstoned memories.
+    pub fn list_memory_seals_for_recovery(&self, workspace_id: &str) -> Result<Vec<MemorySeal>> {
+        self.query_for(DbOperation::Query,
+            "SELECT s.memory_id, s.content_commitment, s.sealed_at, s.revealed_at, s.reveal_verified, m.content FROM memory_seals s JOIN memories m ON m.id = s.memory_id WHERE m.workspace_id = ?1 ORDER BY s.memory_id",
+            &[Value::Text(workspace_id.to_owned())])?.iter().map(|row| {
+                let seal = stored_memory_seal_from_row(row)?;
+                if seal.is_sealed()
+                    && required_text(row, 5, DbOperation::Query, "content")?
+                        != crate::models::MEMORY_SEAL_PLACEHOLDER_CONTENT
+                {
+                    return Err(DbError::MalformedRow {
+                        operation: DbOperation::Query,
+                        message: "memory_seals recovery rejected exposed content before reveal".to_owned(),
+                    });
+                }
                 Ok(seal)
-            })
-            .transpose()
+            }).collect()
+    }
+
+    /// Restore public seal evidence without revealing content or replaying a reveal.
+    pub fn insert_memory_seal_for_recovery(&self, seal: &MemorySeal) -> Result<()> {
+        validate_attestation_seal_fields(
+            &seal.content_commitment,
+            &seal.sealed_at,
+            seal.revealed_at.as_deref(),
+            seal.reveal_verified,
+        )
+        .map_err(|_| DbError::MalformedRow {
+            operation: DbOperation::Execute,
+            message: "memory_seals recovery rejected invalid public seal evidence".to_owned(),
+        })?;
+        self.execute_for(DbOperation::Execute,
+            "INSERT INTO memory_seals (memory_id, content_commitment, sealed_at, revealed_at, reveal_verified) VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[Value::Text(seal.memory_id.clone()), Value::Text(seal.content_commitment.clone()),
+                Value::Text(seal.sealed_at.clone()), seal.revealed_at.clone().map_or(Value::Null, Value::Text),
+                seal.reveal_verified.map_or(Value::Null, |v| Value::BigInt(i64::from(v)))])?;
+        Ok(())
     }
 
     /// Record a verified reveal on an existing, still-sealed row. Returns
@@ -25418,6 +25631,20 @@ pub struct CreateCausalEvidenceInput {
     pub method: String,
 }
 
+/// Exact causal ledger state carried by authenticated local recovery.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoredCausalEvidence {
+    pub id: String,
+    pub workspace_id: String,
+    pub failure_id: String,
+    pub candidate_cause_id: String,
+    pub contribution_score: f64,
+    pub evidence_uris: Vec<String>,
+    pub computed_at: String,
+    pub method: String,
+}
+
 /// Canonical details schema for `memory.level_transition` audit rows.
 pub const MEMORY_LEVEL_TRANSITION_AUDIT_SCHEMA_V1: &str = "ee.audit.memory_level_transition.v1";
 
@@ -26065,6 +26292,44 @@ impl DbConnection {
             ],
         )?;
 
+        Ok(())
+    }
+
+    /// Read the complete workspace ledger without rounding its scores.
+    pub fn list_causal_evidence_for_recovery(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<StoredCausalEvidence>> {
+        self.query_for(DbOperation::Query,
+            "SELECT id, workspace_id, failure_id, candidate_cause_id, contribution_score, evidence_uris_json, computed_at, method FROM causal_evidence WHERE workspace_id = ?1 ORDER BY id",
+            &[Value::Text(workspace_id.to_owned())])?
+            .iter().map(|row| Ok(StoredCausalEvidence {
+                id: required_text(row, 0, DbOperation::Query, "id")?.to_owned(),
+                workspace_id: required_text(row, 1, DbOperation::Query, "workspace_id")?.to_owned(),
+                failure_id: required_text(row, 2, DbOperation::Query, "failure_id")?.to_owned(),
+                candidate_cause_id: required_text(row, 3, DbOperation::Query, "candidate_cause_id")?.to_owned(),
+                contribution_score: required_f64(row, 4, DbOperation::Query, "contribution_score")?,
+                evidence_uris: required_json_string_vec(row, 5, "evidence_uris_json")?,
+                computed_at: required_text(row, 6, DbOperation::Query, "computed_at")?.to_owned(),
+                method: required_text(row, 7, DbOperation::Query, "method")?.to_owned(),
+            })).collect()
+    }
+
+    /// Strict insertion in the caller's recovery transaction; never replace evidence.
+    pub fn insert_causal_evidence_for_recovery(&self, row: &StoredCausalEvidence) -> Result<()> {
+        if !row.contribution_score.is_finite() || !(0.0..=1.0).contains(&row.contribution_score) {
+            return Err(DbError::MalformedRow {
+                operation: DbOperation::Execute,
+                message: "recovered causal contribution must be finite and within 0..=1".to_owned(),
+            });
+        }
+        self.execute_for(DbOperation::Execute,
+            "INSERT INTO causal_evidence (id, workspace_id, failure_id, candidate_cause_id, contribution_score, evidence_uris_json, computed_at, method) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            &[Value::Text(row.id.clone()), Value::Text(row.workspace_id.clone()),
+                Value::Text(row.failure_id.clone()), Value::Text(row.candidate_cause_id.clone()),
+                Value::Double(row.contribution_score),
+                Value::Text(json_string_vec(&row.evidence_uris, "causal evidence URIs")?),
+                Value::Text(row.computed_at.clone()), Value::Text(row.method.clone())])?;
         Ok(())
     }
 
@@ -33277,14 +33542,16 @@ fn stored_pack_evidence_item_from_row(row: &Row) -> Result<StoredPackEvidenceIte
 // ============================================================================
 
 /// Durable rationale trace row plus its workspace scope.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredRationaleTrace {
     pub workspace_id: String,
     pub trace: RationaleTrace,
 }
 
 /// One durable link from a rationale trace to an evidence or target artifact.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredRationaleTraceLink {
     pub trace_id: String,
     pub target_type: String,
@@ -33360,6 +33627,18 @@ impl DbConnection {
         workspace_id: &str,
         trace: &RationaleTrace,
     ) -> Result<()> {
+        self.insert_rationale_trace_record(workspace_id, trace)?;
+        for link in rationale_trace_link_rows(trace) {
+            self.insert_rationale_trace_link(&link)?;
+        }
+        Ok(())
+    }
+
+    fn insert_rationale_trace_record(
+        &self,
+        workspace_id: &str,
+        trace: &RationaleTrace,
+    ) -> Result<()> {
         self.execute_for(
             DbOperation::Execute,
             "INSERT INTO rationale_traces (trace_id, workspace_id, schema, kind, author, summary, posture, confidence_basis_points, visibility, redaction_status, evidence_uris_json, linked_memory_ids_json, linked_context_pack_ids_json, linked_recorder_run_ids_json, linked_recorder_event_ids_json, linked_causal_trace_ids_json, supersedes_trace_ids_json, contradicted_by_trace_ids_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
@@ -33407,18 +33686,45 @@ impl DbConnection {
             ],
         )?;
 
-        for link in rationale_trace_link_rows(trace) {
-            self.insert_rationale_trace_link(&link)?;
-        }
-
         Ok(())
+    }
+
+    /// Read every trace, including traces with no target links, in the caller's snapshot.
+    pub fn list_rationale_traces_for_recovery(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<StoredRationaleTrace>> {
+        let sql = format!("{RATIONALE_TRACE_SELECT_SQL} WHERE workspace_id = ?1 ORDER BY trace_id");
+        self.query_for(
+            DbOperation::Query,
+            &sql,
+            &[Value::Text(workspace_id.to_owned())],
+        )?
+        .iter()
+        .map(stored_rationale_trace_from_row)
+        .collect()
+    }
+
+    /// Validate the normal safety policy while retaining original vectors and timestamps.
+    /// Links are restored separately so additional links and their chronology survive.
+    pub fn insert_rationale_trace_for_recovery(&self, row: &StoredRationaleTrace) -> Result<()> {
+        normalized_rationale_trace(&row.trace)?;
+        self.insert_rationale_trace_record(&row.workspace_id, &row.trace)
+    }
+
+    /// Strictly preserve a link inside the caller's recovery transaction.
+    pub fn insert_rationale_trace_link_for_recovery(
+        &self,
+        link: &StoredRationaleTraceLink,
+    ) -> Result<()> {
+        self.insert_rationale_trace_link(link)
     }
 
     /// Get one rationale trace by ID.
     pub fn get_rationale_trace(&self, trace_id: &str) -> Result<Option<StoredRationaleTrace>> {
         let rows = self.query_for(
             DbOperation::Query,
-            RATIONALE_TRACE_SELECT_SQL_WITH_WHERE,
+            &format!("{RATIONALE_TRACE_SELECT_SQL} WHERE trace_id = ?1"),
             &[Value::Text(trace_id.to_string())],
         )?;
 
@@ -33479,10 +33785,10 @@ impl DbConnection {
     }
 }
 
-const RATIONALE_TRACE_SELECT_SQL_WITH_WHERE: &str = "SELECT trace_id, workspace_id, schema, kind, author, summary, posture, confidence_basis_points, visibility, redaction_status, evidence_uris_json, linked_memory_ids_json, linked_context_pack_ids_json, linked_recorder_run_ids_json, linked_recorder_event_ids_json, linked_causal_trace_ids_json, supersedes_trace_ids_json, contradicted_by_trace_ids_json, created_at FROM rationale_traces WHERE trace_id = ?1";
+const RATIONALE_TRACE_SELECT_SQL: &str = "SELECT trace_id, workspace_id, schema, kind, author, summary, posture, confidence_basis_points, visibility, redaction_status, evidence_uris_json, linked_memory_ids_json, linked_context_pack_ids_json, linked_recorder_run_ids_json, linked_recorder_event_ids_json, linked_causal_trace_ids_json, supersedes_trace_ids_json, contradicted_by_trace_ids_json, created_at FROM rationale_traces";
 
 fn normalized_rationale_trace(trace: &RationaleTrace) -> Result<RationaleTrace> {
-    if !text_matches(trace.schema, RATIONALE_TRACE_SCHEMA_V1) {
+    if !text_matches(&trace.schema, RATIONALE_TRACE_SCHEMA_V1) {
         return Err(DbError::MalformedRow {
             operation: DbOperation::Execute,
             message: format!(
@@ -33638,7 +33944,7 @@ fn stored_rationale_trace_from_row(row: &Row) -> Result<StoredRationaleTrace> {
     Ok(StoredRationaleTrace {
         workspace_id: required_text(row, 1, DbOperation::Query, "workspace_id")?.to_string(),
         trace: RationaleTrace {
-            schema: RATIONALE_TRACE_SCHEMA_V1,
+            schema: RATIONALE_TRACE_SCHEMA_V1.to_owned(),
             trace_id: required_text(row, 0, DbOperation::Query, "trace_id")?.to_string(),
             kind: parse_rationale_trace_kind(required_text(row, 3, DbOperation::Query, "kind")?)?,
             author: required_text(row, 4, DbOperation::Query, "author")?.to_string(),
@@ -47443,6 +47749,86 @@ mod tests {
         ensure_equal(&event.applied_at, &None, "applied_at is null initially")?;
         ensure(!event.created_at.is_empty(), "created_at is populated")?;
 
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn agent_context_profile_recovery_preserves_counts_and_invalidates_cache() -> TestResult {
+        let connection = DbConnection::open_memory()?;
+        connection.migrate()?;
+        setup_workspace(&connection)?;
+        seed_memory(&connection, "mem_01234567890123456789012345")?;
+        let profile = super::StoredAgentContextProfile {
+            workspace_id: "wsp_01234567890123456789012345".to_owned(),
+            agent_name: "RecoveredAgent".to_owned(),
+            memory_id: "mem_01234567890123456789012345".to_owned(),
+            counts: AgentContextProfileCounts::new(17, 3, 2),
+            last_seen_at: "2026-09-01T01:02:03Z".to_owned(),
+            weight_cached: -0.05,
+        };
+        ensure(
+            connection
+                .list_agent_context_profiles_for_pack(&profile.workspace_id, &profile.agent_name)?
+                .is_empty(),
+            "prime empty cache",
+        )?;
+        connection
+            .with_transaction(|| connection.insert_agent_context_profile_for_recovery(&profile))?;
+        let cached = connection
+            .list_agent_context_profiles_for_pack(&profile.workspace_id, &profile.agent_name)?;
+        ensure_equal(&cached.len(), &1, "recovery invalidates cache")?;
+        ensure_equal(&cached[0].counts, &profile.counts, "exact counts visible")?;
+        ensure(
+            connection
+                .insert_agent_context_profile_for_recovery(&profile)
+                .is_err(),
+            "duplicate recovery refuses merge",
+        )?;
+        ensure_equal(
+            &connection.get_agent_context_profile(
+                &profile.workspace_id,
+                &profile.agent_name,
+                &profile.memory_id,
+            )?,
+            &Some(profile.clone()),
+            "existing profile untouched",
+        )?;
+        let updated = connection.upsert_agent_context_profile_event(
+            &super::UpsertAgentContextProfileInput {
+                workspace_id: profile.workspace_id.clone(),
+                agent_name: profile.agent_name.clone(),
+                memory_id: profile.memory_id.clone(),
+                counts_delta: AgentContextProfileCounts::new(1, 0, 0),
+                last_seen_at: Some("2026-09-02T01:02:03Z".to_owned()),
+                weight_cached: 0.05,
+            },
+        )?;
+        ensure_equal(
+            &updated.counts,
+            &AgentContextProfileCounts::new(18, 3, 2),
+            "ordinary learning continues once",
+        )?;
+        for weight in [f64::NAN, f64::INFINITY, 0.051, -0.051] {
+            let invalid = super::StoredAgentContextProfile {
+                agent_name: "InvalidAgent".to_owned(),
+                weight_cached: weight,
+                ..profile.clone()
+            };
+            ensure(
+                connection
+                    .insert_agent_context_profile_for_recovery(&invalid)
+                    .is_err(),
+                "invalid recovery weights refused",
+            )?;
+        }
+        ensure_equal(
+            &connection
+                .list_agent_context_profiles_for_recovery(&profile.workspace_id)?
+                .len(),
+            &1,
+            "no invalid rows stored",
+        )?;
         connection.close()?;
         Ok(())
     }
