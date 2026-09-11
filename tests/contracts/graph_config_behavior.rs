@@ -72,11 +72,15 @@ fn assert_float_eq(actual: f64, expected: f64, context: &str) -> TestResult {
 }
 
 fn assert_graph_config_snapshot(name: &str, value: Value) {
+    // The arbitrary-precision serde_json feature serializes Number through a
+    // private marker when another Serde serializer receives a Value. Snapshot
+    // canonical JSON text so numbers retain their public JSON representation.
+    let value = serde_json::to_string_pretty(&value).expect("graph snapshot must be valid JSON");
     let mut settings = insta::Settings::clone_current();
     settings.set_snapshot_path("../snapshots");
     settings.set_prepend_module_to_snapshot(false);
     settings.bind(|| {
-        insta::assert_json_snapshot!(name, value);
+        insta::assert_snapshot!(name, value);
     });
 }
 
