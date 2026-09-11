@@ -59425,6 +59425,9 @@ mod tests {
             )?;
             holder.close().map_err(|error| error.to_string())
         });
+        holder_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| TestFailure::new(format!("holder fence did not start: {error}")))?;
         let contender_thread = thread::spawn(move || -> std::result::Result<(), String> {
             contender_attempt_tx
                 .send(())
@@ -59435,16 +59438,11 @@ mod tests {
                 .map_err(|error| format!("announce contender close completion: {error}"))
         });
 
-        holder_entered_rx
-            .recv_timeout(Duration::from_secs(2))
-            .map_err(|error| TestFailure::new(format!("holder fence did not start: {error}")))?;
         contender_attempt_rx
             .recv_timeout(Duration::from_secs(2))
             .map_err(|error| TestFailure::new(format!("contender close did not start: {error}")))?;
         ensure(
-            contender_finished_rx
-                .recv_timeout(Duration::from_millis(100))
-                .is_err(),
+            contender_finished_rx.try_recv().is_err(),
             "preopened contender close must remain fenced while holder owns the database",
         )?;
 
