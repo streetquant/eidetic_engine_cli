@@ -24,6 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use chrono::{DateTime, Utc};
 use fnx_classes::Graph;
 use fnx_runtime::CompatibilityMode;
 
@@ -613,11 +614,11 @@ fn text_body_claim_fields(
     Some((entity, claim, scope, typed_polarity, typed_present))
 }
 
-fn parse_body_claim(memory: &StoredMemory) -> Option<BodyClaim> {
+fn parse_body_claim(memory: &StoredMemory, reference_time: DateTime<Utc>) -> Option<BodyClaim> {
     if memory.id.trim().is_empty()
         || memory.workspace_id.trim().is_empty()
         || memory.tombstoned_at.is_some()
-        || !body_memory_is_current(memory)
+        || !body_memory_is_current(memory, reference_time)
     {
         return None;
     }
@@ -654,8 +655,7 @@ fn parse_body_claim(memory: &StoredMemory) -> Option<BodyClaim> {
     })
 }
 
-fn body_memory_is_current(memory: &StoredMemory) -> bool {
-    let now = chrono::Utc::now();
+fn body_memory_is_current(memory: &StoredMemory, reference_time: DateTime<Utc>) -> bool {
     let valid_from = match memory.valid_from.as_deref() {
         Some(raw) => chrono::DateTime::parse_from_rfc3339(raw)
             .ok()
@@ -673,7 +673,8 @@ fn body_memory_is_current(memory: &StoredMemory) -> bool {
     {
         return false;
     }
-    !valid_from.is_some_and(|start| start > now) && !valid_to.is_some_and(|end| end <= now)
+    !valid_from.is_some_and(|start| start > reference_time)
+        && !valid_to.is_some_and(|end| end <= reference_time)
 }
 
 /// Discover only exact same-workspace/entity/claim pairs with opposite explicit
@@ -681,9 +682,21 @@ fn body_memory_is_current(memory: &StoredMemory) -> bool {
 /// and no body/evidence row is merged, deleted, or rewritten.
 #[must_use]
 pub fn detect_body_contradiction_pairs(memories: &[StoredMemory]) -> Vec<ConflictEdge> {
+    detect_body_contradiction_pairs_at(memories, Utc::now())
+}
+
+/// Discover exact body contradictions at a caller-supplied reference time.
+///
+/// The reference time is threaded through validity checks so historical
+/// context/conflict replay cannot silently use the wall clock.
+#[must_use]
+pub fn detect_body_contradiction_pairs_at(
+    memories: &[StoredMemory],
+    reference_time: DateTime<Utc>,
+) -> Vec<ConflictEdge> {
     let mut grouped: BTreeMap<BodyClaimKey, (BTreeSet<String>, BTreeSet<String>)> = BTreeMap::new();
     for memory in memories {
-        let Some(claim) = parse_body_claim(memory) else {
+        let Some(claim) = parse_body_claim(memory, reference_time) else {
             continue;
         };
         let entry = grouped
@@ -909,6 +922,19 @@ const DEFERRED_SIGNAL_KINDS: [ExplicitConflictSignal; 4] = [
 /// body edges; already-read direct links remain usable.
 #[must_use]
 pub fn gather_explicit_conflict_edges(connection: &DbConnection) -> GatheredConflictEdges {
+    gather_explicit_conflict_edges_at(connection, Utc::now())
+}
+
+/// Gather explicit conflict edges at a caller-supplied reference time.
+///
+/// Body-derived evidence is evaluated against this same time, while direct
+/// link evidence remains unchanged. This keeps historical context replay
+/// consistent with the caller's temporal filters.
+#[must_use]
+pub fn gather_explicit_conflict_edges_at(
+    connection: &DbConnection,
+    reference_time: DateTime<Utc>,
+) -> GatheredConflictEdges {
     let gathered = GATHERED_SIGNAL_KINDS.to_vec();
     let deferred = DEFERRED_SIGNAL_KINDS.to_vec();
 
@@ -967,7 +993,7 @@ pub fn gather_explicit_conflict_edges(connection: &DbConnection) -> GatheredConf
     match connection.list_workspaces() {
         Ok(workspaces) => {
             for workspace in workspaces {
-                match connection.list_memories(&workspace.id, None, false) {
+                match connection.list_memories_for_retrieval(&workspace.id, None, false) {
                     Ok(memories) => current_memories.extend(memories),
                     Err(error) => {
                         body_inference_read_error = true;
@@ -990,7 +1016,7 @@ pub fn gather_explicit_conflict_edges(connection: &DbConnection) -> GatheredConf
     let automatic_body_edges = if body_inference_read_error {
         Vec::new()
     } else {
-        detect_body_contradiction_pairs(&current_memories)
+        detect_body_contradiction_pairs_at(&current_memories, reference_time)
     };
 
     GatheredConflictEdges {
@@ -1017,7 +1043,17 @@ pub fn detect_explicit_contradictions_from_connection(
     connection: &DbConnection,
     config: ContradictionDetectionConfig,
 ) -> (ContradictionDetectionReport, GatheredConflictEdges) {
-    let gathered = gather_explicit_conflict_edges(connection);
+    detect_explicit_contradictions_from_connection_at(connection, config, Utc::now())
+}
+
+/// Gather and detect contradictions at a caller-supplied reference time.
+#[must_use]
+pub fn detect_explicit_contradictions_from_connection_at(
+    connection: &DbConnection,
+    config: ContradictionDetectionConfig,
+    reference_time: DateTime<Utc>,
+) -> (ContradictionDetectionReport, GatheredConflictEdges) {
+    let gathered = gather_explicit_conflict_edges_at(connection, reference_time);
     let all_edges = gathered.all_edges();
     let report = detect_explicit_contradictions(&all_edges, config);
     (report, gathered)
@@ -1033,6 +1069,8 @@ pub fn detect_explicit_contradictions_from_connection(
 
 /// Schema id for the read-only conflict surface JSON.
 pub const CONFLICT_SURFACE_SCHEMA_V1: &str = "ee.conflict.v1";
+/// Schema id for the additive conflict surface carrying all corroborating signal kinds.
+pub const CONFLICT_SURFACE_SCHEMA_V2: &str = "ee.conflict.v2";
 
 /// Trust ranking for a memory's `trust_class` (higher = more trusted). Used only
 /// to pick the "higher-trust side" of a conflicting pair. Ranks the canonical
@@ -1085,12 +1123,54 @@ pub struct ConflictPairView {
     /// The heaviest explicit signal implicating this pair (snake_case).
     pub signal: String,
     pub load_bearing_milli: u64,
-    /// `"a"`, `"b"`, or `"tie"` — which member is the higher-trust/fresher side.
+    /// "a", "b", or "tie" — which member is the higher-trust/fresher side.
     pub preferred_side: String,
-    /// Why that side was preferred: `higher_trust`, `fresher`, or `tie_no_signal`.
+    /// Why that side was preferred: higher_trust, fresher, or tie_no_signal.
     pub preferred_reason: String,
     pub memory_a: ConflictMemberView,
     pub memory_b: ConflictMemberView,
+}
+
+/// Additive v2 projection of a conflicting pair. It preserves every distinct
+/// corroborating signal while leaving the v1 struct-literal and wire shape
+/// unchanged.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictPairViewV2 {
+    pub conflict_id: String,
+    /// The heaviest explicit signal implicating this pair (snake_case).
+    pub signal: String,
+    /// Every distinct signal kind backing the canonical pair, in precedence order.
+    pub signals: Vec<String>,
+    pub load_bearing_milli: u64,
+    /// "a", "b", or "tie" — which member is the higher-trust/fresher side.
+    pub preferred_side: String,
+    /// Why that side was preferred: higher_trust, fresher, or tie_no_signal.
+    pub preferred_reason: String,
+    pub memory_a: ConflictMemberView,
+    pub memory_b: ConflictMemberView,
+}
+
+impl ConflictPairViewV2 {
+    /// All corroborating signal kinds, ordered strongest-first.
+    #[must_use]
+    pub fn signal_kinds(&self) -> &[String] {
+        &self.signals
+    }
+
+    /// Project this additive v2 pair back to the stable v1 shape.
+    #[must_use]
+    pub fn as_v1(&self) -> ConflictPairView {
+        ConflictPairView {
+            conflict_id: self.conflict_id.clone(),
+            signal: self.signal.clone(),
+            load_bearing_milli: self.load_bearing_milli,
+            preferred_side: self.preferred_side.clone(),
+            preferred_reason: self.preferred_reason.clone(),
+            memory_a: self.memory_a.clone(),
+            memory_b: self.memory_b.clone(),
+        }
+    }
 }
 
 /// A detected contradiction cluster projected for the surface.
@@ -1127,6 +1207,102 @@ pub struct ConflictSurface {
     pub degraded: Vec<String>,
 }
 
+/// Additive v2 conflict surface. The v1 surface remains the default for
+/// existing callers and keeps its original pair shape.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictSurfaceV2 {
+    pub schema: &'static str,
+    pub pairs: Vec<ConflictPairViewV2>,
+    pub clusters: Vec<ConflictClusterView>,
+    pub explicit_edge_count: usize,
+    pub gathered_signals: Vec<String>,
+    pub deferred_signals: Vec<String>,
+    pub fuzzy_near_conflict_skipped: bool,
+    pub degraded: Vec<String>,
+}
+
+impl ConflictSurfaceV2 {
+    /// Pairs/clusters that implicate a memory id.
+    #[must_use]
+    pub fn focused_on(&self, memory_id: &str) -> ConflictSurfaceV2 {
+        ConflictSurfaceV2 {
+            schema: self.schema,
+            pairs: self
+                .pairs
+                .iter()
+                .filter(|pair| pair.memory_a.id == memory_id || pair.memory_b.id == memory_id)
+                .cloned()
+                .collect(),
+            clusters: self
+                .clusters
+                .iter()
+                .filter(|cluster| cluster.member_ids.iter().any(|id| id == memory_id))
+                .cloned()
+                .collect(),
+            explicit_edge_count: self.explicit_edge_count,
+            gathered_signals: self.gathered_signals.clone(),
+            deferred_signals: self.deferred_signals.clone(),
+            fuzzy_near_conflict_skipped: self.fuzzy_near_conflict_skipped,
+            degraded: self.degraded.clone(),
+        }
+    }
+
+    /// Project the additive v2 surface back to the stable v1 shape.
+    #[must_use]
+    pub fn as_v1(&self) -> ConflictSurface {
+        ConflictSurface {
+            schema: CONFLICT_SURFACE_SCHEMA_V1,
+            pairs: self.pairs.iter().map(ConflictPairViewV2::as_v1).collect(),
+            clusters: self.clusters.clone(),
+            explicit_edge_count: self.explicit_edge_count,
+            gathered_signals: self.gathered_signals.clone(),
+            deferred_signals: self.deferred_signals.clone(),
+            fuzzy_near_conflict_skipped: self.fuzzy_near_conflict_skipped,
+            degraded: self.degraded.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ConflictSurfaceComponents {
+    pairs: Vec<ConflictPairViewV2>,
+    clusters: Vec<ConflictClusterView>,
+    explicit_edge_count: usize,
+    gathered_signals: Vec<String>,
+    deferred_signals: Vec<String>,
+    fuzzy_near_conflict_skipped: bool,
+    degraded: Vec<String>,
+}
+
+impl ConflictSurfaceComponents {
+    fn into_v1(self) -> ConflictSurface {
+        ConflictSurface {
+            schema: CONFLICT_SURFACE_SCHEMA_V1,
+            pairs: self.pairs.iter().map(ConflictPairViewV2::as_v1).collect(),
+            clusters: self.clusters,
+            explicit_edge_count: self.explicit_edge_count,
+            gathered_signals: self.gathered_signals,
+            deferred_signals: self.deferred_signals,
+            fuzzy_near_conflict_skipped: self.fuzzy_near_conflict_skipped,
+            degraded: self.degraded,
+        }
+    }
+
+    fn into_v2(self) -> ConflictSurfaceV2 {
+        ConflictSurfaceV2 {
+            schema: CONFLICT_SURFACE_SCHEMA_V2,
+            pairs: self.pairs,
+            clusters: self.clusters,
+            explicit_edge_count: self.explicit_edge_count,
+            gathered_signals: self.gathered_signals,
+            deferred_signals: self.deferred_signals,
+            fuzzy_near_conflict_skipped: self.fuzzy_near_conflict_skipped,
+            degraded: self.degraded,
+        }
+    }
+}
+
 impl ConflictSurface {
     /// Pairs/clusters that implicate `memory_id` (for `ee conflict explain`).
     #[must_use]
@@ -1145,7 +1321,7 @@ impl ConflictSurface {
             .collect();
         ConflictSurface {
             schema: self.schema,
-            explicit_edge_count: pairs.len(),
+            explicit_edge_count: self.explicit_edge_count,
             pairs,
             clusters,
             gathered_signals: self.gathered_signals.clone(),
@@ -1174,8 +1350,7 @@ fn member_view(memory: &crate::db::StoredMemory, preferred: bool) -> ConflictMem
     }
 }
 
-fn memory_currentness_rank(memory: &StoredMemory) -> i64 {
-    let now = chrono::Utc::now();
+fn memory_currentness_rank(memory: &StoredMemory, reference_time: DateTime<Utc>) -> i64 {
     let valid_from = match memory.valid_from.as_deref() {
         Some(value) => match chrono::DateTime::parse_from_rfc3339(value) {
             Ok(parsed) => Some(parsed.with_timezone(&chrono::Utc)),
@@ -1190,21 +1365,26 @@ fn memory_currentness_rank(memory: &StoredMemory) -> i64 {
         },
         None => None,
     };
-    if valid_from.is_some_and(|start| start > now) || valid_to.is_some_and(|end| end <= now) {
+    if valid_from.is_some_and(|start| start > reference_time)
+        || valid_to.is_some_and(|end| end <= reference_time)
+    {
         0
     } else {
         1
     }
 }
 
-fn memory_precedence(memory: &StoredMemory) -> ContradictionPrecedence {
+fn memory_precedence(
+    memory: &StoredMemory,
+    reference_time: DateTime<Utc>,
+) -> ContradictionPrecedence {
     let (recency_epoch, recency_known) = recency_rank(Some(&memory.updated_at));
     ContradictionPrecedence {
         memory_id: memory.id.clone(),
         trust_rank: i64::from(trust_class_rank(&memory.trust_class)) * 1_000,
         authority_rank: authority_subclass_rank(memory.trust_subclass.as_deref()),
         verification_rank: verification_status_rank(&memory.provenance_verification_status),
-        validity_rank: memory_currentness_rank(memory),
+        validity_rank: memory_currentness_rank(memory, reference_time),
         confidence_milli: confidence_rank_milli(memory.confidence),
         recency_epoch,
         recency_known,
@@ -1219,8 +1399,18 @@ pub fn preferred_side(
     a: &StoredMemory,
     b: &StoredMemory,
 ) -> (&'static str, &'static str, bool, bool) {
-    let left = memory_precedence(a);
-    let right = memory_precedence(b);
+    preferred_side_at(a, b, Utc::now())
+}
+
+/// Decide the preferred side at a caller-supplied reference time.
+#[must_use]
+pub fn preferred_side_at(
+    a: &StoredMemory,
+    b: &StoredMemory,
+    reference_time: DateTime<Utc>,
+) -> (&'static str, &'static str, bool, bool) {
+    let left = memory_precedence(a, reference_time);
+    let right = memory_precedence(b, reference_time);
     let decision = decide_contradiction_survivor_with_precedence(&left, &right);
     if decision.basis == crate::core::contradiction_guard::SuppressionBasis::DeterministicTieBreak
         && left.trust_rank == right.trust_rank
@@ -1266,31 +1456,49 @@ pub fn assemble_conflict_surface(
     connection: &DbConnection,
     config: ContradictionDetectionConfig,
 ) -> ConflictSurface {
-    let (report, gathered) = detect_explicit_contradictions_from_connection(connection, config);
+    assemble_conflict_surface_at(connection, config, Utc::now())
+}
+
+/// Assemble the read-only conflict surface at a caller-supplied reference
+/// time, applying it to inferred body validity and preferred-side ranking.
+#[must_use]
+fn assemble_conflict_surface_components(
+    connection: &DbConnection,
+    config: ContradictionDetectionConfig,
+    reference_time: DateTime<Utc>,
+) -> ConflictSurfaceComponents {
+    let (report, gathered) =
+        detect_explicit_contradictions_from_connection_at(connection, config, reference_time);
 
     let mut degraded: Vec<String> = Vec::new();
     if let Some(error) = &gathered.read_error {
         degraded.push(error.clone());
     }
 
-    // Deduplicate to canonical pairs, keeping the heaviest signal per pair.
-    let mut pair_signal: BTreeMap<(String, String), ExplicitConflictSignal> = BTreeMap::new();
+    // Deduplicate to canonical pairs while retaining every corroborating
+    // signal kind. The ordered list supplies the complete evidence view and
+    // the deterministic primary signal for existing consumers.
+    let mut pair_signals: BTreeMap<(String, String), BTreeSet<ExplicitConflictSignal>> =
+        BTreeMap::new();
     let all_edges = gathered.all_edges();
     for edge in &all_edges {
         if let Some(pair) = canonical_pair(edge) {
-            pair_signal
-                .entry(pair)
-                .and_modify(|s| {
-                    if edge.signal.weight_milli() > s.weight_milli() {
-                        *s = edge.signal;
-                    }
-                })
-                .or_insert(edge.signal);
+            pair_signals.entry(pair).or_default().insert(edge.signal);
         }
     }
 
-    let mut pairs: Vec<ConflictPairView> = Vec::new();
-    for ((low, high), signal) in &pair_signal {
+    let mut pairs: Vec<ConflictPairViewV2> = Vec::new();
+    for ((low, high), signal_set) in &pair_signals {
+        let mut ordered_signals = signal_set.iter().copied().collect::<Vec<_>>();
+        ordered_signals.sort_by(|left, right| {
+            right
+                .weight_milli()
+                .cmp(&left.weight_milli())
+                .then_with(|| left.cmp(right))
+        });
+        let Some(signal) = ordered_signals.first().copied() else {
+            continue;
+        };
         // A reviewed both-valid resolution settled this tension: suppress.
         if gathered
             .both_valid_resolved
@@ -1311,10 +1519,14 @@ pub fn assemble_conflict_surface(
         if a.tombstoned_at.is_some() || b.tombstoned_at.is_some() {
             continue;
         }
-        let (preferred, reason, a_pref, b_pref) = preferred_side(&a, &b);
-        pairs.push(ConflictPairView {
+        let (preferred, reason, a_pref, b_pref) = preferred_side_at(&a, &b, reference_time);
+        pairs.push(ConflictPairViewV2 {
             conflict_id: conflict_pair_id(low, high),
             signal: signal.as_str().to_owned(),
+            signals: ordered_signals
+                .iter()
+                .map(|signal| signal.as_str().to_owned())
+                .collect(),
             load_bearing_milli: signal.weight_milli(),
             preferred_side: preferred.to_owned(),
             preferred_reason: reason.to_owned(),
@@ -1347,8 +1559,7 @@ pub fn assemble_conflict_surface(
         })
         .collect();
 
-    ConflictSurface {
-        schema: CONFLICT_SURFACE_SCHEMA_V1,
+    ConflictSurfaceComponents {
         pairs,
         clusters,
         explicit_edge_count: report.explicit_edge_count,
@@ -1365,6 +1576,37 @@ pub fn assemble_conflict_surface(
         fuzzy_near_conflict_skipped: report.fuzzy_near_conflict_skipped,
         degraded,
     }
+}
+
+/// Assemble the stable v1 read-only conflict surface.
+#[must_use]
+pub fn assemble_conflict_surface_at(
+    connection: &DbConnection,
+    config: ContradictionDetectionConfig,
+    reference_time: DateTime<Utc>,
+) -> ConflictSurface {
+    assemble_conflict_surface_components(connection, config, reference_time).into_v1()
+}
+
+/// Assemble the additive v2 read-only conflict surface carrying every
+/// corroborating signal kind.
+#[must_use]
+pub fn assemble_conflict_surface_v2(
+    connection: &DbConnection,
+    config: ContradictionDetectionConfig,
+) -> ConflictSurfaceV2 {
+    assemble_conflict_surface_v2_at(connection, config, Utc::now())
+}
+
+/// Assemble the additive v2 conflict surface at a caller-supplied reference
+/// time.
+#[must_use]
+pub fn assemble_conflict_surface_v2_at(
+    connection: &DbConnection,
+    config: ContradictionDetectionConfig,
+    reference_time: DateTime<Utc>,
+) -> ConflictSurfaceV2 {
+    assemble_conflict_surface_components(connection, config, reference_time).into_v2()
 }
 
 // ---------------------------------------------------------------------------
@@ -1695,11 +1937,13 @@ pub fn plan_conflict_resolution(
 #[cfg(test)]
 mod tests {
     use super::{
-        CONFLICT_SURFACE_SCHEMA_V1, ConflictEdge, ContradictionDetectionConfig,
-        ExplicitConflictSignal, assemble_conflict_surface, canonical_pair,
-        detect_body_contradiction_pairs, detect_explicit_contradictions,
-        detect_explicit_contradictions_from_connection, gather_explicit_conflict_edges,
-        preferred_side, trust_class_rank,
+        CONFLICT_SURFACE_SCHEMA_V1, CONFLICT_SURFACE_SCHEMA_V2, ConflictEdge,
+        ContradictionDetectionConfig, ExplicitConflictSignal, assemble_conflict_surface,
+        assemble_conflict_surface_at, assemble_conflict_surface_v2, canonical_pair,
+        detect_body_contradiction_pairs, detect_body_contradiction_pairs_at,
+        detect_explicit_contradictions, detect_explicit_contradictions_from_connection,
+        gather_explicit_conflict_edges, gather_explicit_conflict_edges_at, preferred_side,
+        trust_class_rank,
     };
     use crate::db::{
         CreateMemoryInput, CreateMemoryLinkInput, CreateWorkspaceInput, DbConnection,
@@ -1713,6 +1957,7 @@ mod tests {
     const MEM_A: &str = "mem_00000000000000000000000001";
     const MEM_B: &str = "mem_00000000000000000000000002";
     const MEM_C: &str = "mem_00000000000000000000000003";
+    const MEM_D: &str = "mem_00000000000000000000000004";
     const LINK_1: &str = "link_00000000000000000000000001";
     const LINK_2: &str = "link_00000000000000000000000002";
     const LINK_3: &str = "link_00000000000000000000000003";
@@ -2141,6 +2386,175 @@ mod tests {
     }
 
     #[test]
+    fn direct_edges_protect_pack_when_body_inference_read_fails() {
+        use std::str::FromStr;
+
+        use crate::models::{MemoryId, ProvenanceUri, UnitScore};
+        use crate::pack::{
+            ContextPackProfile, PackCandidate, PackCandidateInput, PackProvenance, PackSection,
+            TokenBudget, assemble_draft_with_profile,
+        };
+
+        let connection = open_seeded_db();
+        seed_memory(&connection, MEM_A);
+        seed_memory(&connection, MEM_B);
+        seed_link(
+            &connection,
+            LINK_1,
+            MEM_A,
+            MEM_B,
+            MemoryLinkRelation::Contradicts,
+        );
+
+        let id_a = MemoryId::from_str(MEM_A).expect("valid A memory id");
+        let id_b = MemoryId::from_str(MEM_B).expect("valid B memory id");
+        let candidate = |memory_id: MemoryId, content: &str| {
+            PackCandidate::new(PackCandidateInput {
+                memory_id,
+                section: PackSection::Evidence,
+                content: content.to_owned(),
+                estimated_tokens: 4,
+                relevance: UnitScore::parse(0.9).expect("relevance"),
+                utility: UnitScore::parse(0.8).expect("utility"),
+                provenance: vec![
+                    PackProvenance::new(
+                        ProvenanceUri::EeMemory(memory_id),
+                        "direct conflict failure fixture",
+                    )
+                    .expect("provenance"),
+                ],
+                why: "direct conflict failure fixture".to_owned(),
+            })
+            .expect("candidate")
+        };
+        let budget = TokenBudget::new(100).expect("budget");
+        let mut draft = assemble_draft_with_profile(
+            ContextPackProfile::Balanced,
+            "direct conflict failure",
+            budget,
+            vec![
+                candidate(id_a, "Entity: deployment; Claim: uses SQLite."),
+                candidate(id_b, "Entity: deployment; Claim: does not use SQLite."),
+            ],
+        )
+        .expect("draft");
+
+        // Break only the semantic body source after the durable link has been
+        // read-capable. The gather must retain the direct contradiction edge.
+        connection
+            .execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for failure fixture");
+        connection
+            .execute_raw("ALTER TABLE memories RENAME TO memories_unavailable")
+            .expect("make body source unavailable");
+
+        let gathered = gather_explicit_conflict_edges_at(
+            &connection,
+            chrono::DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+                .expect("reference time")
+                .with_timezone(&chrono::Utc),
+        );
+        assert!(
+            gathered.read_error.is_some(),
+            "semantic body-read failure must be visible"
+        );
+        assert_eq!(
+            gathered.edges,
+            vec![ConflictEdge::new(
+                MEM_A,
+                MEM_B,
+                ExplicitConflictSignal::ContradictionLink,
+            )],
+            "the durable direct edge survives body-read failure"
+        );
+        assert!(
+            gathered.automatic_body_edges.is_empty(),
+            "inferred edges fail closed when the body source is unreadable"
+        );
+
+        let detected = gathered
+            .all_edges()
+            .into_iter()
+            .map(|edge| (edge.memory_a, edge.memory_b))
+            .collect::<Vec<_>>();
+        let unresolved =
+            crate::core::contradiction_guard::unresolved_contradiction_pairs(&detected, &[]);
+        assert_eq!(
+            draft.apply_contradiction_guard(&unresolved, false),
+            1,
+            "the retained direct edge still protects the pack"
+        );
+        assert_eq!(draft.items.len(), 1);
+        assert_eq!(draft.omitted.len(), 1);
+    }
+
+    #[test]
+    fn body_contradictions_honor_caller_reference_time() {
+        let connection = open_seeded_db();
+        seed_claim_memory(
+            &connection,
+            MEM_A,
+            "Entity: deployment; Claim: uses SQLite.",
+        );
+        seed_claim_memory(
+            &connection,
+            MEM_B,
+            "Entity: deployment; Claim: does not use SQLite.",
+        );
+        connection
+            .execute_raw(
+                "UPDATE memories SET valid_from = '2024-01-01T00:00:00Z',                  valid_to = '2024-12-31T00:00:00Z'                  WHERE id IN ('mem_00000000000000000000000001',                               'mem_00000000000000000000000002')",
+            )
+            .expect("set historical validity windows");
+        let memories = [
+            connection
+                .get_memory(MEM_A)
+                .expect("read historical A")
+                .expect("historical A exists"),
+            connection
+                .get_memory(MEM_B)
+                .expect("read historical B")
+                .expect("historical B exists"),
+        ];
+        let historical = chrono::DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+            .expect("historical reference time")
+            .with_timezone(&chrono::Utc);
+        let current = chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+            .expect("current reference time")
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(
+            detect_body_contradiction_pairs_at(&memories, historical).len(),
+            1,
+            "the caller's historical reference time keeps both claims current"
+        );
+        assert!(
+            detect_body_contradiction_pairs_at(&memories, current).is_empty(),
+            "the same claims are expired at the later reference time"
+        );
+
+        let historical_surface = assemble_conflict_surface_at(
+            &connection,
+            ContradictionDetectionConfig::default(),
+            historical,
+        );
+        assert_eq!(
+            historical_surface.pairs.len(),
+            1,
+            "historical conflict surface uses the supplied reference time"
+        );
+        let current_surface = assemble_conflict_surface_at(
+            &connection,
+            ContradictionDetectionConfig::default(),
+            current,
+        );
+        assert!(
+            current_surface.pairs.is_empty(),
+            "later conflict surface excludes the expired inferred pair"
+        );
+    }
+
+    #[test]
     fn body_contradictions_require_explicit_identity_and_opposition() {
         let connection = open_seeded_db();
         seed_claim_memory(&connection, MEM_A, "deployment uses SQLite");
@@ -2246,6 +2660,51 @@ mod tests {
         assert_eq!(pair.signal, "contradiction_link");
         assert!(pair.load_bearing_milli > 0);
         assert!(surface.degraded.is_empty());
+    }
+
+    #[test]
+    fn surface_preserves_all_corroborating_signals_with_deterministic_primary() {
+        let connection = open_seeded_db();
+        seed_memory_trust(&connection, MEM_A, "human_explicit");
+        seed_memory_trust(&connection, MEM_B, "agent_assertion");
+        seed_link(
+            &connection,
+            LINK_1,
+            MEM_A,
+            MEM_B,
+            MemoryLinkRelation::Contradicts,
+        );
+        seed_link(
+            &connection,
+            LINK_2,
+            MEM_B,
+            MEM_A,
+            MemoryLinkRelation::Supersedes,
+        );
+
+        let v1 = assemble_conflict_surface(&connection, ContradictionDetectionConfig::default());
+        let v1_pair = v1.pairs.first().expect("multi-signal pair");
+        assert_eq!(v1_pair.signal, "contradiction_link");
+        let v1_json = serde_json::to_value(&v1).expect("serialize v1 surface");
+        assert!(
+            v1_json["pairs"][0].get("signals").is_none(),
+            "v1 must retain its original pair wire shape"
+        );
+
+        let v2 = assemble_conflict_surface_v2(&connection, ContradictionDetectionConfig::default());
+        assert_eq!(v2.schema, CONFLICT_SURFACE_SCHEMA_V2);
+        let pair = v2.pairs.first().expect("multi-signal v2 pair");
+        assert_eq!(
+            pair.signal_kinds(),
+            &["contradiction_link".to_owned(), "supersession".to_owned()]
+        );
+        assert_eq!(pair.as_v1(), v1_pair.clone());
+        let v2_json = serde_json::to_value(&v2).expect("serialize v2 surface");
+        assert_eq!(
+            v2_json["pairs"][0]["signals"],
+            serde_json::json!(["contradiction_link", "supersession"])
+        );
+        assert_eq!(v1.schema, CONFLICT_SURFACE_SCHEMA_V1);
     }
 
     #[test]
@@ -2398,10 +2857,10 @@ mod tests {
     #[test]
     fn surface_focused_on_filters_to_the_named_memory() {
         let connection = open_seeded_db();
-        for memory_id in [MEM_A, MEM_B, MEM_C] {
+        for memory_id in [MEM_A, MEM_B, MEM_C, MEM_D] {
             seed_memory(&connection, memory_id);
         }
-        // MEM_A<->MEM_B conflict; MEM_C is unrelated.
+        // MEM_A<->MEM_B and MEM_B<->MEM_C are conflicts; MEM_D is unrelated.
         seed_link(
             &connection,
             LINK_1,
@@ -2409,16 +2868,29 @@ mod tests {
             MEM_B,
             MemoryLinkRelation::Contradicts,
         );
+        seed_link(
+            &connection,
+            LINK_2,
+            MEM_B,
+            MEM_C,
+            MemoryLinkRelation::Contradicts,
+        );
 
         let surface =
             assemble_conflict_surface(&connection, ContradictionDetectionConfig::default());
-        let focused = surface.focused_on(MEM_C);
+        assert_eq!(surface.explicit_edge_count, 2);
+        let focused = surface.focused_on(MEM_D);
         assert!(
             focused.pairs.is_empty(),
-            "MEM_C participates in no conflict pair"
+            "MEM_D participates in no conflict pair"
+        );
+        assert_eq!(
+            focused.explicit_edge_count, 2,
+            "focused views retain the full detector edge count"
         );
         let focused_a = surface.focused_on(MEM_A);
         assert_eq!(focused_a.pairs.len(), 1, "MEM_A is in exactly one pair");
+        assert_eq!(focused_a.explicit_edge_count, 2);
     }
 
     #[test]
