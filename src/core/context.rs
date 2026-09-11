@@ -3368,7 +3368,13 @@ async fn run_context_pack_with_performance_inner(
         &determinism,
     )
     .map_err(|error| ContextPackError::Pack(error.to_string()))?;
-    apply_context_pack_contradiction_guard(read_connection, &mut draft);
+    let contradiction_reference_time =
+        context_validity_reference_time(options, &effective_filters).unwrap_or_else(Utc::now);
+    apply_context_pack_contradiction_guard(
+        read_connection,
+        &mut draft,
+        contradiction_reference_time,
+    );
     if concurrent_limit_retry_after_ms.is_none() {
         append_direct_evidence_pack_items(
             read_connection,
@@ -12772,11 +12778,18 @@ fn push_degradation(
     }
 }
 
-fn apply_context_pack_contradiction_guard(connection: &DbConnection, draft: &mut PackDraft) {
+fn apply_context_pack_contradiction_guard(
+    connection: &DbConnection,
+    draft: &mut PackDraft,
+    reference_time: DateTime<Utc>,
+) {
     if draft.items.len() < 2 {
         return;
     }
-    let gathered = crate::core::contradiction_detect::gather_explicit_conflict_edges(connection);
+    let gathered = crate::core::contradiction_detect::gather_explicit_conflict_edges_at(
+        connection,
+        reference_time,
+    );
     if let Some(read_error) = gathered.read_error.as_deref() {
         tracing::warn!(
             target: "ee::pack::contradiction_guard",

@@ -209,6 +209,10 @@ mod tests {
             ContradictionResolutionKind::Supersede
         );
         assert_eq!(
+            ContradictionResolutionKind::from_signal(ExplicitConflictSignal::BodyContradiction),
+            ContradictionResolutionKind::Supersede
+        );
+        assert_eq!(
             ContradictionResolutionKind::from_signal(ExplicitConflictSignal::DuplicateDivergent),
             ContradictionResolutionKind::Merge
         );
@@ -299,6 +303,7 @@ mod tests {
             ExplicitConflictSignal::Supersession,
             ExplicitConflictSignal::TrustOutcomeSplit,
             ExplicitConflictSignal::RepeatedCoSelection,
+            ExplicitConflictSignal::BodyContradiction,
             ExplicitConflictSignal::DuplicateDivergent,
             ExplicitConflictSignal::ValidityWindowOverlap,
         ] {
