@@ -16,7 +16,9 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rustix::fs::{FlockOperation, flock};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sqlmodel_core::{IsolationLevel, Row, Value};
+#[cfg(test)]
+use sqlmodel_core::IsolationLevel;
+use sqlmodel_core::{Row, Value};
 use sqlmodel_frankensqlite::FrankenConnection;
 
 use crate::config::{MeshLane, MeshLaneDecision};
@@ -449,6 +451,18 @@ fn write_owner_key(location: &DatabaseLocation) -> WriteOwnerKey {
 }
 
 fn normalized_write_owner_file_key(path: &Path) -> PathBuf {
+    // Anchor relative spellings before lexical cleanup so db.sqlite and
+    // $PWD/db.sqlite share both the process gate and the cross-process lock.
+    // Keep this lexical (rather than canonicalizing) because a new database
+    // file need not exist yet; symlink components are rejected separately by
+    // the database and lock-path validators.
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current_dir| current_dir.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -537,9 +551,9 @@ fn lock_file_write_owner_gate(location: &DatabaseLocation) -> Result<FileWriteOw
     let process_guard = file_write_owner_gate(&key)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let lock_file = match location {
-        DatabaseLocation::Memory => None,
-        DatabaseLocation::File(path) => Some(lock_database_write_file(path)?),
+    let lock_file = match &key {
+        WriteOwnerKey::Memory => None,
+        WriteOwnerKey::File(path) => Some(lock_database_write_file(path)?),
     };
 
     FILE_WRITE_OWNER_DEPTHS.with(|depths| {
@@ -759,7 +773,7 @@ fn lock_database_write_file_with_wait_observer(
     max_wait: Duration,
     mut on_contention: impl FnMut(Option<u64>),
 ) -> Result<File> {
-    let lock_path = database_path.with_extension("write.lock");
+    let lock_path = normalized_write_owner_file_key(database_path).with_extension("write.lock");
     ensure_database_write_lock_path_has_no_symlink_components(&lock_path)?;
     ensure_database_write_lock_path_is_regular_or_missing(&lock_path)?;
 
@@ -862,7 +876,7 @@ fn lock_database_write_file(database_path: &Path) -> Result<File> {
 
 #[cfg(not(unix))]
 fn lock_database_write_file(database_path: &Path) -> Result<File> {
-    let lock_path = database_path.with_extension("write.lock");
+    let lock_path = normalized_write_owner_file_key(database_path).with_extension("write.lock");
     ensure_database_write_lock_path_has_no_symlink_components(&lock_path)?;
     ensure_database_write_lock_path_is_regular_or_missing(&lock_path)?;
     let lock_file =
@@ -1188,6 +1202,21 @@ impl DbConnection {
     }
 
     pub fn close(self) -> Result<()> {
+        // FrankenSQLite performs a passive WAL checkpoint while closing a
+        // read-write file connection. Keep that checkpoint inside the same
+        // per-database owner fence as BEGIN/COMMIT so a newly admitted writer
+        // cannot collide with teardown from a previously committed
+        // connection.
+        let _write_owner = if matches!(
+            (&self.location, self.mode),
+            (DatabaseLocation::File(_), DatabaseOpenMode::ReadWrite)
+        ) {
+            Some(retry_sqlite_contention(DbOperation::Close, || {
+                lock_file_write_owner_gate(&self.location)
+            })?)
+        } else {
+            None
+        };
         self.inner
             .close_sync()
             .map_err(|source| DbError::sqlmodel(DbOperation::Close, source))
@@ -1213,6 +1242,7 @@ impl DbConnection {
     /// For file-backed databases, manually managing transactions with `begin_transaction`,
     /// `commit`, and `rollback` does NOT hold the write-owner lock across the transaction.
     /// Prefer `with_transaction` or `with_write_transaction` for safe transactional writes.
+    #[cfg(test)]
     pub(crate) fn begin_transaction(&self, isolation: IsolationLevel) -> Result<()> {
         let sql = match isolation {
             IsolationLevel::ReadUncommitted | IsolationLevel::ReadCommitted => "BEGIN DEFERRED",
@@ -1292,7 +1322,11 @@ impl DbConnection {
                 .map(|()| None)
         } else {
             self.reject_read_only_write(DbOperation::BeginTransaction)
-                .and_then(|()| lock_file_write_owner_gate(&self.location))
+                .and_then(|()| {
+                    retry_sqlite_contention(DbOperation::BeginTransaction, || {
+                        lock_file_write_owner_gate(&self.location)
+                    })
+                })
                 .map(Some)
         }
         .map_err(map_error)?;
@@ -1443,65 +1477,38 @@ impl DbConnection {
                 Ok(None)
             }
             DatabaseLocation::File(_) => {
-                const MAX_ATTEMPTS: usize = 16;
-                let mut last_retryable_error = None;
-
-                for attempt in 0..MAX_ATTEMPTS {
-                    // The flock gate itself surfaces cross-process swarm
-                    // contention as a transient `InvalidPath` error
-                    // (bd-d67os.26). Retry it on the same schedule as BEGIN
-                    // contention instead of propagating it out of the loop
-                    // with `?` — otherwise every `with_transaction` write
-                    // fast-fails after the gate's ~113ms internal budget
-                    // while sibling single-shot `execute_for` writes retry
-                    // (bd-d67os.27).
-                    let write_owner = match lock_file_write_owner_gate(&self.location) {
-                        Ok(guard) => guard,
-                        Err(error) if db_error_is_transient_sqlite_contention(&error) => {
-                            last_retryable_error = Some(error);
-                            if attempt + 1 < MAX_ATTEMPTS {
-                                sleep_retry_delay_or_cancel(
-                                    DbOperation::BeginTransaction,
-                                    advisory_lock_retry_delay(attempt),
-                                )?;
-                            }
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    match self.begin_transaction(IsolationLevel::RepeatableRead) {
-                        Ok(()) => return Ok(Some(write_owner)),
-                        Err(error) if db_error_is_transient_sqlite_contention(&error) => {
-                            last_retryable_error = Some(error);
-                            drop(write_owner);
-                            if attempt + 1 < MAX_ATTEMPTS {
-                                sleep_retry_delay_or_cancel(
-                                    DbOperation::BeginTransaction,
-                                    advisory_lock_retry_delay(attempt),
-                                )?;
-                            }
-                        }
-                        Err(error) => return Err(error),
+                // Acquire the process/flock owner once and keep it while the
+                // engine drains any prior writer handoff. Releasing the owner
+                // after every busy result lets same-process contenders rotate
+                // through the gate and repeatedly collide with the same
+                // storage transition.
+                let write_owner = retry_sqlite_contention(DbOperation::BeginTransaction, || {
+                    lock_file_write_owner_gate(&self.location)
+                })?;
+                let begin = retry_sqlite_contention(DbOperation::BeginTransaction, || {
+                    guard_storage_panic(DbOperation::BeginTransaction, || {
+                        self.inner.execute_raw("BEGIN IMMEDIATE").map_err(|source| {
+                            DbError::sqlmodel(DbOperation::BeginTransaction, source)
+                        })
+                    })
+                });
+                match begin {
+                    Ok(()) => Ok(Some(write_owner)),
+                    Err(error) => {
+                        drop(write_owner);
+                        Err(error)
                     }
-                }
-
-                match last_retryable_error {
-                    Some(error) => Err(error),
-                    None => Err(DbError::MalformedRow {
-                        operation: DbOperation::BeginTransaction,
-                        message: "write owner retry loop exhausted without a retryable error"
-                            .to_string(),
-                    }),
                 }
             }
         }
     }
 
+    /// Execute raw SQL through the same per-database writer fence and
+    /// contention retry path as parameterized writes. Raw SQL remains useful
+    /// for migrations and narrowly scoped diagnostics, but must not bypass
+    /// writer ownership merely because it is unparameterized.
     pub fn execute_raw(&self, sql: &str) -> Result<()> {
-        self.reject_read_only_write(DbOperation::Execute)?;
-        self.inner
-            .execute_raw(sql)
-            .map_err(|source| DbError::sqlmodel(DbOperation::Execute, source))
+        self.execute_raw_for(DbOperation::Execute, sql)
     }
 
     /// Run SQLite's opportunistic query planner/index optimization while
@@ -1662,8 +1669,9 @@ impl DbConnection {
         let operation = DbOperation::WalCheckpoint;
         let sql = mode.pragma_sql();
         let rows = if matches!(self.location, DatabaseLocation::File(_)) {
+            let _write_owner =
+                retry_sqlite_contention(operation, || lock_file_write_owner_gate(&self.location))?;
             retry_sqlite_contention(operation, || {
-                let _write_owner = lock_file_write_owner_gate(&self.location)?;
                 self.inner
                     .query_sync(sql, &[])
                     .map_err(|source| DbError::sqlmodel(operation, source))
@@ -2069,10 +2077,9 @@ impl DbConnection {
             })
         };
         if matches!(self.location, DatabaseLocation::File(_)) {
-            return retry_sqlite_contention(operation, || {
-                let _write_owner = lock_file_write_owner_gate(&self.location)?;
-                run()
-            });
+            let _write_owner =
+                retry_sqlite_contention(operation, || lock_file_write_owner_gate(&self.location))?;
+            return retry_sqlite_contention(operation, run);
         }
 
         run()
@@ -2103,10 +2110,9 @@ impl DbConnection {
             })
         };
         if matches!(self.location, DatabaseLocation::File(_)) {
-            return retry_sqlite_contention(operation, || {
-                let _write_owner = lock_file_write_owner_gate(&self.location)?;
-                run()
-            });
+            let _write_owner =
+                retry_sqlite_contention(operation, || lock_file_write_owner_gate(&self.location))?;
+            return retry_sqlite_contention(operation, run);
         }
 
         run()
@@ -2441,8 +2447,9 @@ fn db_error_is_transient_sqlite_contention(error: &DbError) -> bool {
 /// Classify a write-owner flock-gate error message as transient contention.
 ///
 /// `lock_database_write_file` returns `DbError::InvalidPath` with a
-/// "could not acquire database write lock: ..." message when it cannot take the
-/// exclusive `<db>.write.lock` flock within its bounded attempts. This mirrors
+/// bounded-wait output when it cannot take the exclusive `<db>.write.lock`
+/// flock. Both the current progress-aware messages and the legacy
+/// "could not acquire database write lock: ..." form are accepted. This mirrors
 /// the flock clause of the `remember` app-level predicate
 /// (`remember_write_contention_is_retryable`) so the shared DB path and the
 /// remember path agree on what counts as retryable flock contention.
@@ -2451,9 +2458,10 @@ fn db_error_is_transient_sqlite_contention(error: &DbError) -> bool {
 /// path/permission failure) or the symlink-guard `InvalidPath` errors, so only
 /// true gate contention is retried.
 fn write_owner_flock_contention_message_is_retryable(message: &str) -> bool {
-    message
-        .to_ascii_lowercase()
-        .contains("could not acquire database write lock")
+    let message = message.to_ascii_lowercase();
+    message.contains("could not acquire database write lock")
+        || message.contains("database write lock holder made no progress")
+        || message.contains("database write lock wait deadline exceeded")
 }
 
 fn sqlmodel_error_is_transient_sqlite_contention(error: &sqlmodel_core::Error) -> bool {
@@ -10273,6 +10281,22 @@ DROP TABLE feedback_events_v120;
     "blake3:v121_evidence_feedback_targets_2026_09_01",
 );
 
+/// V122: Bind resumable import completions to the attempt owner.
+///
+/// Existing rows are retained as legacy-owned checkpoints. Every new running
+/// attempt supplies a fresh owner token, and completion uses both that token
+/// and the attempt number as its compare-and-set fence.
+pub const V122_IMPORT_LEDGER_ATTEMPT_OWNER_CAS: Migration = Migration::new(
+    122,
+    "import_ledger_attempt_owner_cas",
+    r#"
+ALTER TABLE import_ledger
+    ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'legacy'
+    CHECK (length(trim(owner_id)) > 0);
+"#,
+    "blake3:v122_import_ledger_attempt_owner_cas_2026_09_10",
+);
+
 /// All migrations in version order.
 pub const MIGRATIONS: &[Migration] = &[
     V001_INIT_SCHEMA,
@@ -10396,6 +10420,7 @@ pub const MIGRATIONS: &[Migration] = &[
     V119_CURATION_GENERATION_TRIGGER_REPAIR,
     V120_TEAM_JOIN_ATTEMPT_FIRST_SYNC_PHASE,
     V121_EVIDENCE_FEEDBACK_TARGETS,
+    V122_IMPORT_LEDGER_ATTEMPT_OWNER_CAS,
 ];
 
 fn compiled_migration(version: u32) -> Option<&'static Migration> {
@@ -14693,6 +14718,12 @@ fn stored_evidence_span_from_row(row: &Row) -> Result<StoredEvidenceSpan> {
     })
 }
 
+/// Legacy owner used by the pre-V122 public import-ledger API.
+///
+/// Owner-aware CASS paths use a private token and the internal helpers below;
+/// keeping this marker for public rows preserves the original struct shapes.
+pub(crate) const LEGACY_IMPORT_OWNER_ID: &str = "legacy";
+
 /// Input for recording a resumable import ledger row.
 #[derive(Debug, Clone)]
 pub struct CreateImportLedgerInput {
@@ -14759,10 +14790,77 @@ pub struct StoredImportLedger {
     pub updated_at: String,
 }
 
+/// Internal import-ledger row carrying the attempt owner used by CASS CAS.
+///
+/// The owner is deliberately kept out of [`StoredImportLedger`] so adding the
+/// V122 fence does not make existing public struct literals source-incompatible.
+#[derive(Debug, Clone)]
+pub(crate) struct StoredImportLedgerWithOwner {
+    pub(crate) ledger: StoredImportLedger,
+    pub(crate) owner_id: String,
+}
+
+fn import_ledger_insert_values(
+    id: &str,
+    input: &CreateImportLedgerInput,
+    owner_id: &str,
+    now: &str,
+) -> Vec<Value> {
+    vec![
+        Value::Text(id.to_owned()),
+        Value::Text(input.workspace_id.clone()),
+        Value::Text(input.source_kind.clone()),
+        Value::Text(input.source_id.clone()),
+        Value::Text(input.status.clone()),
+        input
+            .cursor_json
+            .as_ref()
+            .map_or(Value::Null, |cursor| Value::Text(cursor.clone())),
+        Value::BigInt(i64::from(input.imported_session_count)),
+        Value::BigInt(i64::from(input.imported_span_count)),
+        Value::BigInt(i64::from(input.attempt_count)),
+        Value::Text(owner_id.to_owned()),
+        input
+            .error_code
+            .as_ref()
+            .map_or(Value::Null, |code| Value::Text(code.clone())),
+        input
+            .error_message
+            .as_ref()
+            .map_or(Value::Null, |message| Value::Text(message.clone())),
+        input
+            .started_at
+            .as_ref()
+            .map_or(Value::Null, |started| Value::Text(started.clone())),
+        input
+            .completed_at
+            .as_ref()
+            .map_or(Value::Null, |completed| Value::Text(completed.clone())),
+        input
+            .metadata_json
+            .as_ref()
+            .map_or(Value::Null, |metadata| Value::Text(metadata.clone())),
+        Value::Text(now.to_owned()),
+        Value::Text(now.to_owned()),
+    ]
+}
+
+const IMPORT_LEDGER_INSERT_SQL: &str = "INSERT INTO import_ledger (id, workspace_id, source_kind, source_id, status, cursor_json, imported_session_count, imported_span_count, attempt_count, owner_id, error_code, error_message, started_at, completed_at, metadata_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)";
+const IMPORT_LEDGER_SELECT_SQL: &str = "SELECT id, workspace_id, source_kind, source_id, status, cursor_json, imported_session_count, imported_span_count, attempt_count, owner_id, error_code, error_message, started_at, completed_at, metadata_json, created_at, updated_at FROM import_ledger";
+
 impl DbConnection {
     /// Recover an import checkpoint without replaying the import or changing its timestamps.
     /// The caller owns the recovery transaction and workspace/source rebinding.
     pub(crate) fn insert_import_ledger_for_recovery(&self, row: &StoredImportLedger) -> Result<()> {
+        self.insert_import_ledger_for_recovery_with_owner(row, LEGACY_IMPORT_OWNER_ID)
+    }
+
+    /// Recover an import checkpoint while retaining its authenticated attempt owner.
+    pub(crate) fn insert_import_ledger_for_recovery_with_owner(
+        &self,
+        row: &StoredImportLedger,
+        owner_id: &str,
+    ) -> Result<()> {
         for raw in [row.cursor_json.as_deref(), row.metadata_json.as_deref()]
             .into_iter()
             .flatten()
@@ -14774,9 +14872,15 @@ impl DbConnection {
                 }
             })?;
         }
+        if owner_id.trim().is_empty() {
+            return Err(DbError::MalformedRow {
+                operation: DbOperation::Execute,
+                message: "recovered import owner must not be empty".to_string(),
+            });
+        }
         self.execute_for(
             DbOperation::Execute,
-            "INSERT INTO import_ledger (id, workspace_id, source_kind, source_id, status, cursor_json, imported_session_count, imported_span_count, attempt_count, error_code, error_message, started_at, completed_at, metadata_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            IMPORT_LEDGER_INSERT_SQL,
             &[
                 Value::Text(row.id.clone()),
                 Value::Text(row.workspace_id.clone()),
@@ -14787,6 +14891,7 @@ impl DbConnection {
                 Value::BigInt(i64::from(row.imported_session_count)),
                 Value::BigInt(i64::from(row.imported_span_count)),
                 Value::BigInt(i64::from(row.attempt_count)),
+                Value::Text(owner_id.to_owned()),
                 row.error_code.clone().map_or(Value::Null, Value::Text),
                 row.error_message.clone().map_or(Value::Null, Value::Text),
                 row.started_at.clone().map_or(Value::Null, Value::Text),
@@ -14802,48 +14907,11 @@ impl DbConnection {
     /// Insert a resumable import ledger row.
     pub fn insert_import_ledger(&self, id: &str, input: &CreateImportLedgerInput) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-
         self.execute_for(
             DbOperation::Execute,
-            "INSERT INTO import_ledger (id, workspace_id, source_kind, source_id, status, cursor_json, imported_session_count, imported_span_count, attempt_count, error_code, error_message, started_at, completed_at, metadata_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-            &[
-                Value::Text(id.to_string()),
-                Value::Text(input.workspace_id.clone()),
-                Value::Text(input.source_kind.clone()),
-                Value::Text(input.source_id.clone()),
-                Value::Text(input.status.clone()),
-                input
-                    .cursor_json
-                    .as_ref()
-                    .map_or(Value::Null, |cursor| Value::Text(cursor.clone())),
-                Value::BigInt(i64::from(input.imported_session_count)),
-                Value::BigInt(i64::from(input.imported_span_count)),
-                Value::BigInt(i64::from(input.attempt_count)),
-                input
-                    .error_code
-                    .as_ref()
-                    .map_or(Value::Null, |code| Value::Text(code.clone())),
-                input
-                    .error_message
-                    .as_ref()
-                    .map_or(Value::Null, |message| Value::Text(message.clone())),
-                input
-                    .started_at
-                    .as_ref()
-                    .map_or(Value::Null, |started| Value::Text(started.clone())),
-                input
-                    .completed_at
-                    .as_ref()
-                    .map_or(Value::Null, |completed| Value::Text(completed.clone())),
-                input
-                    .metadata_json
-                    .as_ref()
-                    .map_or(Value::Null, |metadata| Value::Text(metadata.clone())),
-                Value::Text(now.clone()),
-                Value::Text(now),
-            ],
+            IMPORT_LEDGER_INSERT_SQL,
+            &import_ledger_insert_values(id, input, LEGACY_IMPORT_OWNER_ID, &now),
         )?;
-
         Ok(())
     }
 
@@ -14853,17 +14921,169 @@ impl DbConnection {
         id: &str,
         input: &CreateImportLedgerInput,
     ) -> Result<StoredImportLedger> {
+        self.upsert_running_import_ledger_with_owner_internal(
+            id,
+            input,
+            LEGACY_IMPORT_OWNER_ID,
+            false,
+        )
+        .map(|row| row.ledger)
+    }
+
+    /// Claim a running import ledger attempt for the CASS importer.
+    pub(crate) fn upsert_running_import_ledger_with_owner(
+        &self,
+        id: &str,
+        input: &CreateImportLedgerInput,
+        owner_id: &str,
+    ) -> Result<StoredImportLedgerWithOwner> {
+        self.upsert_running_import_ledger_with_owner_internal(id, input, owner_id, true)
+    }
+
+    fn upsert_running_import_ledger_with_owner_internal(
+        &self,
+        id: &str,
+        input: &CreateImportLedgerInput,
+        owner_id: &str,
+        owner_aware: bool,
+    ) -> Result<StoredImportLedgerWithOwner> {
+        if owner_id.trim().is_empty() {
+            return Err(DbError::MalformedRow {
+                operation: DbOperation::Execute,
+                message: "import owner must not be empty".to_string(),
+            });
+        }
         let now = Utc::now().to_rfc3339();
+        let sql = if owner_aware {
+            "INSERT INTO import_ledger (id, workspace_id, source_kind, source_id, status, cursor_json, imported_session_count, imported_span_count, attempt_count, owner_id, error_code, error_message, started_at, completed_at, metadata_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) ON CONFLICT(workspace_id, source_kind, source_id) DO UPDATE SET status = 'running', attempt_count = import_ledger.attempt_count + 1, owner_id = excluded.owner_id, error_code = NULL, error_message = NULL, started_at = excluded.started_at, completed_at = NULL, updated_at = excluded.updated_at"
+        } else {
+            // Legacy callers cannot clobber an owner-aware claim.
+            "INSERT INTO import_ledger (id, workspace_id, source_kind, source_id, status, cursor_json, imported_session_count, imported_span_count, attempt_count, owner_id, error_code, error_message, started_at, completed_at, metadata_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) ON CONFLICT(workspace_id, source_kind, source_id) DO UPDATE SET status = 'running', attempt_count = import_ledger.attempt_count + 1, owner_id = excluded.owner_id, error_code = NULL, error_message = NULL, started_at = excluded.started_at, completed_at = NULL, updated_at = excluded.updated_at WHERE import_ledger.owner_id = 'legacy'"
+        };
 
         self.with_transaction(|| {
             self.execute_for(
                 DbOperation::Execute,
-                "INSERT INTO import_ledger (id, workspace_id, source_kind, source_id, status, cursor_json, imported_session_count, imported_span_count, attempt_count, error_code, error_message, started_at, completed_at, metadata_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) ON CONFLICT(workspace_id, source_kind, source_id) DO UPDATE SET status = 'running', attempt_count = import_ledger.attempt_count + 1, error_code = NULL, error_message = NULL, started_at = excluded.started_at, completed_at = NULL, updated_at = excluded.updated_at",
+                sql,
+                &import_ledger_insert_values(id, input, owner_id, &now),
+            )?;
+            self.get_import_ledger_by_source_with_owner(
+                &input.workspace_id,
+                &input.source_kind,
+                &input.source_id,
+            )?
+            .ok_or_else(|| DbError::MalformedRow {
+                operation: DbOperation::Query,
+                message: "running import ledger upsert did not return a source row".to_string(),
+            })
+        })
+    }
+
+    /// Get an import ledger row by its ee import ID.
+    pub fn get_import_ledger(&self, id: &str) -> Result<Option<StoredImportLedger>> {
+        Ok(self.get_import_ledger_with_owner(id)?.map(|row| row.ledger))
+    }
+
+    pub(crate) fn get_import_ledger_with_owner(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredImportLedgerWithOwner>> {
+        let rows = self.query_for(
+            DbOperation::Query,
+            &format!("{IMPORT_LEDGER_SELECT_SQL} WHERE id = ?1"),
+            &[Value::Text(id.to_owned())],
+        )?;
+        rows.first()
+            .map(stored_import_ledger_with_owner_from_row)
+            .transpose()
+    }
+
+    /// Get an import ledger row by its stable upstream source key.
+    pub fn get_import_ledger_by_source(
+        &self,
+        workspace_id: &str,
+        source_kind: &str,
+        source_id: &str,
+    ) -> Result<Option<StoredImportLedger>> {
+        Ok(self
+            .get_import_ledger_by_source_with_owner(workspace_id, source_kind, source_id)?
+            .map(|row| row.ledger))
+    }
+
+    pub(crate) fn get_import_ledger_by_source_with_owner(
+        &self,
+        workspace_id: &str,
+        source_kind: &str,
+        source_id: &str,
+    ) -> Result<Option<StoredImportLedgerWithOwner>> {
+        let rows = self.query_for(
+            DbOperation::Query,
+            &format!(
+                "{IMPORT_LEDGER_SELECT_SQL} WHERE workspace_id = ?1 AND source_kind = ?2 AND source_id = ?3"
+            ),
+            &[
+                Value::Text(workspace_id.to_owned()),
+                Value::Text(source_kind.to_owned()),
+                Value::Text(source_id.to_owned()),
+            ],
+        )?;
+        rows.first()
+            .map(stored_import_ledger_with_owner_from_row)
+            .transpose()
+    }
+
+    /// List import ledger rows for a workspace in stable resume order.
+    pub fn list_import_ledgers(&self, workspace_id: &str) -> Result<Vec<StoredImportLedger>> {
+        Ok(self
+            .list_import_ledgers_with_owner(workspace_id)?
+            .into_iter()
+            .map(|row| row.ledger)
+            .collect())
+    }
+
+    pub(crate) fn list_import_ledgers_with_owner(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<StoredImportLedgerWithOwner>> {
+        let rows = self.query_for(
+            DbOperation::Query,
+            &format!(
+                "{IMPORT_LEDGER_SELECT_SQL} WHERE workspace_id = ?1 ORDER BY source_kind ASC, source_id ASC, id ASC"
+            ),
+            &[Value::Text(workspace_id.to_owned())],
+        )?;
+        rows.iter()
+            .map(stored_import_ledger_with_owner_from_row)
+            .collect()
+    }
+
+    /// List import ledger rows by status in deterministic order.
+    pub fn list_import_ledgers_by_status(
+        &self,
+        workspace_id: &str,
+        status: &str,
+    ) -> Result<Vec<StoredImportLedger>> {
+        let rows = self.query_for(
+            DbOperation::Query,
+            &format!(
+                "{IMPORT_LEDGER_SELECT_SQL} WHERE workspace_id = ?1 AND status = ?2 ORDER BY source_kind ASC, source_id ASC, id ASC"
+            ),
+            &[
+                Value::Text(workspace_id.to_owned()),
+                Value::Text(status.to_owned()),
+            ],
+        )?;
+        rows.iter().map(stored_import_ledger_from_row).collect()
+    }
+
+    /// Update resumable import progress for an existing legacy ledger row.
+    pub fn update_import_ledger(&self, id: &str, input: &UpdateImportLedgerInput) -> Result<bool> {
+        self.with_write_owner_fence(|error| error, || {
+            let now = Utc::now().to_rfc3339();
+            let affected = self.execute_for(
+                DbOperation::Execute,
+                "UPDATE import_ledger SET status = ?1, cursor_json = ?2, imported_session_count = ?3, imported_span_count = ?4, attempt_count = ?5, error_code = ?6, error_message = ?7, started_at = ?8, completed_at = ?9, updated_at = ?10 WHERE id = ?11 AND owner_id = 'legacy'",
                 &[
-                    Value::Text(id.to_string()),
-                    Value::Text(input.workspace_id.clone()),
-                    Value::Text(input.source_kind.clone()),
-                    Value::Text(input.source_id.clone()),
                     Value::Text(input.status.clone()),
                     input
                         .cursor_json
@@ -14888,137 +15108,68 @@ impl DbConnection {
                         .completed_at
                         .as_ref()
                         .map_or(Value::Null, |completed| Value::Text(completed.clone())),
-                    input
-                        .metadata_json
-                        .as_ref()
-                        .map_or(Value::Null, |metadata| Value::Text(metadata.clone())),
-                    Value::Text(now.clone()),
-                    Value::Text(now.clone()),
+                    Value::Text(now),
+                    Value::Text(id.to_owned()),
                 ],
             )?;
-
-            self.get_import_ledger_by_source(
-                &input.workspace_id,
-                &input.source_kind,
-                &input.source_id,
-            )?
-            .ok_or_else(|| DbError::MalformedRow {
-                operation: DbOperation::Query,
-                message: "running import ledger upsert did not return a source row".to_string(),
-            })
+            Ok(affected > 0)
         })
     }
 
-    /// Get an import ledger row by its ee import ID.
-    pub fn get_import_ledger(&self, id: &str) -> Result<Option<StoredImportLedger>> {
-        let rows = self.query_for(
-            DbOperation::Query,
-            "SELECT id, workspace_id, source_kind, source_id, status, cursor_json, imported_session_count, imported_span_count, attempt_count, error_code, error_message, started_at, completed_at, metadata_json, created_at, updated_at FROM import_ledger WHERE id = ?1",
-            &[Value::Text(id.to_string())],
-        )?;
-
-        rows.first().map(stored_import_ledger_from_row).transpose()
-    }
-
-    /// Get an import ledger row by its stable upstream source key.
-    pub fn get_import_ledger_by_source(
-        &self,
-        workspace_id: &str,
-        source_kind: &str,
-        source_id: &str,
-    ) -> Result<Option<StoredImportLedger>> {
-        let rows = self.query_for(
-            DbOperation::Query,
-            "SELECT id, workspace_id, source_kind, source_id, status, cursor_json, imported_session_count, imported_span_count, attempt_count, error_code, error_message, started_at, completed_at, metadata_json, created_at, updated_at FROM import_ledger WHERE workspace_id = ?1 AND source_kind = ?2 AND source_id = ?3",
-            &[
-                Value::Text(workspace_id.to_string()),
-                Value::Text(source_kind.to_string()),
-                Value::Text(source_id.to_string()),
-            ],
-        )?;
-
-        rows.first().map(stored_import_ledger_from_row).transpose()
-    }
-
-    /// List import ledger rows for a workspace in stable resume order.
-    pub fn list_import_ledgers(&self, workspace_id: &str) -> Result<Vec<StoredImportLedger>> {
-        let rows = self.query_for(
-            DbOperation::Query,
-            "SELECT id, workspace_id, source_kind, source_id, status, cursor_json, imported_session_count, imported_span_count, attempt_count, error_code, error_message, started_at, completed_at, metadata_json, created_at, updated_at FROM import_ledger WHERE workspace_id = ?1 ORDER BY source_kind ASC, source_id ASC, id ASC",
-            &[Value::Text(workspace_id.to_string())],
-        )?;
-
-        rows.iter().map(stored_import_ledger_from_row).collect()
-    }
-
-    /// List import ledger rows by status in deterministic order.
-    pub fn list_import_ledgers_by_status(
-        &self,
-        workspace_id: &str,
-        status: &str,
-    ) -> Result<Vec<StoredImportLedger>> {
-        let rows = self.query_for(
-            DbOperation::Query,
-            "SELECT id, workspace_id, source_kind, source_id, status, cursor_json, imported_session_count, imported_span_count, attempt_count, error_code, error_message, started_at, completed_at, metadata_json, created_at, updated_at FROM import_ledger WHERE workspace_id = ?1 AND status = ?2 ORDER BY source_kind ASC, source_id ASC, id ASC",
-            &[
-                Value::Text(workspace_id.to_string()),
-                Value::Text(status.to_string()),
-            ],
-        )?;
-
-        rows.iter().map(stored_import_ledger_from_row).collect()
-    }
-
-    /// Update resumable import progress for an existing ledger row.
-    pub fn update_import_ledger(&self, id: &str, input: &UpdateImportLedgerInput) -> Result<bool> {
-        let now = Utc::now().to_rfc3339();
-        let affected = self.execute_for(
-            DbOperation::Execute,
-            "UPDATE import_ledger SET status = ?1, cursor_json = ?2, imported_session_count = ?3, imported_span_count = ?4, attempt_count = ?5, error_code = ?6, error_message = ?7, started_at = ?8, completed_at = ?9, updated_at = ?10 WHERE id = ?11",
-            &[
-                Value::Text(input.status.clone()),
-                input
-                    .cursor_json
-                    .as_ref()
-                    .map_or(Value::Null, |cursor| Value::Text(cursor.clone())),
-                Value::BigInt(i64::from(input.imported_session_count)),
-                Value::BigInt(i64::from(input.imported_span_count)),
-                Value::BigInt(i64::from(input.attempt_count)),
-                input
-                    .error_code
-                    .as_ref()
-                    .map_or(Value::Null, |code| Value::Text(code.clone())),
-                input
-                    .error_message
-                    .as_ref()
-                    .map_or(Value::Null, |message| Value::Text(message.clone())),
-                input
-                    .started_at
-                    .as_ref()
-                    .map_or(Value::Null, |started| Value::Text(started.clone())),
-                input
-                    .completed_at
-                    .as_ref()
-                    .map_or(Value::Null, |completed| Value::Text(completed.clone())),
-                Value::Text(now),
-                Value::Text(id.to_string()),
-            ],
-        )?;
-
-        Ok(affected > 0)
-    }
-
-    /// Complete one import attempt while preserving concurrently bumped attempts.
+    /// Complete a legacy import attempt while retaining the original API.
     pub fn complete_import_ledger_attempt(
         &self,
         id: &str,
         input: &CompleteImportLedgerInput,
     ) -> Result<bool> {
-        let now = Utc::now().to_rfc3339();
+        self.with_write_owner_fence(|error| error, || {
+            let now = Utc::now().to_rfc3339();
+            self.with_transaction(|| {
+                let affected = self.execute_for(
+                    DbOperation::Execute,
+                    "UPDATE import_ledger SET status = ?1, cursor_json = ?2, imported_session_count = imported_session_count + ?3, imported_span_count = imported_span_count + ?4, error_code = ?5, error_message = ?6, started_at = NULL, completed_at = ?7, updated_at = ?8 WHERE id = ?9 AND owner_id = 'legacy' AND status = 'running'",
+                    &[
+                        Value::Text(input.status.clone()),
+                        input
+                            .cursor_json
+                            .as_ref()
+                            .map_or(Value::Null, |cursor| Value::Text(cursor.clone())),
+                        Value::BigInt(i64::from(input.imported_session_delta)),
+                        Value::BigInt(i64::from(input.imported_span_delta)),
+                        input
+                            .error_code
+                            .as_ref()
+                            .map_or(Value::Null, |code| Value::Text(code.clone())),
+                        input
+                            .error_message
+                            .as_ref()
+                            .map_or(Value::Null, |message| Value::Text(message.clone())),
+                        input
+                            .completed_at
+                            .as_ref()
+                            .map_or(Value::Null, |completed| Value::Text(completed.clone())),
+                        Value::Text(now),
+                        Value::Text(id.to_owned()),
+                    ],
+                )?;
+                Ok(affected > 0)
+            })
+        })
+    }
+
+    /// Complete one owner-aware import attempt using attempt and owner CAS.
+    pub(crate) fn complete_import_ledger_attempt_with_owner(
+        &self,
+        id: &str,
+        input: &CompleteImportLedgerInput,
+        expected_attempt_count: u32,
+        expected_owner_id: &str,
+    ) -> Result<bool> {
         self.with_transaction(|| {
+            let now = Utc::now().to_rfc3339();
             let affected = self.execute_for(
                 DbOperation::Execute,
-                "UPDATE import_ledger SET status = ?1, cursor_json = ?2, imported_session_count = imported_session_count + ?3, imported_span_count = imported_span_count + ?4, error_code = ?5, error_message = ?6, started_at = NULL, completed_at = ?7, updated_at = ?8 WHERE id = ?9",
+                "UPDATE import_ledger SET status = ?1, cursor_json = ?2, imported_session_count = imported_session_count + ?3, imported_span_count = imported_span_count + ?4, error_code = ?5, error_message = ?6, started_at = NULL, completed_at = ?7, updated_at = ?8 WHERE id = ?9 AND attempt_count = ?10 AND owner_id = ?11 AND status = 'running'",
                 &[
                     Value::Text(input.status.clone()),
                     input
@@ -15039,34 +15190,47 @@ impl DbConnection {
                         .completed_at
                         .as_ref()
                         .map_or(Value::Null, |completed| Value::Text(completed.clone())),
-                    Value::Text(now.clone()),
-                    Value::Text(id.to_string()),
+                    Value::Text(now),
+                    Value::Text(id.to_owned()),
+                    Value::BigInt(i64::from(expected_attempt_count)),
+                    Value::Text(expected_owner_id.to_owned()),
                 ],
             )?;
-
             Ok(affected > 0)
         })
     }
 }
 
 fn stored_import_ledger_from_row(row: &Row) -> Result<StoredImportLedger> {
-    Ok(StoredImportLedger {
-        id: required_text(row, 0, DbOperation::Query, "id")?.to_string(),
-        workspace_id: required_text(row, 1, DbOperation::Query, "workspace_id")?.to_string(),
-        source_kind: required_text(row, 2, DbOperation::Query, "source_kind")?.to_string(),
-        source_id: required_text(row, 3, DbOperation::Query, "source_id")?.to_string(),
-        status: required_text(row, 4, DbOperation::Query, "status")?.to_string(),
-        cursor_json: optional_text(row, 5)?.map(str::to_string),
-        imported_session_count: required_u32(row, 6, DbOperation::Query, "imported_session_count")?,
-        imported_span_count: required_u32(row, 7, DbOperation::Query, "imported_span_count")?,
-        attempt_count: required_u32(row, 8, DbOperation::Query, "attempt_count")?,
-        error_code: optional_text(row, 9)?.map(str::to_string),
-        error_message: optional_text(row, 10)?.map(str::to_string),
-        started_at: optional_text(row, 11)?.map(str::to_string),
-        completed_at: optional_text(row, 12)?.map(str::to_string),
-        metadata_json: optional_text(row, 13)?.map(str::to_string),
-        created_at: required_text(row, 14, DbOperation::Query, "created_at")?.to_string(),
-        updated_at: required_text(row, 15, DbOperation::Query, "updated_at")?.to_string(),
+    Ok(stored_import_ledger_with_owner_from_row(row)?.ledger)
+}
+
+fn stored_import_ledger_with_owner_from_row(row: &Row) -> Result<StoredImportLedgerWithOwner> {
+    Ok(StoredImportLedgerWithOwner {
+        ledger: StoredImportLedger {
+            id: required_text(row, 0, DbOperation::Query, "id")?.to_string(),
+            workspace_id: required_text(row, 1, DbOperation::Query, "workspace_id")?.to_string(),
+            source_kind: required_text(row, 2, DbOperation::Query, "source_kind")?.to_string(),
+            source_id: required_text(row, 3, DbOperation::Query, "source_id")?.to_string(),
+            status: required_text(row, 4, DbOperation::Query, "status")?.to_string(),
+            cursor_json: optional_text(row, 5)?.map(str::to_string),
+            imported_session_count: required_u32(
+                row,
+                6,
+                DbOperation::Query,
+                "imported_session_count",
+            )?,
+            imported_span_count: required_u32(row, 7, DbOperation::Query, "imported_span_count")?,
+            attempt_count: required_u32(row, 8, DbOperation::Query, "attempt_count")?,
+            error_code: optional_text(row, 10)?.map(str::to_string),
+            error_message: optional_text(row, 11)?.map(str::to_string),
+            started_at: optional_text(row, 12)?.map(str::to_string),
+            completed_at: optional_text(row, 13)?.map(str::to_string),
+            metadata_json: optional_text(row, 14)?.map(str::to_string),
+            created_at: required_text(row, 15, DbOperation::Query, "created_at")?.to_string(),
+            updated_at: required_text(row, 16, DbOperation::Query, "updated_at")?.to_string(),
+        },
+        owner_id: required_text(row, 9, DbOperation::Query, "owner_id")?.to_string(),
     })
 }
 
@@ -34405,20 +34569,25 @@ pub mod concurrent_writer_contract {
 impl DbConnection {
     /// Ensure the advisory locks table exists.
     pub fn ensure_advisory_locks_table(&self) -> Result<()> {
-        retry_sqlite_contention(DbOperation::EnsureMigrationTable, || {
-            self.execute_raw_for(
-                DbOperation::EnsureMigrationTable,
-                concurrent_writer_contract::LOCK_TABLE_DDL,
-            )?;
-            self.execute_raw_for(
-                DbOperation::EnsureMigrationTable,
-                concurrent_writer_contract::LOCK_HOLDER_INDEX_DDL,
-            )?;
-            self.execute_raw_for(
-                DbOperation::EnsureMigrationTable,
-                concurrent_writer_contract::LOCK_EXPIRY_INDEX_DDL,
-            )
-        })
+        self.with_write_owner_fence(
+            |error| error,
+            || {
+                retry_sqlite_contention(DbOperation::EnsureMigrationTable, || {
+                    self.execute_raw_for(
+                        DbOperation::EnsureMigrationTable,
+                        concurrent_writer_contract::LOCK_TABLE_DDL,
+                    )?;
+                    self.execute_raw_for(
+                        DbOperation::EnsureMigrationTable,
+                        concurrent_writer_contract::LOCK_HOLDER_INDEX_DDL,
+                    )?;
+                    self.execute_raw_for(
+                        DbOperation::EnsureMigrationTable,
+                        concurrent_writer_contract::LOCK_EXPIRY_INDEX_DDL,
+                    )
+                })
+            },
+        )
     }
 
     /// Attempt to acquire an advisory lock.
@@ -47488,57 +47657,74 @@ mod tests {
         input.imported_session_count = 0;
         input.imported_span_count = 0;
         input.attempt_count = 1;
-        let first =
-            connection.upsert_running_import_ledger("imp_02234567890123456789012345", &input)?;
-        ensure_equal(&first.status.as_str(), &"running", "first status")?;
-        ensure_equal(&first.attempt_count, &1, "first attempt count")?;
-
-        let _ = connection.update_import_ledger(
+        let first = connection.upsert_running_import_ledger_with_owner(
             "imp_02234567890123456789012345",
-            &super::UpdateImportLedgerInput {
+            &input,
+            "attempt-1",
+        )?;
+        ensure_equal(&first.ledger.status.as_str(), &"running", "first status")?;
+        ensure_equal(&first.ledger.attempt_count, &1, "first attempt count")?;
+
+        let completed_first = connection.complete_import_ledger_attempt_with_owner(
+            "imp_02234567890123456789012345",
+            &super::CompleteImportLedgerInput {
                 status: "completed".to_string(),
-                cursor_json: Some(r#"{"complete":true}"#.to_string()),
-                imported_session_count: 1,
-                imported_span_count: 1,
-                attempt_count: 1,
+                cursor_json: Some(r#"{\"complete\":true}"#.to_string()),
+                imported_session_delta: 1,
+                imported_span_delta: 1,
                 error_code: None,
                 error_message: None,
-                started_at: None,
                 completed_at: Some("2026-04-29T20:10:00Z".to_string()),
             },
+            first.ledger.attempt_count,
+            &first.owner_id,
+        )?;
+        ensure(
+            completed_first,
+            "first completion must affect the ledger row",
         )?;
 
-        let reopened =
-            connection.upsert_running_import_ledger("imp_02234567890123456789012345", &input)?;
-        ensure_equal(&reopened.status.as_str(), &"running", "reopened status")?;
-        ensure_equal(&reopened.attempt_count, &2, "reopened attempt count")?;
+        let reopened = connection.upsert_running_import_ledger_with_owner(
+            "imp_02234567890123456789012345",
+            &input,
+            "attempt-2",
+        )?;
         ensure_equal(
-            &reopened.imported_session_count,
+            &reopened.ledger.status.as_str(),
+            &"running",
+            "reopened status",
+        )?;
+        ensure_equal(&reopened.ledger.attempt_count, &2, "reopened attempt count")?;
+        ensure_equal(&reopened.owner_id.as_str(), &"attempt-2", "reopened owner")?;
+        ensure_equal(
+            &reopened.ledger.imported_session_count,
             &1,
             "reopened keeps imported session count",
         )?;
         ensure_equal(
-            &reopened.imported_span_count,
+            &reopened.ledger.imported_span_count,
             &1,
             "reopened keeps imported span count",
         )?;
         ensure_equal(
-            &reopened.completed_at,
+            &reopened.ledger.completed_at,
             &None,
             "reopened clears completed_at",
         )?;
 
-        let completed = connection.complete_import_ledger_attempt(
+        let completed = connection.complete_import_ledger_attempt_with_owner(
             "imp_02234567890123456789012345",
             &super::CompleteImportLedgerInput {
                 status: "completed".to_string(),
-                cursor_json: Some(r#"{"complete":true,"second":true}"#.to_string()),
+                cursor_json: Some(r#"{\"complete\":true,\"second\":true}"#.to_string()),
                 imported_session_delta: 3,
                 imported_span_delta: 5,
                 error_code: None,
                 error_message: None,
                 completed_at: Some("2026-04-29T20:15:00Z".to_string()),
             },
+            reopened.ledger.attempt_count,
+            &reopened.owner_id,
         )?;
         ensure(completed, "completion update must affect the ledger row")?;
         let completed_ledger = connection
@@ -47563,6 +47749,330 @@ mod tests {
         let ledgers = connection.list_import_ledgers("wsp_01234567890123456789012345")?;
         ensure_equal(&ledgers.len(), &1, "upsert keeps one source ledger")?;
 
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn import_ledger_completion_cas_rejects_stale_success_and_failure() -> TestResult {
+        let connection = DbConnection::open_memory()?;
+        connection.migrate()?;
+        setup_workspace(&connection)?;
+
+        let mut first_input = import_ledger_input("cass://cas-race-success-failure", "running");
+        first_input.imported_session_count = 0;
+        first_input.imported_span_count = 0;
+        let first = connection.upsert_running_import_ledger_with_owner(
+            "imp_32234567890123456789012345",
+            &first_input,
+            "owner-first",
+        )?;
+
+        let second = connection.upsert_running_import_ledger_with_owner(
+            "imp_32234567890123456789012345",
+            &first_input,
+            "owner-second",
+        )?;
+        ensure_equal(&second.ledger.attempt_count, &2, "second attempt count")?;
+        ensure_equal(
+            &second.owner_id.as_str(),
+            &"owner-second",
+            "second attempt owner",
+        )?;
+
+        let stale_success = connection.complete_import_ledger_attempt_with_owner(
+            "imp_32234567890123456789012345",
+            &super::CompleteImportLedgerInput {
+                status: "completed".to_string(),
+                cursor_json: Some(r#"{\"stale\":\"success\"}"#.to_string()),
+                imported_session_delta: 9,
+                imported_span_delta: 11,
+                error_code: None,
+                error_message: None,
+                completed_at: Some("2026-04-29T20:11:00Z".to_string()),
+            },
+            first.ledger.attempt_count,
+            &first.owner_id,
+        )?;
+        ensure(!stale_success, "stale success must lose the attempt CAS")?;
+        let still_running = connection
+            .get_import_ledger_with_owner("imp_32234567890123456789012345")?
+            .ok_or_else(|| TestFailure::new("running CAS row not found"))?;
+        ensure_equal(
+            &still_running.ledger.status.as_str(),
+            &"running",
+            "stale success keeps running state",
+        )?;
+        ensure_equal(
+            &still_running.ledger.attempt_count,
+            &2,
+            "stale success keeps current attempt",
+        )?;
+        ensure_equal(
+            &still_running.owner_id.as_str(),
+            &"owner-second",
+            "stale success keeps owner",
+        )?;
+        ensure_equal(
+            &still_running.ledger.imported_session_count,
+            &0,
+            "stale success adds no sessions",
+        )?;
+        ensure_equal(
+            &still_running.ledger.imported_span_count,
+            &0,
+            "stale success adds no spans",
+        )?;
+
+        let current_failure = connection.complete_import_ledger_attempt_with_owner(
+            "imp_32234567890123456789012345",
+            &super::CompleteImportLedgerInput {
+                status: "failed".to_string(),
+                cursor_json: Some(r#"{\"current\":\"failure\"}"#.to_string()),
+                imported_session_delta: 1,
+                imported_span_delta: 2,
+                error_code: Some("source_failed".to_string()),
+                error_message: Some("current attempt failed".to_string()),
+                completed_at: Some("2026-04-29T20:12:00Z".to_string()),
+            },
+            second.ledger.attempt_count,
+            &second.owner_id,
+        )?;
+        ensure(current_failure, "current failure must complete its attempt")?;
+        let failed = connection
+            .get_import_ledger_with_owner("imp_32234567890123456789012345")?
+            .ok_or_else(|| TestFailure::new("failed CAS row not found"))?;
+        ensure_equal(
+            &failed.ledger.status.as_str(),
+            &"failed",
+            "current failure status",
+        )?;
+        ensure_equal(
+            &failed.owner_id.as_str(),
+            &"owner-second",
+            "failure retains owner",
+        )?;
+        ensure_equal(
+            &failed.ledger.imported_session_count,
+            &1,
+            "current failure session delta",
+        )?;
+        ensure_equal(
+            &failed.ledger.imported_span_count,
+            &2,
+            "current failure span delta",
+        )?;
+
+        let duplicate_success = connection.complete_import_ledger_attempt_with_owner(
+            "imp_32234567890123456789012345",
+            &super::CompleteImportLedgerInput {
+                status: "completed".to_string(),
+                cursor_json: Some(r#"{\"duplicate\":true}"#.to_string()),
+                imported_session_delta: 99,
+                imported_span_delta: 99,
+                error_code: None,
+                error_message: None,
+                completed_at: Some("2026-04-29T20:13:00Z".to_string()),
+            },
+            second.ledger.attempt_count,
+            &second.owner_id,
+        )?;
+        ensure(
+            !duplicate_success,
+            "terminal failure must reject a duplicate success",
+        )?;
+        let still_failed = connection
+            .get_import_ledger_with_owner("imp_32234567890123456789012345")?
+            .ok_or_else(|| TestFailure::new("terminal CAS row not found"))?;
+        ensure_equal(
+            &still_failed.ledger,
+            &failed.ledger,
+            "duplicate success must preserve failure",
+        )?;
+
+        let mut success_first_input =
+            import_ledger_input("cass://cas-race-failure-success", "running");
+        success_first_input.imported_session_count = 0;
+        success_first_input.imported_span_count = 0;
+        let success_first = connection.upsert_running_import_ledger_with_owner(
+            "imp_42234567890123456789012345",
+            &success_first_input,
+            "success-owner-first",
+        )?;
+        let success_second = connection.upsert_running_import_ledger_with_owner(
+            "imp_42234567890123456789012345",
+            &success_first_input,
+            "success-owner-second",
+        )?;
+
+        let stale_failure = connection.complete_import_ledger_attempt_with_owner(
+            "imp_42234567890123456789012345",
+            &super::CompleteImportLedgerInput {
+                status: "failed".to_string(),
+                cursor_json: Some(r#"{\"stale\":\"failure\"}"#.to_string()),
+                imported_session_delta: 7,
+                imported_span_delta: 7,
+                error_code: Some("stale_failure".to_string()),
+                error_message: Some("stale failure".to_string()),
+                completed_at: Some("2026-04-29T20:14:00Z".to_string()),
+            },
+            success_first.ledger.attempt_count,
+            &success_first.owner_id,
+        )?;
+        ensure(!stale_failure, "stale failure must lose the attempt CAS")?;
+
+        let current_success = connection.complete_import_ledger_attempt_with_owner(
+            "imp_42234567890123456789012345",
+            &super::CompleteImportLedgerInput {
+                status: "completed".to_string(),
+                cursor_json: Some(r#"{\"current\":\"success\"}"#.to_string()),
+                imported_session_delta: 2,
+                imported_span_delta: 3,
+                error_code: None,
+                error_message: None,
+                completed_at: Some("2026-04-29T20:15:00Z".to_string()),
+            },
+            success_second.ledger.attempt_count,
+            &success_second.owner_id,
+        )?;
+        ensure(current_success, "current success must complete its attempt")?;
+        let completed = connection
+            .get_import_ledger_with_owner("imp_42234567890123456789012345")?
+            .ok_or_else(|| TestFailure::new("completed CAS row not found"))?;
+        ensure_equal(
+            &completed.ledger.status.as_str(),
+            &"completed",
+            "current success status",
+        )?;
+        ensure_equal(
+            &completed.owner_id.as_str(),
+            &"success-owner-second",
+            "success retains owner",
+        )?;
+        ensure_equal(
+            &completed.ledger.imported_session_count,
+            &2,
+            "current success session delta",
+        )?;
+        ensure_equal(
+            &completed.ledger.imported_span_count,
+            &3,
+            "current success span delta",
+        )?;
+
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_import_ledger_mutations_cannot_clobber_owner_aware_attempt() -> TestResult {
+        let connection = DbConnection::open_memory()?;
+        connection.migrate()?;
+        setup_workspace(&connection)?;
+
+        let input = import_ledger_input("cass://ownerless-guard", "running");
+        let current = connection.upsert_running_import_ledger_with_owner(
+            "imp_52234567890123456789012345",
+            &input,
+            "active-owner",
+        )?;
+
+        let updated = connection.update_import_ledger(
+            "imp_52234567890123456789012345",
+            &super::UpdateImportLedgerInput {
+                status: "completed".to_string(),
+                cursor_json: None,
+                imported_session_count: 99,
+                imported_span_count: 99,
+                attempt_count: 99,
+                error_code: None,
+                error_message: None,
+                started_at: None,
+                completed_at: None,
+            },
+        )?;
+        ensure(!updated, "legacy update must not overwrite an active owner")?;
+
+        let completed = connection.complete_import_ledger_attempt(
+            "imp_52234567890123456789012345",
+            &super::CompleteImportLedgerInput {
+                status: "completed".to_string(),
+                cursor_json: None,
+                imported_session_delta: 99,
+                imported_span_delta: 99,
+                error_code: None,
+                error_message: None,
+                completed_at: None,
+            },
+        )?;
+        ensure(
+            !completed,
+            "legacy completion must not overwrite an active owner",
+        )?;
+
+        // The old upsert signature remains callable, but its conflict clause
+        // reports the current row without rotating an owner-aware attempt.
+        let _legacy_view =
+            connection.upsert_running_import_ledger("imp_62234567890123456789012345", &input)?;
+        let after = connection
+            .get_import_ledger_with_owner("imp_52234567890123456789012345")?
+            .ok_or_else(|| TestFailure::new("owner-aware row disappeared"))?;
+        ensure_equal(&after.ledger, &current.ledger, "legacy writes preserve row")?;
+        ensure_equal(
+            &after.owner_id.as_str(),
+            &"active-owner",
+            "legacy writes preserve owner",
+        )?;
+
+        let terminal = connection.complete_import_ledger_attempt_with_owner(
+            "imp_52234567890123456789012345",
+            &super::CompleteImportLedgerInput {
+                status: "completed".to_string(),
+                cursor_json: None,
+                imported_session_delta: 1,
+                imported_span_delta: 1,
+                error_code: None,
+                error_message: None,
+                completed_at: Some("2026-04-29T20:10:00Z".to_string()),
+            },
+            current.ledger.attempt_count,
+            &current.owner_id,
+        )?;
+        ensure(terminal, "owner-aware completion should finish the claim")?;
+
+        let updated_after_completion = connection.update_import_ledger(
+            "imp_52234567890123456789012345",
+            &super::UpdateImportLedgerInput {
+                status: "running".to_string(),
+                cursor_json: None,
+                imported_session_count: 0,
+                imported_span_count: 0,
+                attempt_count: 0,
+                error_code: None,
+                error_message: None,
+                started_at: None,
+                completed_at: None,
+            },
+        )?;
+        ensure(
+            !updated_after_completion,
+            "legacy update must not overwrite a completed owner-aware row",
+        )?;
+        let _legacy_reopen_after_completion =
+            connection.upsert_running_import_ledger("imp_72234567890123456789012345", &input)?;
+        let final_row = connection
+            .get_import_ledger_with_owner("imp_52234567890123456789012345")?
+            .ok_or_else(|| TestFailure::new("completed owner-aware row disappeared"))?;
+        ensure_equal(
+            &final_row.ledger.status.as_str(),
+            &"completed",
+            "legacy upsert preserves completed owner-aware status",
+        )?;
+        ensure_equal(
+            &final_row.owner_id.as_str(),
+            &"active-owner",
+            "legacy upsert preserves completed owner-aware owner",
+        )?;
         connection.close()?;
         Ok(())
     }
@@ -57314,6 +57824,31 @@ mod tests {
             &true,
             "flock acquire-errno is transient",
         )?;
+        // The current progress-aware gate emits these messages when a holder
+        // stays stagnant or the absolute wait budget expires. Keep both
+        // outcomes retryable; otherwise the new fence silently regresses to a
+        // fast failure under cross-process contention.
+        for (message, context) in [
+            (
+                "database write lock holder made no progress for 38000ms: Resource temporarily unavailable",
+                "stagnant holder is transient",
+            ),
+            (
+                "database write lock wait deadline exceeded after 300000ms: Resource temporarily unavailable",
+                "wait deadline is transient",
+            ),
+        ] {
+            let progress_timeout = super::DbError::InvalidPath {
+                operation: super::DbOperation::BeginTransaction,
+                path: lock_path.clone(),
+                message: message.to_string(),
+            };
+            ensure_equal(
+                &super::db_error_is_transient_sqlite_contention(&progress_timeout),
+                &true,
+                context,
+            )?;
+        }
 
         // A genuine OPEN failure (path/permission) is NOT contention; do not retry.
         let open_failure = super::DbError::InvalidPath {
@@ -58465,6 +59000,30 @@ mod tests {
     }
 
     #[test]
+    fn file_write_owner_process_gate_normalizes_relative_and_absolute_paths() -> TestResult {
+        let current_dir =
+            std::env::current_dir().map_err(|error| TestFailure::new(error.to_string()))?;
+        let relative_path = PathBuf::from(format!(
+            "target/ee-write-owner-relative-{}.db",
+            std::process::id()
+        ));
+        let absolute_path = current_dir.join(&relative_path);
+        let relative = DatabaseLocation::File(relative_path.clone());
+        let absolute = DatabaseLocation::File(absolute_path.clone());
+
+        ensure_equal(
+            &file_write_owner_gate_address_for_test(&relative),
+            &file_write_owner_gate_address_for_test(&absolute),
+            "relative and absolute spellings reuse the same process gate",
+        )?;
+        ensure_equal(
+            &super::normalized_write_owner_file_key(&relative_path).with_extension("write.lock"),
+            &super::normalized_write_owner_file_key(&absolute_path).with_extension("write.lock"),
+            "relative and absolute spellings reuse the same cross-process lock path",
+        )
+    }
+
+    #[test]
     fn file_write_owner_depth_allows_same_file_nesting_only() -> TestResult {
         let tempdir = tempfile::tempdir().map_err(|error| TestFailure::new(error.to_string()))?;
         let shard_a = DatabaseLocation::File(tempdir.path().join("shard-a.db"));
@@ -58722,6 +59281,184 @@ mod tests {
         std::fs::remove_dir_all(&test_dir).ok();
 
         ensure_equal(&count, &2i64, "both rows committed atomically")
+    }
+
+    #[test]
+    fn with_write_owner_fence_holds_manual_transaction_across_contender() -> TestResult {
+        let tempdir = tempfile::tempdir().map_err(|error| TestFailure::new(error.to_string()))?;
+        let db_path = tempdir.path().join("manual-fence.db");
+        let setup = DbConnection::open_file(&db_path).map_err(TestFailure::from)?;
+        setup
+            .execute_raw(
+                "CREATE TABLE manual_fence_probe (
+                    id INTEGER PRIMARY KEY,
+                    value TEXT NOT NULL
+                )",
+            )
+            .map_err(TestFailure::from)?;
+        setup.close().map_err(TestFailure::from)?;
+
+        // Open both handles before entering the owner fence. The contender must
+        // remain blocked by the fence even though it already has a live handle.
+        let manual = DbConnection::open_file(&db_path).map_err(TestFailure::from)?;
+        let contender = DbConnection::open_file(&db_path).map_err(TestFailure::from)?;
+        let (manual_entered_tx, manual_entered_rx) = mpsc::channel();
+        let (contender_attempt_tx, contender_attempt_rx) = mpsc::channel();
+        let (contender_finished_tx, contender_finished_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let manual_thread = thread::spawn(move || -> std::result::Result<(), String> {
+            manual.with_write_owner_fence(
+                |error| error.to_string(),
+                || {
+                    manual.begin().map_err(|error| error.to_string())?;
+                    manual_entered_tx
+                        .send(())
+                        .map_err(|error| format!("announce manual transaction: {error}"))?;
+                    release_rx
+                        .recv()
+                        .map_err(|error| format!("await manual transaction release: {error}"))?;
+                    manual.rollback().map_err(|error| error.to_string())
+                },
+            )?;
+            manual.close().map_err(|error| error.to_string())
+        });
+        let contender_thread = thread::spawn(move || -> std::result::Result<(), String> {
+            contender_attempt_tx
+                .send(())
+                .map_err(|error| format!("announce contender attempt: {error}"))?;
+            contender
+                .execute_raw("INSERT INTO manual_fence_probe (id, value) VALUES (1, 'contender')")
+                .map_err(|error| error.to_string())?;
+            contender_finished_tx
+                .send(())
+                .map_err(|error| format!("announce contender completion: {error}"))?;
+            contender.close().map_err(|error| error.to_string())
+        });
+
+        manual_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| {
+                TestFailure::new(format!("manual transaction did not start: {error}"))
+            })?;
+        contender_attempt_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| TestFailure::new(format!("contender did not start: {error}")))?;
+        ensure(
+            contender_finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "preopened contender must remain fenced while manual transaction is active",
+        )?;
+
+        release_tx
+            .send(())
+            .map_err(|error| TestFailure::new(format!("release manual transaction: {error}")))?;
+        manual_thread
+            .join()
+            .map_err(|_| TestFailure::new("manual transaction thread panicked"))?
+            .map_err(TestFailure::new)?;
+        contender_thread
+            .join()
+            .map_err(|_| TestFailure::new("contender thread panicked"))?
+            .map_err(TestFailure::new)?;
+
+        let verify = DbConnection::open_file(&db_path).map_err(TestFailure::from)?;
+        let rows = verify
+            .query("SELECT COUNT(*) FROM manual_fence_probe", &[])
+            .map_err(TestFailure::from)?;
+        let count = rows
+            .first()
+            .and_then(|row| row.get(0))
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0);
+        verify.close().map_err(TestFailure::from)?;
+
+        ensure_equal(
+            &count,
+            &1i64,
+            "contender write commits after the retained manual transaction releases",
+        )
+    }
+
+    #[test]
+    fn close_holds_write_owner_through_wal_checkpoint_with_preopened_contender() -> TestResult {
+        let tempdir = tempfile::tempdir().map_err(|error| TestFailure::new(error.to_string()))?;
+        let db_path = tempdir.path().join("close-fence.db");
+        let setup = DbConnection::open_file(&db_path).map_err(TestFailure::from)?;
+        setup
+            .execute_raw(
+                "CREATE TABLE close_fence_probe (
+                    id INTEGER PRIMARY KEY,
+                    value TEXT NOT NULL
+                )",
+            )
+            .map_err(TestFailure::from)?;
+        setup
+            .execute_raw(
+                "INSERT INTO close_fence_probe (id, value) VALUES (1, \"checkpoint-holder\")",
+            )
+            .map_err(TestFailure::from)?;
+        setup.close().map_err(TestFailure::from)?;
+
+        // Both handles are live before the holder enters its fence. The
+        // contender close includes FrankenSQLite WAL teardown/checkpoint and
+        // must wait for the same owner fence as ordinary writes.
+        let holder = DbConnection::open_file(&db_path).map_err(TestFailure::from)?;
+        let contender = DbConnection::open_file(&db_path).map_err(TestFailure::from)?;
+        let (holder_entered_tx, holder_entered_rx) = mpsc::channel();
+        let (contender_attempt_tx, contender_attempt_rx) = mpsc::channel();
+        let (contender_finished_tx, contender_finished_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let holder_thread = thread::spawn(move || -> std::result::Result<(), String> {
+            holder.with_write_owner_fence(
+                |error| error.to_string(),
+                || {
+                    holder_entered_tx
+                        .send(())
+                        .map_err(|error| format!("announce holder fence: {error}"))?;
+                    release_rx
+                        .recv()
+                        .map_err(|error| format!("await holder release: {error}"))
+                },
+            )?;
+            holder.close().map_err(|error| error.to_string())
+        });
+        let contender_thread = thread::spawn(move || -> std::result::Result<(), String> {
+            contender_attempt_tx
+                .send(())
+                .map_err(|error| format!("announce contender close: {error}"))?;
+            contender.close().map_err(|error| error.to_string())?;
+            contender_finished_tx
+                .send(())
+                .map_err(|error| format!("announce contender close completion: {error}"))
+        });
+
+        holder_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| TestFailure::new(format!("holder fence did not start: {error}")))?;
+        contender_attempt_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| TestFailure::new(format!("contender close did not start: {error}")))?;
+        ensure(
+            contender_finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "preopened contender close must remain fenced while holder owns the database",
+        )?;
+
+        release_tx
+            .send(())
+            .map_err(|error| TestFailure::new(format!("release holder fence: {error}")))?;
+        holder_thread
+            .join()
+            .map_err(|_| TestFailure::new("holder thread panicked"))?
+            .map_err(TestFailure::from)?;
+        contender_thread
+            .join()
+            .map_err(|_| TestFailure::new("contender close thread panicked"))?
+            .map_err(TestFailure::from)
     }
 
     #[test]

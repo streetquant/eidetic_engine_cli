@@ -14,7 +14,6 @@ use std::time::Duration;
 use blake3;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Value as JsonValue, json};
-use sqlmodel_core::IsolationLevel;
 use uuid::Uuid;
 
 use super::process::{CASS_STDOUT_LINE_MAX_BYTES, CassStreamError};
@@ -25,7 +24,7 @@ use super::{
 use crate::db::{
     CompleteImportLedgerInput, CreateAuditInput, CreateEvidenceSpanInput, CreateImportLedgerInput,
     CreateSearchIndexJobInput, CreateSessionInput, DatabaseConfig, DbConnection, DbError,
-    DbOperation, EvidenceProducerKind, SearchIndexJobType,
+    DbOperation, EvidenceProducerKind, SearchIndexJobType, StoredImportLedgerWithOwner,
 };
 use crate::models::{
     AuditId, CASS_EVIDENCE_SPAN_SCHEMA_V1, CASS_SESSION_SCHEMA_V1, EvidenceId,
@@ -685,56 +684,35 @@ pub fn import_cass_sessions(
     ensure_database_parent(&database_path)?;
     let connection = DbConnection::open(DatabaseConfig::file(database_path.clone()))?;
     connection.migrate()?;
-    let workspace_id = ensure_workspace(&connection, &workspace_path)?;
-    let ledger_id = ensure_running_ledger(&connection, &workspace_id, &source_id)?;
+    // Keep the ledger owner lease across discovery persistence, session/span side effects,
+    // and the terminal CAS. A second importer can then wait for the first
+    // owner to finish, observe its committed session, and contribute a zero
+    // delta without making the ledger counters diverge from stored rows.
+    connection.with_write_owner_fence(CassImportError::Storage, || {
+        let workspace_id = ensure_workspace(&connection, &workspace_path)?;
+        let ledger = ensure_running_ledger(&connection, &workspace_id, &source_id)?;
+        let ledger_id = ledger.ledger.id.clone();
+        let expected_attempt_count = ledger.ledger.attempt_count;
+        let expected_owner_id = ledger.owner_id.clone();
+        let discovered_sessions = sessions.clone();
 
-    let mut cursor = ImportCursor::new();
-    let mut session_reports = Vec::with_capacity(sessions.len());
-    let mut imported = 0_u32;
-    let mut skipped = 0_u32;
-    let mut spans_imported = 0_u32;
-    let mut index_jobs_queued = 0_u32;
+        let mut cursor = ImportCursor::new();
+        let mut session_reports = Vec::with_capacity(sessions.len());
+        let mut imported = 0_u32;
+        let mut skipped = 0_u32;
+        let mut spans_imported = 0_u32;
+        let mut index_jobs_queued = 0_u32;
 
-    let import_result: Result<(), CassImportError> = (|| {
-        for session in sessions {
-            cursor.record_discovered();
-            if let Some(existing) =
-                connection.get_session_by_cass_id(&workspace_id, &session.source_path)?
-            {
-                let index_job_id = existing_session_index_job_for_reconciliation(
-                    &connection,
-                    &workspace_id,
-                    &existing.id,
-                )?;
-                if index_job_id.is_some() {
-                    index_jobs_queued = index_jobs_queued.saturating_add(1);
-                }
-                cursor.record_skipped();
-                skipped = skipped.saturating_add(1);
-                session_reports.push(ImportedCassSession {
-                    source_path: session.source_path,
-                    session_id: Some(existing.id),
-                    index_job_id,
-                    status: ImportSessionStatus::Skipped,
-                    spans_imported: 0,
-                    message_count: session.message_count,
-                    missing_metadata: session.missing_metadata,
-                });
-                continue;
-            }
-
-            let spans = if options.include_spans {
-                view_session_spans(client, &session.source_path)?
-            } else {
-                Vec::new()
-            };
-
-            match persist_session_import_if_absent(&connection, &workspace_id, &session, &spans)? {
-                SessionImportPersistResult::Skipped { session_id } => {
+        let import_result: Result<(), CassImportError> = (|| {
+            for session in sessions {
+                cursor.record_discovered();
+                if let Some(existing) =
+                    connection.get_session_by_cass_id(&workspace_id, &session.source_path)?
+                {
                     let index_job_id = existing_session_index_job_for_reconciliation(
                         &connection,
                         &workspace_id,
-                        &session_id,
+                        &existing.id,
                     )?;
                     if index_job_id.is_some() {
                         index_jobs_queued = index_jobs_queued.saturating_add(1);
@@ -743,7 +721,7 @@ pub fn import_cass_sessions(
                     skipped = skipped.saturating_add(1);
                     session_reports.push(ImportedCassSession {
                         source_path: session.source_path,
-                        session_id: Some(session_id),
+                        session_id: Some(existing.id),
                         index_job_id,
                         status: ImportSessionStatus::Skipped,
                         spans_imported: 0,
@@ -752,71 +730,116 @@ pub fn import_cass_sessions(
                     });
                     continue;
                 }
-                SessionImportPersistResult::Imported {
-                    session_id,
-                    index_job_id,
-                } => {
-                    for span in &spans {
-                        cursor.record_span(&session.source_path, span.end_line);
-                    }
-                    let session_spans = saturating_len(spans.len());
-                    spans_imported = spans_imported.saturating_add(session_spans);
 
-                    cursor.record_imported(&session.source_path);
-                    imported = imported.saturating_add(1);
-                    index_jobs_queued = index_jobs_queued.saturating_add(1);
-                    session_reports.push(ImportedCassSession {
-                        source_path: session.source_path,
-                        session_id: Some(session_id),
-                        index_job_id: Some(index_job_id),
-                        status: ImportSessionStatus::Imported,
-                        spans_imported: session_spans,
-                        message_count: session.message_count,
-                        missing_metadata: session.missing_metadata,
-                    });
+                let spans = if options.include_spans {
+                    view_session_spans(client, &session.source_path)?
+                } else {
+                    Vec::new()
+                };
+
+                match persist_session_import_if_absent(
+                    &connection,
+                    &workspace_id,
+                    &session,
+                    &spans,
+                )? {
+                    SessionImportPersistResult::Skipped { session_id } => {
+                        let index_job_id = existing_session_index_job_for_reconciliation(
+                            &connection,
+                            &workspace_id,
+                            &session_id,
+                        )?;
+                        if index_job_id.is_some() {
+                            index_jobs_queued = index_jobs_queued.saturating_add(1);
+                        }
+                        cursor.record_skipped();
+                        skipped = skipped.saturating_add(1);
+                        session_reports.push(ImportedCassSession {
+                            source_path: session.source_path,
+                            session_id: Some(session_id),
+                            index_job_id,
+                            status: ImportSessionStatus::Skipped,
+                            spans_imported: 0,
+                            message_count: session.message_count,
+                            missing_metadata: session.missing_metadata,
+                        });
+                        continue;
+                    }
+                    SessionImportPersistResult::Imported {
+                        session_id,
+                        index_job_id,
+                    } => {
+                        for span in &spans {
+                            cursor.record_span(&session.source_path, span.end_line);
+                        }
+                        let session_spans = saturating_len(spans.len());
+                        spans_imported = spans_imported.saturating_add(session_spans);
+
+                        cursor.record_imported(&session.source_path);
+                        imported = imported.saturating_add(1);
+                        index_jobs_queued = index_jobs_queued.saturating_add(1);
+                        session_reports.push(ImportedCassSession {
+                            source_path: session.source_path,
+                            session_id: Some(session_id),
+                            index_job_id: Some(index_job_id),
+                            status: ImportSessionStatus::Imported,
+                            spans_imported: session_spans,
+                            message_count: session.message_count,
+                            missing_metadata: session.missing_metadata,
+                        });
+                    }
                 }
             }
-        }
-        Ok(())
-    })();
+            Ok(())
+        })();
 
-    if let Err(error) = import_result {
+        if let Err(error) = import_result {
+            complete_ledger(
+                &connection,
+                &ledger_id,
+                expected_attempt_count,
+                &expected_owner_id,
+                &cursor,
+                imported,
+                spans_imported,
+                &discovered_sessions,
+                Some(&error),
+            )?;
+            return Err(error);
+        }
+
         complete_ledger(
             &connection,
             &ledger_id,
+            expected_attempt_count,
+            &expected_owner_id,
             &cursor,
             imported,
             spans_imported,
-            Some(&error),
+            &discovered_sessions,
+            None,
         )?;
-        return Err(error);
-    }
 
-    complete_ledger(
-        &connection,
-        &ledger_id,
-        &cursor,
-        imported,
-        spans_imported,
-        None,
-    )?;
-
-    Ok(CassImportReport {
-        schema: IMPORT_CASS_SCHEMA_V1,
-        workspace_path: workspace_path.to_string_lossy().into_owned(),
-        database_path: Some(database_path.to_string_lossy().into_owned()),
-        source_id,
-        ledger_id: Some(ledger_id),
-        dry_run: false,
-        since: since_cutoff,
-        sessions_discovered: cursor.sessions_discovered,
-        sessions_imported: imported,
-        sessions_skipped: skipped,
-        spans_imported,
-        index_jobs_queued,
-        index_required_action: Some(index_required_action(&workspace_path, Some(&database_path))),
-        status: "completed".to_string(),
-        sessions: session_reports,
+        Ok(CassImportReport {
+            schema: IMPORT_CASS_SCHEMA_V1,
+            workspace_path: workspace_path.to_string_lossy().into_owned(),
+            database_path: Some(database_path.to_string_lossy().into_owned()),
+            source_id,
+            ledger_id: Some(ledger_id),
+            dry_run: false,
+            since: since_cutoff,
+            sessions_discovered: cursor.sessions_discovered,
+            sessions_imported: imported,
+            sessions_skipped: skipped,
+            spans_imported,
+            index_jobs_queued,
+            index_required_action: Some(index_required_action(
+                &workspace_path,
+                Some(&database_path),
+            )),
+            status: "completed".to_string(),
+            sessions: session_reports,
+        })
     })
 }
 
@@ -882,79 +905,8 @@ fn with_import_session_transaction<T>(
     let mut last_retryable_error = None;
 
     for attempt in 0..MAX_ATTEMPTS {
-        begin_import_session_transaction(connection)?;
-        match operation() {
-            Ok(result) => match connection.commit() {
-                Ok(()) => return Ok(result),
-                Err(error) if import_session_transaction_error_is_retryable(&error) => {
-                    if let Err(rollback_error) = connection.rollback() {
-                        tracing::error!(
-                            phase = "cass_import_commit_retryable",
-                            error = %error,
-                            rollback_error = %rollback_error,
-                            "failed to rollback import session transaction after commit failure"
-                        );
-                    }
-                    last_retryable_error = Some(error);
-                }
-                Err(error) => {
-                    if let Err(rollback_error) = connection.rollback() {
-                        tracing::error!(
-                            phase = "cass_import_commit",
-                            error = %error,
-                            rollback_error = %rollback_error,
-                            "failed to rollback import session transaction after commit failure"
-                        );
-                    }
-                    return Err(error);
-                }
-            },
-            Err(error) if import_session_transaction_error_is_retryable(&error) => {
-                if let Err(rollback_error) = connection.rollback() {
-                    tracing::error!(
-                        phase = "cass_import_operation_retryable",
-                        error = %error,
-                        rollback_error = %rollback_error,
-                        "failed to rollback import session transaction after operation failure"
-                    );
-                }
-                last_retryable_error = Some(error);
-            }
-            Err(error) => {
-                if let Err(rollback_error) = connection.rollback() {
-                    tracing::error!(
-                        phase = "cass_import_operation",
-                        error = %error,
-                        rollback_error = %rollback_error,
-                        "failed to rollback import session transaction after operation failure"
-                    );
-                }
-                return Err(error);
-            }
-        }
-
-        if attempt + 1 < MAX_ATTEMPTS {
-            std::thread::sleep(import_session_transaction_retry_delay(attempt));
-        }
-    }
-
-    match last_retryable_error {
-        Some(error) => Err(error),
-        None => Err(DbError::MalformedRow {
-            operation: DbOperation::CommitTransaction,
-            message: "import session transaction retry loop exhausted without a retryable error"
-                .to_string(),
-        }),
-    }
-}
-
-fn begin_import_session_transaction(connection: &DbConnection) -> Result<(), DbError> {
-    const MAX_ATTEMPTS: usize = 16;
-    let mut last_retryable_error = None;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        match connection.begin_transaction(IsolationLevel::RepeatableRead) {
-            Ok(()) => return Ok(()),
+        match connection.with_transaction(|| operation()) {
+            Ok(result) => return Ok(result),
             Err(error) if import_session_transaction_error_is_retryable(&error) => {
                 last_retryable_error = Some(error);
                 if attempt + 1 < MAX_ATTEMPTS {
@@ -967,7 +919,11 @@ fn begin_import_session_transaction(connection: &DbConnection) -> Result<(), DbE
 
     match last_retryable_error {
         Some(error) => Err(error),
-        None => connection.begin_transaction(IsolationLevel::RepeatableRead),
+        None => Err(DbError::MalformedRow {
+            operation: DbOperation::CommitTransaction,
+            message: "import session transaction retry loop exhausted without a retryable error"
+                .to_string(),
+        }),
     }
 }
 
@@ -1891,10 +1847,11 @@ fn ensure_running_ledger(
     connection: &DbConnection,
     workspace_id: &str,
     source_id: &str,
-) -> Result<String, DbError> {
+) -> Result<StoredImportLedgerWithOwner, DbError> {
     let now = Utc::now().to_rfc3339();
     let id = stable_import_id(source_id);
-    let ledger = connection.upsert_running_import_ledger(
+    let owner_id = Uuid::now_v7().simple().to_string();
+    connection.upsert_running_import_ledger_with_owner(
         &id,
         &CreateImportLedgerInput {
             workspace_id: workspace_id.to_string(),
@@ -1911,37 +1868,105 @@ fn ensure_running_ledger(
             completed_at: None,
             metadata_json: Some(json!({"schema": IMPORT_LEDGER_CASS_SCHEMA_V1}).to_string()),
         },
-    )?;
-    Ok(ledger.id)
+        &owner_id,
+    )
 }
 
 fn complete_ledger(
     connection: &DbConnection,
     ledger_id: &str,
+    expected_attempt_count: u32,
+    expected_owner_id: &str,
     cursor: &ImportCursor,
     imported_sessions: u32,
     imported_spans: u32,
+    discovered_sessions: &[CassSessionInfo],
     error: Option<&CassImportError>,
-) -> Result<(), DbError> {
+) -> Result<(), CassImportError> {
+    let current = connection
+        .get_import_ledger_with_owner(ledger_id)?
+        .ok_or_else(|| ledger_attempt_lost_error(ledger_id, expected_attempt_count))?;
+    if current.ledger.status != "running"
+        || current.ledger.attempt_count != expected_attempt_count
+        || current.owner_id != expected_owner_id
+    {
+        return Err(ledger_attempt_lost_error(ledger_id, expected_attempt_count));
+    }
+
+    // A session transaction can commit before a process dies before this
+    // terminal CAS. Reconcile durable rows before adding this attempt's
+    // deltas, so a retry repairs counters without replaying side effects.
+    let (durable_sessions, durable_spans) = durable_import_counts(
+        connection,
+        &current.ledger.workspace_id,
+        discovered_sessions,
+    )?;
+    let missing_sessions = durable_sessions.saturating_sub(current.ledger.imported_session_count);
+    let missing_spans = durable_spans.saturating_sub(current.ledger.imported_span_count);
+    let session_delta = imported_sessions.max(missing_sessions);
+    let span_delta = imported_spans.max(missing_spans);
+
     let status = if error.is_some() {
         "failed"
     } else {
         "completed"
     };
     let now = Utc::now().to_rfc3339();
-    let _ = connection.complete_import_ledger_attempt(
+    let applied = connection.complete_import_ledger_attempt_with_owner(
         ledger_id,
         &CompleteImportLedgerInput {
             status: status.to_string(),
             cursor_json: Some(import_cursor_json(cursor, error).to_string()),
-            imported_session_delta: imported_sessions,
-            imported_span_delta: imported_spans,
+            imported_session_delta: session_delta,
+            imported_span_delta: span_delta,
             error_code: error.map(|err| error_code(err).to_string()),
             error_message: error.map(ToString::to_string),
             completed_at: Some(now),
         },
+        expected_attempt_count,
+        expected_owner_id,
     )?;
-    Ok(())
+    if applied {
+        Ok(())
+    } else {
+        Err(ledger_attempt_lost_error(ledger_id, expected_attempt_count))
+    }
+}
+
+fn durable_import_counts(
+    connection: &DbConnection,
+    workspace_id: &str,
+    discovered_sessions: &[CassSessionInfo],
+) -> Result<(u32, u32), CassImportError> {
+    let mut seen_source_paths = BTreeSet::new();
+    let mut session_count = 0_u32;
+    let mut span_count = 0_u32;
+    for session in discovered_sessions {
+        if !seen_source_paths.insert(session.source_path.clone()) {
+            continue;
+        }
+        let Some(existing) =
+            connection.get_session_by_cass_id(workspace_id, &session.source_path)?
+        else {
+            continue;
+        };
+        session_count = session_count.saturating_add(1);
+        span_count = span_count.saturating_add(saturating_len(
+            connection
+                .list_evidence_spans_for_session(&existing.id)?
+                .len(),
+        ));
+    }
+    Ok((session_count, span_count))
+}
+
+fn ledger_attempt_lost_error(ledger_id: &str, expected_attempt_count: u32) -> CassImportError {
+    CassImportError::Storage(DbError::MalformedRow {
+        operation: DbOperation::CommitTransaction,
+        message: format!(
+            "CASS import ledger {ledger_id} completion lost its owner/attempt lease at attempt {expected_attempt_count}; retry the import"
+        ),
+    })
 }
 
 fn import_cursor_json(cursor: &ImportCursor, error: Option<&CassImportError>) -> JsonValue {
@@ -2707,6 +2732,216 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn cass_completion_rejects_missing_forged_and_cross_workspace_owners() -> TestResult {
+        let root = unique_test_dir("cass-ledger-owner-fence")?;
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        fs::create_dir_all(&workspace_a).map_err(|error| error.to_string())?;
+        fs::create_dir_all(&workspace_b).map_err(|error| error.to_string())?;
+        let database = root.join("ee.db");
+        let connection = DbConnection::open_file(&database).map_err(|error| error.to_string())?;
+        connection.migrate().map_err(|error| error.to_string())?;
+
+        let workspace_a_id =
+            ensure_workspace(&connection, &workspace_a).map_err(|error| error.to_string())?;
+        let workspace_b_id =
+            ensure_workspace(&connection, &workspace_b).map_err(|error| error.to_string())?;
+        let first = ensure_running_ledger(&connection, &workspace_a_id, "cass://workspace-a")
+            .map_err(|error| error.to_string())?;
+        let current = ensure_running_ledger(&connection, &workspace_a_id, "cass://workspace-a")
+            .map_err(|error| error.to_string())?;
+        let foreign = ensure_running_ledger(&connection, &workspace_b_id, "cass://workspace-b")
+            .map_err(|error| error.to_string())?;
+        ensure_equal(
+            &current.ledger.attempt_count,
+            &2,
+            "reopen increments the attempt before completion",
+        )?;
+        ensure(
+            current.owner_id != first.owner_id,
+            "reopen must issue a fresh owner token",
+        )?;
+
+        let cursor = ImportCursor::new();
+        let stale = complete_ledger(
+            &connection,
+            &first.ledger.id,
+            first.ledger.attempt_count,
+            &first.owner_id,
+            &cursor,
+            1,
+            2,
+            &[],
+            None,
+        )
+        .expect_err("stale owner/attempt must be surfaced to the CASS caller");
+        ensure(
+            matches!(
+                stale,
+                CassImportError::Storage(DbError::MalformedRow {
+                    operation: DbOperation::CommitTransaction,
+                    ..
+                })
+            ),
+            format!("stale completion must map to storage: {stale:?}"),
+        )?;
+
+        let still_running = connection
+            .get_import_ledger_with_owner(&current.ledger.id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "current ledger row disappeared after stale completion".to_string())?;
+        ensure_equal(
+            &still_running.ledger.status.as_str(),
+            &"running",
+            "stale completion leaves current attempt running",
+        )?;
+        ensure_equal(
+            &still_running.owner_id,
+            &current.owner_id,
+            "stale completion preserves current owner",
+        )?;
+        ensure_equal(
+            &still_running.ledger.attempt_count,
+            &current.ledger.attempt_count,
+            "stale completion preserves current attempt",
+        )?;
+
+        let missing_owner = complete_ledger(
+            &connection,
+            &current.ledger.id,
+            current.ledger.attempt_count,
+            "",
+            &cursor,
+            3,
+            4,
+            &[],
+            None,
+        )
+        .expect_err("missing owner must not authorize completion");
+        ensure(
+            matches!(missing_owner, CassImportError::Storage(_)),
+            format!("missing owner must return an explicit lease error: {missing_owner:?}"),
+        )?;
+
+        let foreign_owner = complete_ledger(
+            &connection,
+            &current.ledger.id,
+            current.ledger.attempt_count,
+            &foreign.owner_id,
+            &cursor,
+            5,
+            6,
+            &[],
+            None,
+        )
+        .expect_err("a workspace B owner must not complete workspace A");
+        ensure(
+            matches!(foreign_owner, CassImportError::Storage(_)),
+            format!("foreign owner must return an explicit lease error: {foreign_owner:?}"),
+        )?;
+
+        let wrong_ledger = complete_ledger(
+            &connection,
+            &foreign.ledger.id,
+            foreign.ledger.attempt_count,
+            &current.owner_id,
+            &cursor,
+            7,
+            8,
+            &[],
+            None,
+        )
+        .expect_err("an owner token must not complete a different ledger identity");
+        ensure(
+            matches!(wrong_ledger, CassImportError::Storage(_)),
+            format!("wrong ledger identity must return an explicit lease error: {wrong_ledger:?}"),
+        )?;
+
+        complete_ledger(
+            &connection,
+            &current.ledger.id,
+            current.ledger.attempt_count,
+            &current.owner_id,
+            &cursor,
+            9,
+            10,
+            &[],
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let completed = connection
+            .get_import_ledger_with_owner(&current.ledger.id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "completed ledger row disappeared".to_string())?;
+        ensure_equal(
+            &completed.ledger.status.as_str(),
+            &"completed",
+            "current owner can complete its lease",
+        )?;
+        connection.close().map_err(|error| error.to_string())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn cass_completion_reconciles_durable_rows_after_session_commit() -> TestResult {
+        let root = unique_test_dir("cass-ledger-reconcile")?;
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
+        let database = root.join("ee.db");
+        let connection = DbConnection::open_file(&database).map_err(|error| error.to_string())?;
+        connection.migrate().map_err(|error| error.to_string())?;
+        let workspace_id =
+            ensure_workspace(&connection, &workspace).map_err(|error| error.to_string())?;
+        let session = CassSessionInfo::new(workspace.join("session.jsonl").display().to_string());
+        let span = CassViewSpanForImport {
+            cass_span_id: "cass-span-reconcile".to_owned(),
+            span_kind: CassSpanKind::Message,
+            start_line: 1,
+            end_line: 1,
+            role: None,
+            excerpt: "durable side effect".to_owned(),
+            content_hash: format!("blake3:{}", blake3_hex("durable side effect")),
+            redacted: false,
+            redacted_reasons: Vec::new(),
+        };
+        let ledger = ensure_running_ledger(&connection, &workspace_id, "cass://reconcile")
+            .map_err(|error| error.to_string())?;
+
+        // Model a crash after the per-session transaction commits but before
+        // the first attempt reaches its terminal ledger CAS.
+        persist_session_import_if_absent(&connection, &workspace_id, &session, &[span])
+            .map_err(|error| error.to_string())?;
+        let cursor = ImportCursor::new();
+        complete_ledger(
+            &connection,
+            &ledger.ledger.id,
+            ledger.ledger.attempt_count,
+            &ledger.owner_id,
+            &cursor,
+            0,
+            0,
+            &[session],
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let completed = connection
+            .get_import_ledger(&ledger.ledger.id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "reconciled ledger row disappeared".to_owned())?;
+        ensure_equal(
+            &completed.imported_session_count,
+            &1,
+            "durable session is reconciled into ledger count",
+        )?;
+        ensure_equal(
+            &completed.imported_span_count,
+            &1,
+            "durable span is reconciled into ledger count",
+        )?;
+        connection.close().map_err(|error| error.to_string())
+    }
+
     type TestResultWith<T> = Result<T, String>;
 
     #[cfg(unix)]
