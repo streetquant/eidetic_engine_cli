@@ -2001,6 +2001,7 @@ pub async fn process_index_jobs_with_cx(
 /// steward's `index_coalesce` job. Dry-run reports remain selection-only and
 /// retain ordinary per-job planning labels; they do not claim that a coalesced
 /// snapshot was built, and they neither claim nor publish any job.
+#[cfg(test)]
 pub(crate) fn process_index_jobs_coalesced(
     options: &IndexProcessingOptions,
 ) -> Result<IndexProcessingReport, IndexRebuildError> {
@@ -2057,7 +2058,17 @@ async fn process_index_jobs_with_drain(
     let (effective_job_limit, _job_limit_capped) =
         runtime_profile.cap_index_job_limit(options.job_limit);
 
-    let db = DbConnection::open_file(&database_path)?;
+    // A dry-run is the steward's read-only preflight. Opening it through the
+    // read-write path takes the database owner flock, whose bounded wait is
+    // intentionally sized for durable writers and can consume the complete
+    // preflight budget while another writer is active. Keep the durable path
+    // on the write-owner gate, but let read-only preflight inspect the WAL
+    // without waiting for that gate.
+    let db = if options.dry_run {
+        DbConnection::open_file_read_only(&database_path)?
+    } else {
+        DbConnection::open_file(&database_path)?
+    };
     let workspace_id = resolve_index_workspace_id(&db, &options.workspace_path)?;
     if !options.dry_run {
         requeue_cancelled_search_index_jobs(&db, &workspace_id)?;
@@ -7675,6 +7686,74 @@ pub struct IndexStatusReport {
     pub elapsed_ms: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SearchIndexJobLedgerSummary {
+    pending: u32,
+    running: u32,
+    unknown: u32,
+}
+
+impl SearchIndexJobLedgerSummary {
+    fn from_jobs(jobs: &[StoredSearchIndexJob]) -> Self {
+        let mut summary = Self::default();
+        for job in jobs {
+            match job.status_enum() {
+                Some(SearchIndexJobStatus::Pending) => {
+                    summary.pending = summary.pending.saturating_add(1);
+                }
+                Some(SearchIndexJobStatus::Running) => {
+                    summary.running = summary.running.saturating_add(1);
+                }
+                Some(
+                    SearchIndexJobStatus::Completed
+                    | SearchIndexJobStatus::Failed
+                    | SearchIndexJobStatus::Cancelled,
+                ) => {}
+                None => {
+                    summary.unknown = summary.unknown.saturating_add(1);
+                }
+            }
+        }
+        summary
+    }
+
+    fn requires_attention(self) -> bool {
+        self.pending > 0 || self.running > 0 || self.unknown > 0
+    }
+
+    fn diagnostic(self) -> Option<String> {
+        self.requires_attention().then(|| {
+            format!(
+                "search-index job ledger requires attention: pending={}, running={}, unknown={}",
+                self.pending, self.running, self.unknown
+            )
+        })
+    }
+}
+
+fn search_index_job_ledger(
+    db: &DbConnection,
+    workspace_id: &str,
+) -> Result<SearchIndexJobLedgerSummary, DbError> {
+    Ok(SearchIndexJobLedgerSummary::from_jobs(
+        &db.list_search_index_jobs(workspace_id, None)?,
+    ))
+}
+
+fn combine_index_status_diagnostics(
+    metadata_error: Option<String>,
+    ledger: SearchIndexJobLedgerSummary,
+) -> Option<String> {
+    match (metadata_error, ledger.diagnostic()) {
+        (Some(metadata_error), Some(ledger_error)) => {
+            Some(format!("{metadata_error}; {ledger_error}"))
+        }
+        (Some(metadata_error), None) => Some(metadata_error),
+        (None, Some(ledger_error)) => Some(ledger_error),
+        (None, None) => None,
+    }
+}
+
 impl IndexStatusReport {
     #[must_use]
     pub fn human_summary(&self) -> String {
@@ -7735,7 +7814,12 @@ impl IndexStatusReport {
         }
 
         if let Some(ref error) = self.last_check_error {
-            output.push_str(&format!("  Last check error: {error}\n"));
+            let label = if error.contains("search-index job ledger") {
+                "Search-index job ledger"
+            } else {
+                "Last check error"
+            };
+            output.push_str(&format!("  {label}: {error}\n"));
         }
 
         output.push_str(&format!("  Elapsed: {:.1}ms\n", self.elapsed_ms));
@@ -7796,7 +7880,15 @@ impl IndexStatusReport {
             IndexHealth::Stale => Some(IndexStatusDegradation {
                 code: "index_stale",
                 severity: "high",
-                message: "Search index is stale.",
+                message: if self
+                    .last_check_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("search-index job ledger"))
+                {
+                    "Search-index job ledger has active or unknown jobs."
+                } else {
+                    "Search index is stale."
+                },
                 repair,
             }),
             IndexHealth::Missing => Some(IndexStatusDegradation {
@@ -7913,53 +8005,67 @@ fn get_index_status_with_connection_mode(
     // Check index directory
     let (index_exists, index_file_count, index_size_bytes) = inspect_index_dir(&index_dir)?;
 
-    let (db_document_counts, evidence_admission, db_generation, embedding) = if database_path
-        .exists()
-    {
-        let owned_connection;
-        let db = if let Some(connection) = connection {
-            connection
-        } else {
-            owned_connection = DbConnection::open_file(&database_path)?;
-            &owned_connection
-        };
-        if let Some(workspace_id) = workspace_id_for_index_status(db, &options.workspace_path)? {
-            let (counts, admission, generation) =
-                get_db_stats(db, &workspace_id, caller_holds_snapshot)?;
-            let embedding = Some(embedding_posture_for_document_count(
-                db,
-                &workspace_id,
-                &index_dir,
-                counts.total(),
-            )?);
-            (counts, admission, generation, embedding)
+    let (db_document_counts, evidence_admission, db_generation, embedding, search_index_job_ledger) =
+        if database_path.exists() {
+            let owned_connection;
+            let db = if let Some(connection) = connection {
+                connection
+            } else {
+                owned_connection = DbConnection::open_file(&database_path)?;
+                &owned_connection
+            };
+            if let Some(workspace_id) = workspace_id_for_index_status(db, &options.workspace_path)?
+            {
+                let (counts, admission, generation) =
+                    get_db_stats(db, &workspace_id, caller_holds_snapshot)?;
+                let embedding = Some(embedding_posture_for_document_count(
+                    db,
+                    &workspace_id,
+                    &index_dir,
+                    counts.total(),
+                )?);
+                let search_index_job_ledger = search_index_job_ledger(db, &workspace_id)?;
+                (
+                    counts,
+                    admission,
+                    generation,
+                    embedding,
+                    search_index_job_ledger,
+                )
+            } else {
+                (
+                    IndexDocumentCounts::default(),
+                    EvidenceAdmissionReport::default(),
+                    None,
+                    None,
+                    SearchIndexJobLedgerSummary::default(),
+                )
+            }
         } else {
             (
                 IndexDocumentCounts::default(),
                 EvidenceAdmissionReport::default(),
                 None,
                 None,
+                SearchIndexJobLedgerSummary::default(),
             )
-        }
-    } else {
-        (
-            IndexDocumentCounts::default(),
-            EvidenceAdmissionReport::default(),
-            None,
-            None,
-        )
-    };
+        };
     let evidence_totals = EvidenceAdmissionTotals::from_report(&evidence_admission);
 
     // Read index metadata if available.
     let metadata_status = read_index_metadata(&index_dir);
-    let last_check_error = metadata_status
+    let metadata_error = metadata_status
         .corruption_error
         .clone()
         .or_else(|| metadata_status.compatibility_error.clone());
+    let last_check_error =
+        combine_index_status_diagnostics(metadata_error, search_index_job_ledger);
 
-    // Determine health
-    let health = determine_health(
+    // Determine health. Generation parity alone is insufficient while an
+    // active or unknown durable ledger row remains: the derived index may be
+    // current for the last publication while work is still pending or owned
+    // by another worker.
+    let metadata_health = determine_health(
         index_exists,
         index_file_count,
         db_generation,
@@ -7968,13 +8074,24 @@ fn get_index_status_with_connection_mode(
         metadata_status.corruption_error.is_some(),
         metadata_status.compatibility_error.is_some(),
     );
+    let health =
+        if metadata_health == IndexHealth::Ready && search_index_job_ledger.requires_attention() {
+            IndexHealth::Stale
+        } else {
+            metadata_health
+        };
 
-    let repair_hint = match health {
-        IndexHealth::Ready => None,
-        IndexHealth::Stale | IndexHealth::Missing | IndexHealth::Corrupt => {
-            Some("ee index rebuild --workspace .")
-        }
-    };
+    let repair_hint =
+        if metadata_health == IndexHealth::Ready && search_index_job_ledger.requires_attention() {
+            Some("ee job run index_coalesce --workspace . --json")
+        } else {
+            match health {
+                IndexHealth::Ready => None,
+                IndexHealth::Stale | IndexHealth::Missing | IndexHealth::Corrupt => {
+                    Some("ee index rebuild --workspace .")
+                }
+            }
+        };
 
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -8557,6 +8674,10 @@ mod tests {
     use crate::search::Embedder;
     use proptest::prelude::*;
     use proptest::test_runner::Config as ProptestConfig;
+    #[cfg(unix)]
+    use rustix::fs::{FlockOperation, flock};
+    #[cfg(unix)]
+    use std::fs::OpenOptions;
 
     type TestResult = Result<(), String>;
 
@@ -11967,6 +12088,7 @@ mod tests {
         let connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
         connection.migrate().map_err(|error| error.to_string())?;
         let workspace_id = "wsp_012345678901234567890123r1";
+        let _embedder_guard = install_test_hash_workspace_embedder(workspace_id);
         connection
             .insert_workspace(
                 workspace_id,
@@ -12069,6 +12191,7 @@ mod tests {
         let connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
         connection.migrate().map_err(|error| error.to_string())?;
         let workspace_id = "wsp_012345678901234567890123c1";
+        let _embedder_guard = install_test_hash_workspace_embedder(workspace_id);
         connection
             .insert_workspace(
                 workspace_id,
@@ -14052,6 +14175,52 @@ mod tests {
         ensure(job.started_at.is_none(), "dry-run does not start job")?;
         connection.close().map_err(|e| e.to_string())
     }
+    #[cfg(unix)]
+    #[test]
+    fn index_processing_dry_run_skips_write_owner_gate_when_writer_is_active() -> TestResult {
+        let root = unique_test_dir("process-dry-run-write-owner");
+        let workspace = root.join("workspace");
+        let database = workspace.join(".ee").join("ee.db");
+        let index_dir = workspace.join(".ee").join("index");
+        seed_reembed_database(&workspace, &database)?;
+
+        let lock_path = database.with_extension("write.lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| error.to_string())?;
+        flock(&lock_file, FlockOperation::NonBlockingLockExclusive)
+            .map_err(|error| error.to_string())?;
+
+        let started = Instant::now();
+        let report = process_index_jobs(&IndexProcessingOptions {
+            workspace_path: workspace,
+            database_path: Some(database),
+            index_dir: Some(index_dir),
+            dry_run: true,
+            job_limit: None,
+        })
+        .map_err(|error| error.to_string())?;
+        let elapsed = started.elapsed();
+
+        flock(&lock_file, FlockOperation::Unlock).map_err(|error| error.to_string())?;
+        ensure(
+            report.status == IndexProcessingStatus::DryRun
+                && report.pending_jobs == 0
+                && report.processed_jobs == 0,
+            format!("writer-held empty preflight report must be a no-op: {report:?}"),
+        )?;
+        ensure(
+            elapsed < Duration::from_secs(2),
+            format!(
+                "read-only empty preflight must not wait on the writer gate: {}ms",
+                elapsed.as_millis()
+            ),
+        )
+    }
 
     #[test]
     fn coalesced_processing_dry_run_reports_selection_without_coalesced_claim() -> TestResult {
@@ -14699,6 +14868,130 @@ mod tests {
         let health = determine_health(true, 5, Some(10), Some(10), true, false, false);
         assert_eq!(health, IndexHealth::Ready);
         assert_eq!(health.degradation_code(), None);
+    }
+
+    #[test]
+    fn index_status_surfaces_pending_and_running_ledger_at_generation_parity() -> TestResult {
+        let (workspace, database, index_dir, connection, workspace_id) =
+            seed_healthy_session_index_case("status-ledger-generation-parity", "l1")?;
+
+        let status_options = IndexStatusOptions {
+            workspace_path: workspace,
+            database_path: Some(database),
+            index_dir: Some(index_dir),
+        };
+        let empty = get_index_status_with_connection(&status_options, Some(&connection))
+            .map_err(|error| error.to_string())?;
+        ensure(
+            empty.health == IndexHealth::Ready
+                && empty.db_generation == empty.index_generation
+                && empty.last_check_error.is_none(),
+            format!("an empty ledger must remain ready at generation parity: {empty:?}"),
+        )?;
+
+        let pending_id = "sidx_statusledgerpending0000001";
+        connection
+            .insert_search_index_job(
+                pending_id,
+                &CreateSearchIndexJobInput {
+                    workspace_id: workspace_id.clone(),
+                    job_type: SearchIndexJobType::FullRebuild,
+                    document_source: None,
+                    document_id: None,
+                    documents_total: 0,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let pending = get_index_status_with_connection(&status_options, Some(&connection))
+            .map_err(|error| error.to_string())?;
+        ensure(
+            pending.health == IndexHealth::Stale
+                && pending.db_generation == pending.index_generation
+                && pending.last_check_error.as_deref().is_some_and(|error| {
+                    error.contains("pending=1")
+                        && error.contains("running=0")
+                        && error.contains("unknown=0")
+                })
+                && pending.repair_hint == Some("ee job run index_coalesce --workspace . --json"),
+            format!("pending ledger row must degrade parity status: {pending:?}"),
+        )?;
+        ensure(
+            pending.human_summary().contains("Search-index job ledger"),
+            "human status must identify the active search-index ledger",
+        )?;
+        ensure(
+            pending.data_json()["lastCheckError"]
+                .as_str()
+                .is_some_and(|error| error.contains("pending=1")),
+            "JSON status must expose the pending ledger count",
+        )?;
+
+        connection
+            .start_search_index_job(pending_id)
+            .map_err(|error| error.to_string())?;
+        let running = get_index_status_with_connection(&status_options, Some(&connection))
+            .map_err(|error| error.to_string())?;
+        ensure(
+            running.health == IndexHealth::Stale
+                && running.db_generation == running.index_generation
+                && running.last_check_error.as_deref().is_some_and(|error| {
+                    error.contains("pending=0")
+                        && error.contains("running=1")
+                        && error.contains("unknown=0")
+                }),
+            format!("running ledger row must remain visible at parity: {running:?}"),
+        )?;
+        ensure(
+            running.data_json()["degraded"][0]["message"]
+                == "Search-index job ledger has active or unknown jobs.",
+            "JSON degradation must explain active ledger ownership",
+        )?;
+
+        connection.close().map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn search_index_job_ledger_summary_counts_unknown_as_attention() {
+        let jobs = vec![
+            StoredSearchIndexJob {
+                id: "sidx_summaryunknown0000000000001".to_owned(),
+                workspace_id: "wsp_summaryunknown0000000000001".to_owned(),
+                job_type: SearchIndexJobType::FullRebuild.as_str().to_owned(),
+                document_source: None,
+                document_id: None,
+                status: "future-status".to_owned(),
+                documents_total: 0,
+                documents_indexed: 0,
+                error_message: None,
+                created_at: "2026-09-10T00:00:00Z".to_owned(),
+                started_at: None,
+                completed_at: None,
+            },
+            StoredSearchIndexJob {
+                id: "sidx_summaryunknown0000000000002".to_owned(),
+                workspace_id: "wsp_summaryunknown0000000000001".to_owned(),
+                job_type: SearchIndexJobType::FullRebuild.as_str().to_owned(),
+                document_source: None,
+                document_id: None,
+                status: SearchIndexJobStatus::Completed.as_str().to_owned(),
+                documents_total: 0,
+                documents_indexed: 0,
+                error_message: None,
+                created_at: "2026-09-10T00:00:01Z".to_owned(),
+                started_at: None,
+                completed_at: Some("2026-09-10T00:00:02Z".to_owned()),
+            },
+        ];
+
+        let summary = SearchIndexJobLedgerSummary::from_jobs(&jobs);
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.running, 0);
+        assert_eq!(summary.unknown, 1);
+        assert!(summary.requires_attention());
+        assert_eq!(
+            summary.diagnostic().as_deref(),
+            Some("search-index job ledger requires attention: pending=0, running=0, unknown=1")
+        );
     }
 
     #[test]
