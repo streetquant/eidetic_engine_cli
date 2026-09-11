@@ -1917,6 +1917,28 @@ mod tests {
             ],
         ),
         (
+            "import_ledger",
+            &[
+                "id",
+                "workspace_id",
+                "source_kind",
+                "source_id",
+                "status",
+                "cursor_json",
+                "imported_session_count",
+                "imported_span_count",
+                "attempt_count",
+                "owner_id",
+                "error_code",
+                "error_message",
+                "started_at",
+                "completed_at",
+                "metadata_json",
+                "created_at",
+                "updated_at",
+            ],
+        ),
+        (
             "memories",
             &[
                 "id",

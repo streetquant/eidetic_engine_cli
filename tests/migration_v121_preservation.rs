@@ -18,6 +18,7 @@ use ee::db::{
 type TestResult = Result<(), String>;
 
 const PRE_V121_VERSION: u32 = 120;
+const POST_V121_VERSION: u32 = 122;
 const WORKSPACE_ID: &str = "wsp_01234567890123456789012345";
 const MEMORY_ID: &str = "mem_01234567890123456789012345";
 const JOB_ID: &str = "sidx_01234567890123456789012345";
@@ -319,8 +320,8 @@ fn v121_preserves_rows_on_supported_migration_clone_and_idempotent_rerun() -> Te
             first.applied()
         ));
     }
-    if clone.schema_version().map_err(|error| error.to_string())? != Some(121) {
-        return Err("clone schema version did not advance to V121".to_owned());
+    if clone.schema_version().map_err(|error| error.to_string())? != Some(POST_V121_VERSION) {
+        return Err("clone schema version did not advance through V122".to_owned());
     }
     let after_first = snapshot_rows(&clone)?;
     if after_first != before {
@@ -357,7 +358,10 @@ fn v121_preserves_rows_on_supported_migration_clone_and_idempotent_rerun() -> Te
     let second = clone
         .migrate()
         .map_err(|error| format!("idempotent migrate rerun: {error}"))?;
-    if !second.applied().is_empty() || !second.skipped().contains(&121) {
+    if !second.applied().is_empty()
+        || !second.skipped().contains(&121)
+        || !second.skipped().contains(&122)
+    {
         return Err(format!(
             "idempotent rerun was not a no-op: applied={:?} skipped={:?}",
             second.applied(),
