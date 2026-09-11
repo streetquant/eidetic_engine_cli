@@ -242,6 +242,30 @@ fn precedence_from_guarded(memory: &GuardedMemory) -> ContradictionPrecedence {
     }
 }
 
+/// Input accepted by the forced contradiction view.
+///
+/// GuardedMemory remains available for compatibility with callers that only
+/// have the legacy trust/freshness pair. Callers that have a stored-memory
+/// standing should pass ContradictionPrecedence so forced mode applies the
+/// complete MEM-03 ordering, including authority, verification, validity,
+/// confidence, and recency.
+pub trait ForcedContradictionMember {
+    /// Return the complete standing used by the shared contradiction order.
+    fn contradiction_precedence(&self) -> ContradictionPrecedence;
+}
+
+impl ForcedContradictionMember for GuardedMemory {
+    fn contradiction_precedence(&self) -> ContradictionPrecedence {
+        precedence_from_guarded(self)
+    }
+}
+
+impl ForcedContradictionMember for ContradictionPrecedence {
+    fn contradiction_precedence(&self) -> ContradictionPrecedence {
+        self.clone()
+    }
+}
+
 /// Compatibility wrapper for callers that only have trust and freshness. It
 /// uses the shared comparator with neutral authority, verification, and
 /// confidence dimensions.
@@ -312,20 +336,34 @@ pub struct ForcedContradictionView {
     pub total: usize,
 }
 
-/// Rank + cap contradiction members for `forced` mode. Deterministic.
+/// Rank + cap contradiction members for forced mode using the legacy
+/// trust/freshness standing. This concrete signature is retained for callers
+/// compiled against the v1 API.
 #[must_use]
 pub fn forced_contradiction_view(members: &[GuardedMemory], cap: usize) -> ForcedContradictionView {
-    let mut ranked: Vec<&GuardedMemory> = members.iter().collect();
-    ranked.sort_by(|a, b| {
-        let left = precedence_from_guarded(a);
-        let right = precedence_from_guarded(b);
-        compare_precedence(&right, &left).then_with(|| a.memory_id.cmp(&b.memory_id))
+    forced_contradiction_view_with_precedence(members, cap)
+}
+
+/// Rank + cap contradiction members for forced mode using the complete shared
+/// MEM-03 precedence. This additive entry point accepts both GuardedMemory and
+/// ContradictionPrecedence; the legacy concrete function remains above.
+#[must_use]
+pub fn forced_contradiction_view_with_precedence<T: ForcedContradictionMember>(
+    members: &[T],
+    cap: usize,
+) -> ForcedContradictionView {
+    let mut ranked: Vec<ContradictionPrecedence> = members
+        .iter()
+        .map(ForcedContradictionMember::contradiction_precedence)
+        .collect();
+    ranked.sort_by(|left, right| {
+        compare_precedence(right, left).then_with(|| left.memory_id.cmp(&right.memory_id))
     });
     let total = ranked.len();
     let shown = ranked
         .into_iter()
         .take(cap)
-        .map(|memory| memory.memory_id.clone())
+        .map(|memory| memory.memory_id)
         .collect();
     ForcedContradictionView { shown, total }
 }
@@ -335,7 +373,8 @@ mod tests {
     use super::{
         ContradictionPrecedence, DEFAULT_FORCED_CONTRADICTION_CAP, GuardedMemory, SuppressionBasis,
         decide_contradiction_survivor, decide_contradiction_survivor_with_precedence,
-        forced_contradiction_view, is_in_unresolved_contradiction, unresolved_contradiction_pairs,
+        forced_contradiction_view, forced_contradiction_view_with_precedence,
+        is_in_unresolved_contradiction, unresolved_contradiction_pairs,
     };
 
     fn mem(id: &str, trust_milli: i64, freshness_epoch: i64) -> GuardedMemory {
@@ -450,5 +489,82 @@ mod tests {
         // A generous cap shows everyone.
         let full = forced_contradiction_view(&members, DEFAULT_FORCED_CONTRADICTION_CAP);
         assert_eq!(full.shown.len(), 3);
+    }
+
+    #[test]
+    fn forced_view_uses_all_shared_precedence_facets() {
+        let members = vec![
+            ContradictionPrecedence {
+                memory_id: "fresh_weak".to_owned(),
+                trust_rank: 3_000,
+                authority_rank: 0,
+                verification_rank: 1,
+                validity_rank: 1,
+                confidence_milli: 100,
+                recency_epoch: 9_999,
+                recency_known: true,
+            },
+            ContradictionPrecedence {
+                memory_id: "high_confidence".to_owned(),
+                trust_rank: 3_000,
+                authority_rank: 0,
+                verification_rank: 1,
+                validity_rank: 1,
+                confidence_milli: 900,
+                recency_epoch: 1,
+                recency_known: true,
+            },
+            ContradictionPrecedence {
+                memory_id: "verified".to_owned(),
+                trust_rank: 3_000,
+                authority_rank: 0,
+                verification_rank: 3,
+                validity_rank: 0,
+                confidence_milli: 1,
+                recency_epoch: 1,
+                recency_known: true,
+            },
+            ContradictionPrecedence {
+                memory_id: "authoritative".to_owned(),
+                trust_rank: 3_000,
+                authority_rank: 3,
+                verification_rank: 0,
+                validity_rank: 0,
+                confidence_milli: 1,
+                recency_epoch: 1,
+                recency_known: true,
+            },
+            ContradictionPrecedence {
+                memory_id: "expired".to_owned(),
+                trust_rank: 3_000,
+                authority_rank: 0,
+                verification_rank: 1,
+                validity_rank: 0,
+                confidence_milli: 1_000,
+                recency_epoch: 99_999,
+                recency_known: true,
+            },
+        ];
+        let view = forced_contradiction_view_with_precedence(&members, members.len());
+        assert_eq!(
+            view.shown,
+            vec![
+                "authoritative".to_owned(),
+                "verified".to_owned(),
+                "high_confidence".to_owned(),
+                "fresh_weak".to_owned(),
+                "expired".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn forced_view_legacy_signature_remains_function_pointer_compatible() {
+        let legacy: fn(&[GuardedMemory], usize) -> super::ForcedContradictionView =
+            forced_contradiction_view;
+        let members = vec![mem("legacy", 900, 1)];
+        let view = legacy(&members, 1);
+        assert_eq!(view.shown, vec!["legacy".to_owned()]);
+        assert_eq!(view.total, 1);
     }
 }
