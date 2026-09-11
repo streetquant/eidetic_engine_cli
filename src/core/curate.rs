@@ -12767,45 +12767,53 @@ fn persist_candidate_disposition(
     evidence_count: u32,
     distinct_session_count: u32,
 ) -> Result<String, DomainError> {
-    connection.begin().map_err(|error| DomainError::Storage {
-        message: format!("Failed to begin curation disposition transaction: {error}"),
-        repair: Some("ee doctor".to_owned()),
-    })?;
-
-    let result = persist_candidate_disposition_inner(
-        connection,
-        stored,
-        policy,
-        to_status,
-        to_review_state,
-        snoozed_until,
-        ttl_policy_id,
-        now,
-        actor,
-        evidence_count,
-        distinct_session_count,
-    );
-
-    match result {
-        Ok(audit_id) => {
-            connection.commit().map_err(|error| DomainError::Storage {
-                message: format!("Failed to commit curation disposition: {error}"),
+    connection.with_write_owner_fence(
+        |error| DomainError::Storage {
+            message: format!("Failed to acquire curation disposition writer fence: {error}"),
+            repair: Some("ee doctor".to_owned()),
+        },
+        || {
+            connection.begin().map_err(|error| DomainError::Storage {
+                message: format!("Failed to begin curation disposition transaction: {error}"),
                 repair: Some("ee doctor".to_owned()),
             })?;
-            Ok(audit_id)
-        }
-        Err(error) => {
-            if let Err(rollback_error) = connection.rollback() {
-                tracing::error!(
-                    phase = "curate_write",
-                    error = %error,
-                    rollback_error = %rollback_error,
-                    "failed to rollback transaction after curate write failure"
-                );
+
+            let result = persist_candidate_disposition_inner(
+                connection,
+                stored,
+                policy,
+                to_status,
+                to_review_state,
+                snoozed_until,
+                ttl_policy_id,
+                now,
+                actor,
+                evidence_count,
+                distinct_session_count,
+            );
+
+            match result {
+                Ok(audit_id) => {
+                    connection.commit().map_err(|error| DomainError::Storage {
+                        message: format!("Failed to commit curation disposition: {error}"),
+                        repair: Some("ee doctor".to_owned()),
+                    })?;
+                    Ok(audit_id)
+                }
+                Err(error) => {
+                    if let Err(rollback_error) = connection.rollback() {
+                        tracing::error!(
+                            phase = "curate_write",
+                            error = %error,
+                            rollback_error = %rollback_error,
+                            "failed to rollback transaction after curate write failure"
+                        );
+                    }
+                    Err(error)
+                }
             }
-            Err(error)
-        }
-    }
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13619,34 +13627,42 @@ fn persist_candidate_validation(
     reviewed_by: &str,
     decision: &ValidationDecision,
 ) -> Result<String, DomainError> {
-    connection.begin().map_err(|error| DomainError::Storage {
-        message: format!("Failed to begin curation validation transaction: {error}"),
-        repair: Some("ee doctor".to_owned()),
-    })?;
-
-    let result = persist_candidate_validation_inner(
-        connection,
-        workspace_id,
-        stored,
-        to_status,
-        reviewed_at,
-        reviewed_by,
-        decision,
-    );
-
-    match result {
-        Ok(audit_id) => {
-            connection.commit().map_err(|error| DomainError::Storage {
-                message: format!("Failed to commit curation validation: {error}"),
+    connection.with_write_owner_fence(
+        |error| DomainError::Storage {
+            message: format!("Failed to acquire curation validation writer fence: {error}"),
+            repair: Some("ee doctor".to_owned()),
+        },
+        || {
+            connection.begin().map_err(|error| DomainError::Storage {
+                message: format!("Failed to begin curation validation transaction: {error}"),
                 repair: Some("ee doctor".to_owned()),
             })?;
-            Ok(audit_id)
-        }
-        Err(error) => {
-            let _ = connection.rollback();
-            Err(error)
-        }
-    }
+
+            let result = persist_candidate_validation_inner(
+                connection,
+                workspace_id,
+                stored,
+                to_status,
+                reviewed_at,
+                reviewed_by,
+                decision,
+            );
+
+            match result {
+                Ok(audit_id) => {
+                    connection.commit().map_err(|error| DomainError::Storage {
+                        message: format!("Failed to commit curation validation: {error}"),
+                        repair: Some("ee doctor".to_owned()),
+                    })?;
+                    Ok(audit_id)
+                }
+                Err(error) => {
+                    let _ = connection.rollback();
+                    Err(error)
+                }
+            }
+        },
+    )
 }
 
 fn persist_candidate_validation_inner(
@@ -13725,35 +13741,43 @@ fn persist_candidate_review(
     reviewed_by: &str,
     reason: Option<&str>,
 ) -> Result<String, DomainError> {
-    connection.begin().map_err(|error| DomainError::Storage {
-        message: format!("Failed to begin curation review transaction: {error}"),
-        repair: Some("ee doctor".to_owned()),
-    })?;
-
-    let result = persist_candidate_review_inner(
-        connection,
-        workspace_id,
-        stored,
-        action,
-        decision,
-        reviewed_at,
-        reviewed_by,
-        reason,
-    );
-
-    match result {
-        Ok(audit_id) => {
-            connection.commit().map_err(|error| DomainError::Storage {
-                message: format!("Failed to commit curation review: {error}"),
+    connection.with_write_owner_fence(
+        |error| DomainError::Storage {
+            message: format!("Failed to acquire curation review writer fence: {error}"),
+            repair: Some("ee doctor".to_owned()),
+        },
+        || {
+            connection.begin().map_err(|error| DomainError::Storage {
+                message: format!("Failed to begin curation review transaction: {error}"),
                 repair: Some("ee doctor".to_owned()),
             })?;
-            Ok(audit_id)
-        }
-        Err(error) => {
-            let _ = connection.rollback();
-            Err(error)
-        }
-    }
+
+            let result = persist_candidate_review_inner(
+                connection,
+                workspace_id,
+                stored,
+                action,
+                decision,
+                reviewed_at,
+                reviewed_by,
+                reason,
+            );
+
+            match result {
+                Ok(audit_id) => {
+                    connection.commit().map_err(|error| DomainError::Storage {
+                        message: format!("Failed to commit curation review: {error}"),
+                        repair: Some("ee doctor".to_owned()),
+                    })?;
+                    Ok(audit_id)
+                }
+                Err(error) => {
+                    let _ = connection.rollback();
+                    Err(error)
+                }
+            }
+        },
+    )
 }
 
 fn curate_review_planned_details(

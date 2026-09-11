@@ -6001,34 +6001,39 @@ fn seed_status_bench_memories(
     workspace_id: &str,
     memory_count: usize,
 ) -> Result<(), String> {
-    connection
-        .begin()
-        .map_err(|error| format!("failed to begin benchmark seed transaction: {error}"))?;
-    let seed_result = (|| -> Result<(), String> {
-        connection
-            .insert_workspace(
-                workspace_id,
-                &CreateWorkspaceInput {
-                    path: workspace_path.to_string_lossy().to_string(),
-                    name: Some("status benchmark workspace".to_owned()),
-                },
-            )
-            .map_err(|error| format!("failed to insert benchmark workspace: {error}"))?;
+    connection.with_write_owner_fence(
+        |error| format!("failed to acquire benchmark seed writer fence: {error}"),
+        || {
+            connection
+                .begin()
+                .map_err(|error| format!("failed to begin benchmark seed transaction: {error}"))?;
+            let seed_result = (|| -> Result<(), String> {
+                connection
+                    .insert_workspace(
+                        workspace_id,
+                        &CreateWorkspaceInput {
+                            path: workspace_path.to_string_lossy().to_string(),
+                            name: Some("status benchmark workspace".to_owned()),
+                        },
+                    )
+                    .map_err(|error| format!("failed to insert benchmark workspace: {error}"))?;
 
-        insert_status_bench_memory_rows(connection, workspace_id, memory_count)?;
+                insert_status_bench_memory_rows(connection, workspace_id, memory_count)?;
 
-        Ok(())
-    })();
+                Ok(())
+            })();
 
-    match seed_result {
-        Ok(()) => connection
-            .commit()
-            .map_err(|error| format!("failed to commit benchmark seed transaction: {error}")),
-        Err(error) => {
-            let _ = connection.rollback();
-            Err(error)
-        }
-    }
+            match seed_result {
+                Ok(()) => connection.commit().map_err(|error| {
+                    format!("failed to commit benchmark seed transaction: {error}")
+                }),
+                Err(error) => {
+                    let _ = connection.rollback();
+                    Err(error)
+                }
+            }
+        },
+    )
 }
 
 fn insert_status_bench_memory_rows(
