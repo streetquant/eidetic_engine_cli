@@ -45,9 +45,9 @@ use crate::db::{
     DbConnection, DbError, DbOperation, EvidenceSpanMemoryAttachResult,
     MemoryLevelTransitionAuditInput, MemoryLinkRelation, MemoryLinkSource,
     ReflectionRequestCandidateConsumptionOutcome, ReflectionRequestLedgerIngestOutcome,
-    ReflectionRequestReplayStatus, SearchIndexJobType, StoredCurationCandidate,
-    StoredCurationTtlPolicy, StoredEvidenceSpan, StoredMemory, StoredMemoryLink,
-    StoredReflectionRequestLedger, StoredSession, audit_actions,
+    ReflectionRequestReplayStatus, SearchIndexJobStatus, SearchIndexJobType,
+    StoredCurationCandidate, StoredCurationTtlPolicy, StoredEvidenceSpan, StoredMemory,
+    StoredMemoryLink, StoredReflectionRequestLedger, StoredSession, audit_actions,
     default_curation_ttl_policy_id_for_review_state, generate_audit_id,
 };
 use crate::graph::decay::{
@@ -5832,8 +5832,8 @@ fn applied_rule_index_job_id(
                 .is_some_and(|id| rule_ids.contains(id))
         })
         .min_by(|left, right| {
-            (left.status == "completed", &left.created_at, &left.id).cmp(&(
-                right.status == "completed",
+            (left.status != "completed", &left.created_at, &left.id).cmp(&(
+                right.status != "completed",
                 &right.created_at,
                 &right.id,
             ))
@@ -5849,8 +5849,13 @@ fn reconcile_curation_index_job(
     subject: &str,
 ) -> Option<CurateCandidatesDegradation> {
     match connection.get_search_index_job(index_job_id) {
-        Ok(Some(job)) if job.status == "completed" => return None,
-        Ok(Some(job)) if matches!(job.status.as_str(), "failed" | "cancelled") => {
+        Ok(Some(job)) if job.status_enum() == Some(SearchIndexJobStatus::Completed) => return None,
+        Ok(Some(job))
+            if matches!(
+                job.status_enum(),
+                Some(SearchIndexJobStatus::Failed | SearchIndexJobStatus::Cancelled)
+            ) =>
+        {
             if let Err(error) = connection.requeue_search_index_job_for_retry(index_job_id) {
                 tracing::warn!(
                     target: "ee::curate",
@@ -5864,6 +5869,92 @@ fn reconcile_curation_index_job(
                     "retry_unavailable",
                     subject,
                 ));
+            }
+        }
+        Ok(Some(job)) if job.status_enum() == Some(SearchIndexJobStatus::Running) => {
+            // A curation replay can encounter a row left running by a worker
+            // that exited before publishing. Use the DB's supported recovery
+            // primitive before attempting the claim CAS. It checks every
+            // workspace publication owner and deliberately preserves rows
+            // protected by live or unprobeable holders.
+            let recovered =
+                match connection.requeue_orphaned_running_search_index_jobs(workspace_id) {
+                    Ok(recovered) => recovered,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "ee::curate",
+                            workspace_id,
+                            index_job_id,
+                            error = %error,
+                            "curation committed but its running index job could not be recovered"
+                        );
+                        return Some(curate_apply_index_publish_failed(
+                            index_job_id,
+                            "recovery_unavailable",
+                            subject,
+                        ));
+                    }
+                };
+
+            match connection.get_search_index_job(index_job_id) {
+                Ok(Some(current))
+                    if current.status_enum() == Some(SearchIndexJobStatus::Completed) =>
+                {
+                    return None;
+                }
+                Ok(Some(current))
+                    if current.status_enum() == Some(SearchIndexJobStatus::Running) =>
+                {
+                    tracing::info!(
+                        target: "ee::curate",
+                        workspace_id,
+                        index_job_id,
+                        recovered,
+                        "deferring curation index publication because the running job owner remains authoritative"
+                    );
+                    return Some(curate_apply_index_publish_failed(
+                        index_job_id,
+                        "owner_protected",
+                        subject,
+                    ));
+                }
+                Ok(Some(current))
+                    if matches!(
+                        current.status_enum(),
+                        Some(SearchIndexJobStatus::Failed | SearchIndexJobStatus::Cancelled)
+                    ) =>
+                {
+                    if let Err(error) = connection.requeue_search_index_job_for_retry(index_job_id)
+                    {
+                        tracing::warn!(
+                            target: "ee::curate",
+                            workspace_id,
+                            index_job_id,
+                            error = %error,
+                            "curation committed but its recovered index job could not be retried"
+                        );
+                        return Some(curate_apply_index_publish_failed(
+                            index_job_id,
+                            "retry_unavailable",
+                            subject,
+                        ));
+                    }
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        target: "ee::curate",
+                        workspace_id,
+                        index_job_id,
+                        error = %error,
+                        "curation committed but its recovered index job could not be inspected"
+                    );
+                    return Some(curate_apply_index_publish_failed(
+                        index_job_id,
+                        "status_unavailable",
+                        subject,
+                    ));
+                }
             }
         }
         Ok(_) => {}
@@ -16103,8 +16194,8 @@ mod tests {
         CreateMemoryInput, CreateMemoryLinkInput, CreateProceduralRuleInput, CreateSessionInput,
         CreateWorkspaceInput, DbConnection, EvidenceProducerKind, EvidenceSpanMemoryAttachResult,
         MemoryLinkRelation, MemoryLinkSource, ReflectionRequestReplayStatus, SearchIndexJobStatus,
-        StoredCurationCandidate, StoredEvidenceSpan, StoredReflectionRequestLedger, StoredSession,
-        audit_actions,
+        SearchIndexJobType, StoredCurationCandidate, StoredEvidenceSpan,
+        StoredReflectionRequestLedger, StoredSession, audit_actions,
     };
     use crate::models::degradation::{
         ADVISORY_LOCK_TIMEOUT_CODE, GRAPH_CURATE_DISCONNECTED_GRAPH_CODE,
@@ -21587,6 +21678,561 @@ mod tests {
             .ok_or_else(|| "memory missing after low-evidence validation".to_owned())?;
         assert!((memory.confidence - 0.7).abs() < 0.001);
         assert_eq!(memory.trust_class, "human_explicit");
+        Ok(())
+    }
+
+    #[test]
+    fn curation_recovers_orphaned_running_index_job_before_claim() -> TestResult {
+        let tempdir = tempfile::tempdir_in("/tmp").map_err(|error| error.to_string())?;
+        let workspace = tempdir.path();
+        fs::create_dir_all(workspace.join(".ee")).map_err(|error| error.to_string())?;
+        let database = workspace.join(".ee").join("ee.db");
+        let workspace_id = test_workspace_id(workspace);
+        let job_id = "sidx_012345678901234567890123o1";
+
+        let _embedder_guard =
+            crate::core::index::install_test_hash_workspace_embedder(&workspace_id);
+        let connection = DbConnection::open_file(&database).map_err(|error| error.to_string())?;
+        connection.migrate().map_err(|error| error.to_string())?;
+        connection
+            .insert_workspace(
+                &workspace_id,
+                &CreateWorkspaceInput {
+                    path: workspace.display().to_string(),
+                    name: Some("curation orphan recovery".to_owned()),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .insert_search_index_job(
+                job_id,
+                &crate::db::CreateSearchIndexJobInput {
+                    workspace_id: workspace_id.clone(),
+                    job_type: SearchIndexJobType::FullRebuild,
+                    document_source: None,
+                    document_id: None,
+                    documents_total: 0,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        ensure(
+            connection
+                .start_search_index_job(job_id)
+                .map_err(|error| error.to_string())?,
+            "orphan fixture must enter running state",
+        )?;
+
+        let degradation = super::reconcile_curation_index_job(
+            &connection,
+            &workspace_id,
+            workspace,
+            job_id,
+            "procedural rule",
+        );
+        ensure(
+            degradation.is_none(),
+            format!("an unowned running curation job should recover: {degradation:?}"),
+        )?;
+
+        let completed = connection
+            .get_search_index_job(job_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "recovered curation job disappeared".to_owned())?;
+        ensure(
+            completed.status_enum() == Some(SearchIndexJobStatus::Completed),
+            format!("recovered curation job must complete in place: {completed:?}"),
+        )?;
+        let jobs = connection
+            .list_search_index_jobs(&workspace_id, None)
+            .map_err(|error| error.to_string())?;
+        ensure(
+            jobs.len() == 1 && jobs[0].id == job_id,
+            format!("recovery must preserve one logical curation job: {jobs:?}"),
+        )?;
+
+        connection.close().map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn curation_preserves_live_and_unprobeable_running_index_job_owners() -> TestResult {
+        for (label, holder_id) in [
+            (
+                "live",
+                format!("index:{}:curate-live-owner", std::process::id()),
+            ),
+            ("unprobeable", "curate-unprobeable-owner".to_owned()),
+        ] {
+            let tempdir = tempfile::tempdir_in("/tmp").map_err(|error| error.to_string())?;
+            let workspace = tempdir.path();
+            fs::create_dir_all(workspace.join(".ee")).map_err(|error| error.to_string())?;
+            let database = workspace.join(".ee").join("ee.db");
+            let workspace_id = test_workspace_id(workspace);
+            let job_id = "sidx_012345678901234567890123p1".to_owned();
+
+            let _embedder_guard =
+                crate::core::index::install_test_hash_workspace_embedder(&workspace_id);
+            let connection =
+                DbConnection::open_file(&database).map_err(|error| error.to_string())?;
+            connection.migrate().map_err(|error| error.to_string())?;
+            connection
+                .insert_workspace(
+                    &workspace_id,
+                    &CreateWorkspaceInput {
+                        path: workspace.display().to_string(),
+                        name: Some(format!("curation {label} owner")),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            connection
+                .insert_search_index_job(
+                    &job_id,
+                    &crate::db::CreateSearchIndexJobInput {
+                        workspace_id: workspace_id.clone(),
+                        job_type: SearchIndexJobType::FullRebuild,
+                        document_source: None,
+                        document_id: None,
+                        documents_total: 0,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            ensure(
+                connection
+                    .start_search_index_job(&job_id)
+                    .map_err(|error| error.to_string())?,
+                "protected owner fixture must enter running state",
+            )?;
+
+            let lock_id = crate::db::AdvisoryLockId::index(&workspace_id);
+            ensure(
+                connection
+                    .acquire_advisory_lock(
+                        &lock_id,
+                        &holder_id,
+                        Some(600),
+                        Some("curation owner fixture"),
+                    )
+                    .map_err(|error| error.to_string())?
+                    .is_acquired(),
+                format!("{label} owner fixture must acquire publication lease"),
+            )?;
+
+            let degradation = super::reconcile_curation_index_job(
+                &connection,
+                &workspace_id,
+                workspace,
+                &job_id,
+                "procedural rule",
+            )
+            .ok_or_else(|| {
+                format!("{label} owner must produce a deferred publication degradation")
+            })?;
+            ensure(
+                degradation.code == super::CURATE_APPLY_INDEX_PUBLISH_FAILED_CODE
+                    && degradation.message.contains("owner_protected"),
+                format!("{label} owner should be reported as protected: {degradation:?}"),
+            )?;
+
+            let still_running = connection
+                .get_search_index_job(&job_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("{label} running curation job disappeared"))?;
+            ensure(
+                still_running.status_enum() == Some(SearchIndexJobStatus::Running),
+                format!("{label} owner must retain the running row: {still_running:?}"),
+            )?;
+            ensure(
+                connection
+                    .release_advisory_lock(&lock_id, &holder_id)
+                    .map_err(|error| error.to_string())?,
+                format!("{label} owner fixture must release publication lease"),
+            )?;
+            connection.close().map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn curation_repeated_orphan_recovery_is_idempotent() -> TestResult {
+        let tempdir = tempfile::tempdir_in("/tmp").map_err(|error| error.to_string())?;
+        let workspace = tempdir.path();
+        fs::create_dir_all(workspace.join(".ee")).map_err(|error| error.to_string())?;
+        let database = workspace.join(".ee").join("ee.db");
+        let workspace_id = test_workspace_id(workspace);
+        let job_id = "sidx_012345678901234567890123r1";
+
+        let _embedder_guard =
+            crate::core::index::install_test_hash_workspace_embedder(&workspace_id);
+        let connection = DbConnection::open_file(&database).map_err(|error| error.to_string())?;
+        connection.migrate().map_err(|error| error.to_string())?;
+        connection
+            .insert_workspace(
+                &workspace_id,
+                &CreateWorkspaceInput {
+                    path: workspace.display().to_string(),
+                    name: Some("curation repeated orphan recovery".to_owned()),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .insert_search_index_job(
+                job_id,
+                &crate::db::CreateSearchIndexJobInput {
+                    workspace_id: workspace_id.clone(),
+                    job_type: SearchIndexJobType::FullRebuild,
+                    document_source: None,
+                    document_id: None,
+                    documents_total: 0,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        ensure(
+            connection
+                .start_search_index_job(job_id)
+                .map_err(|error| error.to_string())?,
+            "repeated recovery fixture must enter running state",
+        )?;
+
+        let first_recovery = connection
+            .requeue_orphaned_running_search_index_jobs(&workspace_id)
+            .map_err(|error| error.to_string())?;
+        ensure(
+            first_recovery == 1,
+            format!("first orphan recovery must requeue one row: {first_recovery}"),
+        )?;
+        let pending = connection
+            .get_search_index_job(job_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "requeued job disappeared after first recovery".to_owned())?;
+        ensure(
+            pending.status_enum() == Some(SearchIndexJobStatus::Pending),
+            format!("first recovery must leave the same row pending: {pending:?}"),
+        )?;
+
+        let second_recovery = connection
+            .requeue_orphaned_running_search_index_jobs(&workspace_id)
+            .map_err(|error| error.to_string())?;
+        ensure(
+            second_recovery == 0,
+            format!("repeated orphan recovery must be a no-op: {second_recovery}"),
+        )?;
+        let still_pending = connection
+            .get_search_index_job(job_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "requeued job disappeared after repeated recovery".to_owned())?;
+        ensure(
+            still_pending.status_enum() == Some(SearchIndexJobStatus::Pending),
+            format!("repeated recovery must preserve pending state: {still_pending:?}"),
+        )?;
+
+        let degradation = super::reconcile_curation_index_job(
+            &connection,
+            &workspace_id,
+            workspace,
+            job_id,
+            "procedural rule",
+        );
+        ensure(
+            degradation.is_none(),
+            format!("requeued curation job should complete: {degradation:?}"),
+        )?;
+        let completed = connection
+            .get_search_index_job(job_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "completed job disappeared after curation replay".to_owned())?;
+        ensure(
+            completed.status_enum() == Some(SearchIndexJobStatus::Completed),
+            format!("curation replay must complete the same job: {completed:?}"),
+        )?;
+
+        let replay = super::reconcile_curation_index_job(
+            &connection,
+            &workspace_id,
+            workspace,
+            job_id,
+            "procedural rule",
+        );
+        ensure(
+            replay.is_none(),
+            format!("replaying a completed curation job must be a no-op: {replay:?}"),
+        )?;
+        let jobs = connection
+            .list_search_index_jobs(&workspace_id, None)
+            .map_err(|error| error.to_string())?;
+        ensure(
+            jobs.len() == 1 && jobs[0].id == job_id,
+            format!("repeated recovery must preserve one logical job: {jobs:?}"),
+        )?;
+
+        connection.close().map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn curation_handles_simultaneous_live_and_dead_owner_workspaces() -> TestResult {
+        let tempdir = tempfile::tempdir_in("/tmp").map_err(|error| error.to_string())?;
+        let root = tempdir.path();
+        let live_workspace = root.join("live");
+        let dead_workspace = root.join("dead");
+        fs::create_dir_all(live_workspace.join(".ee")).map_err(|error| error.to_string())?;
+        fs::create_dir_all(dead_workspace.join(".ee")).map_err(|error| error.to_string())?;
+        let database = root.join("ee.db");
+        let live_workspace_id = test_workspace_id(&live_workspace);
+        let dead_workspace_id = test_workspace_id(&dead_workspace);
+        let live_job_id = "sidx_012345678901234567890123l1";
+        let dead_job_id = "sidx_012345678901234567890123d1";
+
+        let _live_embedder_guard =
+            crate::core::index::install_test_hash_workspace_embedder(&live_workspace_id);
+        let _dead_embedder_guard =
+            crate::core::index::install_test_hash_workspace_embedder(&dead_workspace_id);
+        let connection = DbConnection::open_file(&database).map_err(|error| error.to_string())?;
+        connection.migrate().map_err(|error| error.to_string())?;
+        for (workspace, workspace_id, name) in [
+            (
+                &live_workspace,
+                &live_workspace_id,
+                "curation simultaneous live owner",
+            ),
+            (
+                &dead_workspace,
+                &dead_workspace_id,
+                "curation simultaneous dead owner",
+            ),
+        ] {
+            connection
+                .insert_workspace(
+                    workspace_id,
+                    &CreateWorkspaceInput {
+                        path: workspace.display().to_string(),
+                        name: Some(name.to_owned()),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        for (workspace_id, job_id) in [
+            (&live_workspace_id, live_job_id),
+            (&dead_workspace_id, dead_job_id),
+        ] {
+            connection
+                .insert_search_index_job(
+                    job_id,
+                    &crate::db::CreateSearchIndexJobInput {
+                        workspace_id: workspace_id.clone(),
+                        job_type: SearchIndexJobType::FullRebuild,
+                        document_source: None,
+                        document_id: None,
+                        documents_total: 0,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            ensure(
+                connection
+                    .start_search_index_job(job_id)
+                    .map_err(|error| error.to_string())?,
+                format!("{job_id} fixture must enter running state"),
+            )?;
+        }
+
+        let live_lock_id = crate::db::AdvisoryLockId::index(&live_workspace_id);
+        let dead_lock_id = crate::db::AdvisoryLockId::index(&dead_workspace_id);
+        let live_holder = format!("index:{}:curate-simultaneous-live", std::process::id());
+        let dead_holder = "index:2147483647:curate-simultaneous-dead";
+        ensure(
+            connection
+                .acquire_advisory_lock(
+                    &live_lock_id,
+                    &live_holder,
+                    Some(600),
+                    Some("simultaneous live owner fixture"),
+                )
+                .map_err(|error| error.to_string())?
+                .is_acquired(),
+            "live owner fixture must acquire its workspace lease",
+        )?;
+        ensure(
+            connection
+                .acquire_advisory_lock(
+                    &dead_lock_id,
+                    dead_holder,
+                    Some(600),
+                    Some("simultaneous dead owner fixture"),
+                )
+                .map_err(|error| error.to_string())?
+                .is_acquired(),
+            "dead owner fixture must retain its workspace lease",
+        )?;
+
+        let live_degradation = super::reconcile_curation_index_job(
+            &connection,
+            &live_workspace_id,
+            &live_workspace,
+            live_job_id,
+            "live procedural rule",
+        )
+        .ok_or_else(|| "live owner must defer curation publication".to_owned())?;
+        ensure(
+            live_degradation.message.contains("owner_protected"),
+            format!("live owner must remain authoritative: {live_degradation:?}"),
+        )?;
+        let live_job = connection
+            .get_search_index_job(live_job_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "live-owned job disappeared".to_owned())?;
+        ensure(
+            live_job.status_enum() == Some(SearchIndexJobStatus::Running),
+            format!("live-owned job must remain running: {live_job:?}"),
+        )?;
+
+        let dead_degradation = super::reconcile_curation_index_job(
+            &connection,
+            &dead_workspace_id,
+            &dead_workspace,
+            dead_job_id,
+            "dead procedural rule",
+        );
+        ensure(
+            dead_degradation.is_none(),
+            format!("dead owner should be recovered and published: {dead_degradation:?}"),
+        )?;
+        let dead_job = connection
+            .get_search_index_job(dead_job_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "dead-owned job disappeared".to_owned())?;
+        ensure(
+            dead_job.status_enum() == Some(SearchIndexJobStatus::Completed),
+            format!("dead-owned job must complete in place: {dead_job:?}"),
+        )?;
+        let dead_jobs = connection
+            .list_search_index_jobs(&dead_workspace_id, None)
+            .map_err(|error| error.to_string())?;
+        ensure(
+            dead_jobs.len() == 1 && dead_jobs[0].id == dead_job_id,
+            format!("dead-owner recovery must preserve one logical job: {dead_jobs:?}"),
+        )?;
+
+        ensure(
+            connection
+                .release_advisory_lock(&live_lock_id, &live_holder)
+                .map_err(|error| error.to_string())?,
+            "live owner fixture must release its workspace lease",
+        )?;
+        connection.close().map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn applied_rule_index_job_prefers_completed_duplicate_and_replays_idempotently() -> TestResult {
+        let tempdir = tempfile::tempdir_in("/tmp").map_err(|error| error.to_string())?;
+        let workspace = tempdir.path();
+        fs::create_dir(workspace.join(".ee")).map_err(|error| error.to_string())?;
+        let database = workspace.join("ee.db");
+        let workspace_id = test_workspace_id(workspace);
+        let memory_id = MemoryId::from_uuid(uuid::Uuid::from_u128(0x6_880)).to_string();
+        let candidate_id = curate_id(0x6_881);
+        let content = "completed publication must win over stale duplicate jobs";
+        let connection = seed_candidate_database(
+            &database,
+            &workspace_id,
+            &memory_id,
+            &candidate_id,
+            "rule",
+            Some("approved"),
+            Some(content),
+        )?;
+
+        let first = apply_curation_candidate(&super::CurateApplyOptions {
+            workspace_path: workspace,
+            database_path: Some(&database),
+            candidate_id: &candidate_id,
+            actor: Some("completed-job-preference-test"),
+            dry_run: false,
+            allow_tombstone_load_bearing: false,
+        })
+        .map_err(|error| error.message())?;
+        assert_eq!(first.application.status, "applied");
+
+        let rule_id = connection
+            .list_procedural_rules(&workspace_id, None, None, true)
+            .map_err(|error| error.to_string())?
+            .first()
+            .map(|rule| rule.id.clone())
+            .ok_or_else(|| "applied rule missing from completed-job fixture".to_owned())?;
+        let completed_job_id = connection
+            .list_search_index_jobs(&workspace_id, None)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|job| {
+                job.document_source.as_deref() == Some("rule")
+                    && job.document_id.as_deref() == Some(rule_id.as_str())
+                    && job.status_enum() == Some(SearchIndexJobStatus::Completed)
+            })
+            .map(|job| job.id)
+            .ok_or_else(|| "completed rule index job missing from fixture".to_owned())?;
+
+        let duplicate_job_id = "sidx_012345678901234567890123c1";
+        connection
+            .insert_search_index_job(
+                duplicate_job_id,
+                &crate::db::CreateSearchIndexJobInput {
+                    workspace_id: workspace_id.clone(),
+                    job_type: SearchIndexJobType::SingleDocument,
+                    document_source: Some("rule".to_owned()),
+                    document_id: Some(rule_id.clone()),
+                    documents_total: 1,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+
+        let selected = super::applied_rule_index_job_id(&connection, &workspace_id, &candidate_id)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(selected.as_deref(), Some(completed_job_id.as_str()));
+
+        let selected_again =
+            super::applied_rule_index_job_id(&connection, &workspace_id, &candidate_id)
+                .map_err(|error| error.to_string())?;
+        assert_eq!(
+            selected_again.as_deref(),
+            Some(completed_job_id.as_str()),
+            "repeated lookup must choose the same completed publication"
+        );
+
+        let replay = apply_curation_candidate(&super::CurateApplyOptions {
+            workspace_path: workspace,
+            database_path: Some(&database),
+            candidate_id: &candidate_id,
+            actor: Some("completed-job-preference-test"),
+            dry_run: false,
+            allow_tombstone_load_bearing: false,
+        })
+        .map_err(|error| error.message())?;
+        assert_eq!(replay.application.status, "already_applied");
+        assert!(!replay.durable_mutation);
+        assert!(
+            replay.degraded.is_empty(),
+            "completed publication should make replay a no-op: {:?}",
+            replay.degraded
+        );
+
+        let jobs = connection
+            .list_search_index_jobs(&workspace_id, None)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(jobs.len(), 2, "replay must not create another index job");
+        let duplicate = jobs
+            .iter()
+            .find(|job| job.id == duplicate_job_id)
+            .ok_or_else(|| "duplicate non-completed job disappeared".to_owned())?;
+        assert_eq!(
+            duplicate.status_enum(),
+            Some(SearchIndexJobStatus::Pending),
+            "replay must leave the stale duplicate untouched"
+        );
+
+        let selected_after_replay =
+            super::applied_rule_index_job_id(&connection, &workspace_id, &candidate_id)
+                .map_err(|error| error.to_string())?;
+        assert_eq!(
+            selected_after_replay.as_deref(),
+            Some(completed_job_id.as_str()),
+            "replay must continue to prefer the completed publication"
+        );
         Ok(())
     }
 
