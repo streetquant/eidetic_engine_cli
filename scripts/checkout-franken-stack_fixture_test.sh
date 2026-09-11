@@ -139,6 +139,8 @@ real_git=${EE_FIXTURE_REAL_GIT:?}
 remote_root=${EE_FIXTURE_REMOTE_ROOT:?}
 fail_repo=${EE_FIXTURE_FAIL_REPO:-}
 fail_once=${EE_FIXTURE_FAIL_ONCE:-}
+fetch_delay=${EE_FIXTURE_FETCH_DELAY:-}
+fetch_log=${EE_FIXTURE_FETCH_LOG:-}
 repository_path=''
 
 if [ "${1:-}" = '-C' ]; then
@@ -151,6 +153,15 @@ if [ "${1:-}" = '-C' ] && [ "${3:-}" = fetch ] && \
   : > "$fail_once"
   printf 'fixture: injected fetch failure for %s\n' "$fail_repo" >&2
   exit 77
+fi
+
+if [ "${1:-}" = '-C' ] && [ "${3:-}" = fetch ]; then
+  if [ -n "$fetch_log" ]; then
+    printf '%s\n' "$(basename "$repository_path")" >> "$fetch_log"
+  fi
+  if [ -n "$fetch_delay" ]; then
+    sleep "$fetch_delay"
+  fi
 fi
 
 if [ "${1:-}" = '-C' ] && [ "${3:-}" = remote ] && \
@@ -215,6 +226,8 @@ run_helper() {
     EE_FIXTURE_FAIL_REPO="$EE_FIXTURE_FAIL_REPO" \
     EE_FIXTURE_FAIL_ONCE="$EE_FIXTURE_FAIL_ONCE" \
     EE_FIXTURE_SYNC_FAIL_ONCE="$EE_FIXTURE_SYNC_FAIL_ONCE" \
+    EE_FIXTURE_FETCH_DELAY="${EE_FIXTURE_FETCH_DELAY:-}" \
+    EE_FIXTURE_FETCH_LOG="${EE_FIXTURE_FETCH_LOG:-}" \
     "$ACTIVE_SOURCE_ROOT/scripts/checkout-franken-stack.sh" "$destination"
 }
 
@@ -377,6 +390,36 @@ run_helper "$fetch_failure_destination" > "$FIXTURE_ROOT/fetch-resume.log" 2>&1
 assert_clean_materialization "$fetch_failure_destination"
 assert_absent "$fetch_failure_destination/.ee-franken-stack-staging"
 
+poisoned_origin_destination=$(fresh_destination poisoned-origin)
+EE_FIXTURE_FAIL_REPO=asupersync
+EE_FIXTURE_FAIL_ONCE="$FIXTURE_ROOT/poisoned-origin.once"
+EE_FIXTURE_FETCH_DELAY=''
+EE_FIXTURE_FETCH_LOG=''
+set +e
+run_helper "$poisoned_origin_destination" > "$FIXTURE_ROOT/poisoned-origin-seed.log" 2>&1
+poisoned_seed_status=$?
+set -e
+[ "$poisoned_seed_status" -eq 77 ]
+poisoned_stage="$poisoned_origin_destination/.ee-franken-stack-staging/asupersync"
+assert_file "$poisoned_stage/.git/ee-franken-stack-staging-v1"
+git -C "$poisoned_stage" remote set-url origin "file://$FIXTURE_ROOT/poisoned-origin.git"
+EE_FIXTURE_FAIL_REPO=''
+EE_FIXTURE_FAIL_ONCE=''
+EE_FIXTURE_FETCH_LOG="$FIXTURE_ROOT/poisoned-origin.fetches"
+: > "$EE_FIXTURE_FETCH_LOG"
+set +e
+run_helper "$poisoned_origin_destination" > "$FIXTURE_ROOT/poisoned-origin.log" 2>&1
+poisoned_status=$?
+set -e
+[ "$poisoned_status" -ne 0 ]
+grep -F 'has unexpected origin; refusing to fetch from it' "$FIXTURE_ROOT/poisoned-origin.log" >/dev/null
+[ ! -s "$EE_FIXTURE_FETCH_LOG" ]
+git -C "$poisoned_stage" remote set-url origin "file://$REMOTE_ROOT/asupersync.git"
+EE_FIXTURE_FETCH_LOG=''
+run_helper "$poisoned_origin_destination" > "$FIXTURE_ROOT/poisoned-origin-resume.log" 2>&1
+assert_clean_materialization "$poisoned_origin_destination"
+assert_absent "$poisoned_origin_destination/.ee-franken-stack-staging"
+
 sync_failure_destination=$(fresh_destination sync-failure)
 EE_FIXTURE_FAIL_REPO=''
 EE_FIXTURE_FAIL_ONCE=''
@@ -392,6 +435,26 @@ assert_absent "$sync_failure_destination/.ee-franken-stack-staging/asupersync/.g
 run_helper "$sync_failure_destination" > "$FIXTURE_ROOT/sync-resume.log" 2>&1
 assert_clean_materialization "$sync_failure_destination"
 assert_absent "$sync_failure_destination/.ee-franken-stack-staging"
+
+concurrency_destination=$(fresh_destination concurrency)
+EE_FIXTURE_FAIL_REPO=''
+EE_FIXTURE_FAIL_ONCE=''
+EE_FIXTURE_SYNC_FAIL_ONCE=''
+EE_FIXTURE_FETCH_DELAY='1'
+EE_FIXTURE_FETCH_LOG="$FIXTURE_ROOT/concurrency.fetches"
+: > "$EE_FIXTURE_FETCH_LOG"
+run_helper "$concurrency_destination" > "$FIXTURE_ROOT/concurrency-1.log" 2>&1 &
+concurrency_pid_one=$!
+sleep 0.1
+run_helper "$concurrency_destination" > "$FIXTURE_ROOT/concurrency-2.log" 2>&1 &
+concurrency_pid_two=$!
+wait "$concurrency_pid_one"
+wait "$concurrency_pid_two"
+assert_clean_materialization "$concurrency_destination"
+grep -F 'reuse asupersync@' "$FIXTURE_ROOT/concurrency-2.log" >/dev/null
+[ "$(wc -l < "$EE_FIXTURE_FETCH_LOG")" -eq 7 ]
+EE_FIXTURE_FETCH_DELAY=''
+EE_FIXTURE_FETCH_LOG=''
 
 symlink_parent="$FIXTURE_ROOT/symlink-parent"
 symlink_target="$FIXTURE_ROOT/symlink-target"
@@ -443,7 +506,19 @@ zero_bad_status=$?
 set -e
 [ "$zero_bad_status" -ne 0 ]
 grep -F 'requirement 0.0.9 is incompatible with asupersync 0.0.11' "$FIXTURE_ROOT/zero-bad.log" >/dev/null
-[ "$ZERO_BAD_MANIFEST_HASH" = "$(sha256sum "$ZERO_BAD_DEST/sqlmodel_rust/Cargo.toml" | awk '{ print $1 }')" ]
+[ "$ZERO_BAD_MANIFEST_HASH" = "$(sha256sum "$WORK_ROOT/sqlmodel_rust/Cargo.toml" | awk '{ print $1 }')" ]
+for repository in \
+  asupersync \
+  franken_agent_detection \
+  franken_networkx \
+  frankensearch \
+  frankensqlite \
+  sqlmodel_rust \
+  toon_rust
+do
+  assert_absent "$ZERO_BAD_DEST/$repository"
+done
+assert_absent "$ZERO_BAD_DEST/.ee-franken-stack-staging"
 
 sed -i 's/version = "0\.0\.11"/version = "0.0.9"/' "$WORK_ROOT/asupersync/Cargo.toml"
 git -C "$WORK_ROOT/asupersync" commit -qam 'fixture asupersync 0.0.9'

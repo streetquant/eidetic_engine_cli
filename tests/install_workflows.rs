@@ -967,19 +967,19 @@ printf 'matching-tag=accepted\n'
 #[test]
 fn franken_stack_lock_pins_complete_full_sha_closure() -> TestResult {
     const EXPECTED: &[(&str, &str)] = &[
-        ("asupersync", "9eb0600e6ef4d17633dff3dc43ad99c64e72adbe"),
+        ("asupersync", "997e8d116ae864789f2cb47be90bfd4be5985c4f"),
         (
             "franken_agent_detection",
-            "17f28ad8fbea9181134d63e109a310ea7bf31997",
+            "36149d417bd9ee4f3dda77e616556c09dea24dbb",
         ),
         (
             "franken_networkx",
-            "972814b1b4649c20b6f2acdd7456e3580cefdbeb",
+            "6809c573a99e79497a43aa5a7c77fb2b0f9e2fc8",
         ),
-        ("frankensearch", "8382ec3ed6b3395afd28dd049efedaedc3259d59"),
-        ("frankensqlite", "61313e42292a27f7545f906b774166f49161a4db"),
-        ("sqlmodel_rust", "021bd17add2de0024d823ddc0d675550145ebf89"),
-        ("toon_rust", "d7185c7800d37810f0a29bd5fca2ee623f25819b"),
+        ("frankensearch", "a792d88b5f7f1291593493d4dbed629edea14bef"),
+        ("frankensqlite", "429d89057d2e11b83d43470172a9039eb8473b4d"),
+        ("sqlmodel_rust", "80feaa267c0e52966da7c9197f57866e36b2a886"),
+        ("toon_rust", "ab5c29b372ba6d39baf0f3071d7247ca3c72bc9c"),
     ];
 
     ensure(
@@ -1627,7 +1627,9 @@ fn franken_stack_helpers_refuse_to_overwrite_existing_work() -> TestResult {
             &format!("{name} helper must not rewrite an existing checkout"),
         )?;
         ensure(
-            !helper.contains("Remove-Item") && !helper.contains("rm -"),
+            !helper.contains("rm -rf -- \"$destination\"")
+                && !helper.contains("Remove-Item -LiteralPath $destination")
+                && !helper.contains("[IO.Directory]::Delete($destination"),
             &format!("{name} helper must not delete an existing checkout"),
         )?;
     }

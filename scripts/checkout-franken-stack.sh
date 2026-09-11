@@ -141,15 +141,114 @@ assert_no_symlink_components "$DESTINATION_ROOT"
 DESTINATION_ROOT=$(CDPATH='' cd -- "$DESTINATION_ROOT" && pwd -P)
 [ "$DESTINATION_ROOT" != "/" ] || die "refusing to populate the filesystem root"
 
+MATERIALIZER_LOCK_PATH="$DESTINATION_ROOT/.ee-franken-stack-materializer.lock"
+[ ! -L "$MATERIALIZER_LOCK_PATH" ] || \
+  die "$MATERIALIZER_LOCK_PATH is a symlink; refusing to modify it"
+MATERIALIZER_LOCK_FD=''
+MATERIALIZER_LOCK_MODE=''
+
+release_materializer_lock() {
+  local owner
+
+  if [ "$MATERIALIZER_LOCK_MODE" = "mkdir" ] && \
+     [ -d "$MATERIALIZER_LOCK_PATH" ] && [ ! -L "$MATERIALIZER_LOCK_PATH" ]; then
+    owner=$(cat "$MATERIALIZER_LOCK_PATH/pid" 2>/dev/null || true)
+    if [ "$owner" = "$$" ]; then
+      rm -f -- "$MATERIALIZER_LOCK_PATH/pid"
+      rmdir -- "$MATERIALIZER_LOCK_PATH" 2>/dev/null || true
+    fi
+  fi
+}
+
+acquire_materializer_lock() {
+  local owner
+
+  if command -v flock >/dev/null 2>&1 && [ ! -d "$MATERIALIZER_LOCK_PATH" ]; then
+    exec {MATERIALIZER_LOCK_FD}>>"$MATERIALIZER_LOCK_PATH" || \
+      die "could not open materializer lock $MATERIALIZER_LOCK_PATH"
+    flock -x "$MATERIALIZER_LOCK_FD" || \
+      die "could not acquire materializer lock $MATERIALIZER_LOCK_PATH"
+    MATERIALIZER_LOCK_MODE='flock'
+    return 0
+  fi
+
+  # macOS does not ship util-linux flock. mkdir is an atomic cross-platform
+  # lock primitive; retain the owner PID so a killed helper's lock can be
+  # recovered before a resumable stage is retried.
+  if [ -e "$MATERIALIZER_LOCK_PATH" ] && [ ! -d "$MATERIALIZER_LOCK_PATH" ]; then
+    die "$MATERIALIZER_LOCK_PATH is not a materializer lock directory"
+  fi
+  while ! mkdir "$MATERIALIZER_LOCK_PATH" 2>/dev/null; do
+    [ -d "$MATERIALIZER_LOCK_PATH" ] && [ ! -L "$MATERIALIZER_LOCK_PATH" ] || \
+      die "$MATERIALIZER_LOCK_PATH changed while acquiring its lock"
+    owner=$(cat "$MATERIALIZER_LOCK_PATH/pid" 2>/dev/null || true)
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -f -- "$MATERIALIZER_LOCK_PATH/pid"
+      rmdir -- "$MATERIALIZER_LOCK_PATH" 2>/dev/null || true
+      continue
+    fi
+    sleep 0.1
+  done
+  if ! printf '%s\n' "$$" > "$MATERIALIZER_LOCK_PATH/pid"; then
+    rmdir -- "$MATERIALIZER_LOCK_PATH" 2>/dev/null || true
+    die "could not record materializer lock owner"
+  fi
+  MATERIALIZER_LOCK_MODE='mkdir'
+}
+
+acquire_materializer_lock
+
 STAGING_ROOT="$DESTINATION_ROOT/.ee-franken-stack-staging"
 STAGING_MARKER_NAME="ee-franken-stack-staging-v1"
 MANAGED_MARKER_NAME="ee-franken-stack-managed"
 CURRENT_STAGE=''
 CURRENT_STAGE_ATTESTED=0
 CURRENT_TEMP=''
+PREFLIGHT_FAILED=0
+PENDING_REPOSITORIES=()
+PENDING_REVISIONS=()
+PENDING_STAGES=()
+PENDING_DESTINATIONS=()
+PUBLISHED_STAGES=()
+PUBLISHED_DESTINATIONS=()
 
 cleanup() {
   local status=$?
+
+  if [ "$status" -ne 0 ] && [ "$PREFLIGHT_FAILED" -eq 1 ]; then
+    # Compatibility is checked before publication. Remove every complete
+    # staged checkout on this path so an incompatible pair cannot leave a
+    # misleading half-materialized bundle behind. Fetch/checkout failures
+    # happen before this flag is set and remain resumable.
+    local staged_path
+    for staged_path in "${PENDING_STAGES[@]}"; do
+      if [ -d "$staged_path" ] && [ ! -L "$staged_path" ]; then
+        rm -rf -- "$staged_path"
+      fi
+    done
+    rmdir -- "$STAGING_ROOT" 2>/dev/null || true
+  fi
+
+  if [ "$status" -ne 0 ] && [ "$PREFLIGHT_FAILED" -eq 0 ] && \
+     [ "${#PUBLISHED_DESTINATIONS[@]}" -gt 0 ]; then
+    # Publication is a sequence of same-filesystem renames. If a later
+    # rename or durability check fails, return every rename completed by this
+    # process to its staged name so a retry cannot mistake a partial bundle
+    # for a successful materialization.
+    local published_index
+    local published_destination
+    local published_stage
+    for (( published_index=${#PUBLISHED_DESTINATIONS[@]}-1; published_index>=0; published_index-- )); do
+      published_destination=${PUBLISHED_DESTINATIONS[$published_index]}
+      published_stage=${PUBLISHED_STAGES[$published_index]}
+      if [ -d "$published_destination" ] && [ ! -L "$published_destination" ] && \
+         [ ! -e "$published_stage" ] && [ ! -L "$published_stage" ]; then
+        if ! mv -- "$published_destination" "$published_stage"; then
+          echo "franken-stack checkout: could not roll back $published_destination" >&2
+        fi
+      fi
+    done
+  fi
 
   if [ -n "$CURRENT_TEMP" ] && [ -e "$CURRENT_TEMP" ]; then
     # This is always a uniquely named temporary marker owned by this process.
@@ -166,6 +265,7 @@ cleanup() {
   if [ -d "$STAGING_ROOT" ]; then
     rmdir -- "$STAGING_ROOT" 2>/dev/null || true
   fi
+  release_materializer_lock
   return "$status"
 }
 
@@ -309,26 +409,18 @@ verify_staging_marker() {
     die "$stage has an unexpected staging attestation; refusing to resume it"
 }
 
-publish_staged_checkout() {
+verify_staging_origin() {
   local repository=$1
-  local revision=$2
-  local stage=$3
-  local destination=$4
+  local stage=$2
+  local expected_url=$3
+  local actual_url
 
-  [ ! -e "$destination" ] && [ ! -L "$destination" ] || \
-    die "$destination appeared while staging; refusing to overwrite it"
-  [ ! -L "$stage" ] || die "$stage is a symlink; refusing to publish it"
-  fsync_path "$stage/.git"
-  fsync_path "$stage"
-  # DESTINATION_ROOT and STAGING_ROOT are on the same filesystem by construction.
-  mv -- "$stage" "$destination"
-  CURRENT_STAGE=''
-  CURRENT_STAGE_ATTESTED=0
-  fsync_path "$DESTINATION_ROOT"
-  echo "franken-stack: checked out ${repository}@${revision}"
+  actual_url=$(git -C "$stage" remote get-url origin 2>/dev/null || true)
+  origin_matches "$repository" "$expected_url" "$actual_url" || \
+    die "$stage has unexpected origin; refusing to fetch from it"
 }
 
-checkout_repository() {
+prepare_repository() {
   local repository=$1
   local revision=$2
   local destination="$DESTINATION_ROOT/$repository"
@@ -402,6 +494,10 @@ checkout_repository() {
   [ -z "$status" ] || \
     die "$stage has unknown local changes; refusing to overwrite staged files"
 
+  # Check the configured remote independently of HEAD. A resumable stage can
+  # have a valid-looking checkout while its origin was replaced after a
+  # previous interrupted run; never fetch from that origin before rejecting it.
+  verify_staging_origin "$repository" "$stage" "$repository_url"
   if ! checkout_identity_matches "$repository" "$revision" "$stage" "$repository_url"; then
     git -C "$stage" fetch --depth 1 origin "$revision"
     git -C "$stage" -c advice.detachedHead=false checkout --detach FETCH_HEAD
@@ -420,7 +516,62 @@ checkout_repository() {
     write_atomic_text "$marker" "$(managed_marker_contents "$repository" "$revision")"
   fi
 
-  publish_staged_checkout "$repository" "$revision" "$stage" "$destination"
+  PENDING_REPOSITORIES+=("$repository")
+  PENDING_REVISIONS+=("$revision")
+  PENDING_STAGES+=("$stage")
+  PENDING_DESTINATIONS+=("$destination")
+  echo "franken-stack: staged ${repository}@${revision}"
+}
+
+materialized_repository_path() {
+  local repository=$1
+  local destination="$DESTINATION_ROOT/$repository"
+  local stage="$STAGING_ROOT/$repository"
+
+  if [ -d "$destination" ] && [ ! -L "$destination" ]; then
+    printf '%s\n' "$destination"
+    return 0
+  fi
+  if [ -d "$stage" ] && [ ! -L "$stage" ]; then
+    printf '%s\n' "$stage"
+    return 0
+  fi
+  die "missing materialized checkout for $repository"
+}
+
+publish_staged_checkout() {
+  local repository=$1
+  local revision=$2
+  local stage=$3
+  local destination=$4
+
+  [ ! -e "$destination" ] && [ ! -L "$destination" ] || \
+    die "$destination appeared while staging; refusing to overwrite it"
+  [ ! -L "$stage" ] || die "$stage is a symlink; refusing to publish it"
+  fsync_path "$stage/.git"
+  fsync_path "$stage"
+  # DESTINATION_ROOT and STAGING_ROOT are on the same filesystem by construction.
+  mv -- "$stage" "$destination"
+  PUBLISHED_STAGES+=("$stage")
+  PUBLISHED_DESTINATIONS+=("$destination")
+  CURRENT_STAGE=''
+  CURRENT_STAGE_ATTESTED=0
+  fsync_path "$DESTINATION_ROOT"
+  echo "franken-stack: checked out ${repository}@${revision}"
+}
+
+publish_pending_checkouts() {
+  local index
+
+  for index in "${!PENDING_REPOSITORIES[@]}"; do
+    CURRENT_STAGE=${PENDING_STAGES[$index]}
+    CURRENT_STAGE_ATTESTED=1
+    publish_staged_checkout \
+      "${PENDING_REPOSITORIES[$index]}" \
+      "${PENDING_REVISIONS[$index]}" \
+      "${PENDING_STAGES[$index]}" \
+      "${PENDING_DESTINATIONS[$index]}"
+  done
 }
 
 # The locked SQLModel revision currently uses a normal semver requirement for
@@ -475,8 +626,10 @@ is_cargo_caret_compatible() {
 }
 
 verify_sqlmodel_asupersync_compatibility() {
-  local asu_toml="$DESTINATION_ROOT/asupersync/Cargo.toml"
-  local sql_toml="$DESTINATION_ROOT/sqlmodel_rust/Cargo.toml"
+  local asu_root=${1:?asupersync checkout path is required}
+  local sql_root=${2:?SQLModel checkout path is required}
+  local asu_toml="$asu_root/Cargo.toml"
+  local sql_toml="$sql_root/Cargo.toml"
   local asu_ver
   local requirements
   local requirement_count
@@ -553,9 +706,18 @@ verify_sqlmodel_asupersync_compatibility() {
 verify_staging_tree
 
 for index in "${!LOCK_REPOSITORIES[@]}"; do
-  checkout_repository "${LOCK_REPOSITORIES[$index]}" "${LOCK_REVISIONS[$index]}"
+  prepare_repository "${LOCK_REPOSITORIES[$index]}" "${LOCK_REVISIONS[$index]}"
 done
 
 verify_staging_tree
 
-verify_sqlmodel_asupersync_compatibility
+# Compatibility is a bundle-level preflight. It must inspect staged paths for
+# new checkouts and existing destinations for reused ones before any rename
+# into the final destination tree.
+PREFLIGHT_FAILED=1
+verify_sqlmodel_asupersync_compatibility \
+  "$(materialized_repository_path asupersync)" \
+  "$(materialized_repository_path sqlmodel_rust)"
+PREFLIGHT_FAILED=0
+
+publish_pending_checkouts
