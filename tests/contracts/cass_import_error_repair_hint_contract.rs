@@ -88,6 +88,19 @@ fn repair_hint_for_io_points_to_workspace_permissions() -> TestResult {
 }
 
 #[test]
+fn repair_hint_for_ledger_attempt_lost_requests_a_fresh_attempt() -> TestResult {
+    let error = CassImportError::LedgerAttemptLost {
+        ledger_id: "imp_01234567890123456789012345".to_string(),
+        expected_attempt_count: 7,
+    };
+    ensure_equal(
+        &error.repair_hint(),
+        &Some("retry the CASS import to acquire a fresh owner/attempt lease"),
+        "LedgerAttemptLost repair_hint",
+    )
+}
+
+#[test]
 fn repair_hint_for_storage_points_to_ee_init_repair_plan() -> TestResult {
     let error = CassImportError::Storage(DbError::MalformedRow {
         operation: DbOperation::Query,

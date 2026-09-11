@@ -367,6 +367,11 @@ pub enum CassImportError {
         path: PathBuf,
         message: String,
     },
+    /// The completion no longer owns the running ledger attempt.
+    LedgerAttemptLost {
+        ledger_id: String,
+        expected_attempt_count: u32,
+    },
     Storage(DbError),
 }
 
@@ -380,6 +385,9 @@ impl CassImportError {
             Self::InvalidJson { .. } => Some("run cass api-version --json and cass doctor --json"),
             Self::InvalidSince { .. } => Some("use --since with a duration like 90d, 24h, or 7d3h"),
             Self::Io { .. } => Some("check workspace and database path permissions"),
+            Self::LedgerAttemptLost { .. } => {
+                Some("retry the CASS import to acquire a fresh owner/attempt lease")
+            }
             Self::Storage(_) => Some("ee init --workspace . --repair-plan"),
         }
     }
@@ -446,6 +454,16 @@ impl fmt::Display for CassImportError {
                 let path = bounded_public_cass_text(path.to_string_lossy().as_ref(), 1_024);
                 let message = bounded_public_cass_text(message, 2_048);
                 write!(formatter, "I/O error at {path}: {message}")
+            }
+            Self::LedgerAttemptLost {
+                ledger_id,
+                expected_attempt_count,
+            } => {
+                let ledger_id = bounded_public_cass_text(ledger_id, 256);
+                write!(
+                    formatter,
+                    "CASS import ledger {ledger_id} completion lost its owner/attempt lease at attempt {expected_attempt_count}; retry the import"
+                )
             }
             Self::Storage(error) => {
                 formatter.write_str(&bounded_public_cass_text(&error.to_string(), 2_048))
@@ -1883,13 +1901,26 @@ fn complete_ledger(
     discovered_sessions: &[CassSessionInfo],
     error: Option<&CassImportError>,
 ) -> Result<(), CassImportError> {
+    let terminal_status = if error.is_some() {
+        "failed"
+    } else {
+        "completed"
+    };
     let current = connection
         .get_import_ledger_with_owner(ledger_id)?
         .ok_or_else(|| ledger_attempt_lost_error(ledger_id, expected_attempt_count))?;
-    if current.ledger.status != "running"
-        || current.ledger.attempt_count != expected_attempt_count
+    if current.ledger.attempt_count != expected_attempt_count
         || current.owner_id != expected_owner_id
     {
+        return Err(ledger_attempt_lost_error(ledger_id, expected_attempt_count));
+    }
+    if current.ledger.status == terminal_status {
+        // The terminal CAS may have committed before the caller observed its
+        // result. Replaying the same owner and attempt is a safe no-op: the
+        // first completion already applied the counters and cursor.
+        return Ok(());
+    }
+    if current.ledger.status != "running" {
         return Err(ledger_attempt_lost_error(ledger_id, expected_attempt_count));
     }
 
@@ -1906,16 +1937,11 @@ fn complete_ledger(
     let session_delta = imported_sessions.max(missing_sessions);
     let span_delta = imported_spans.max(missing_spans);
 
-    let status = if error.is_some() {
-        "failed"
-    } else {
-        "completed"
-    };
     let now = Utc::now().to_rfc3339();
     let applied = connection.complete_import_ledger_attempt_with_owner(
         ledger_id,
         &CompleteImportLedgerInput {
-            status: status.to_string(),
+            status: terminal_status.to_string(),
             cursor_json: Some(import_cursor_json(cursor, error).to_string()),
             imported_session_delta: session_delta,
             imported_span_delta: span_delta,
@@ -1961,12 +1987,10 @@ fn durable_import_counts(
 }
 
 fn ledger_attempt_lost_error(ledger_id: &str, expected_attempt_count: u32) -> CassImportError {
-    CassImportError::Storage(DbError::MalformedRow {
-        operation: DbOperation::CommitTransaction,
-        message: format!(
-            "CASS import ledger {ledger_id} completion lost its owner/attempt lease at attempt {expected_attempt_count}; retry the import"
-        ),
-    })
+    CassImportError::LedgerAttemptLost {
+        ledger_id: ledger_id.to_owned(),
+        expected_attempt_count,
+    }
 }
 
 fn import_cursor_json(cursor: &ImportCursor, error: Option<&CassImportError>) -> JsonValue {
@@ -1998,6 +2022,7 @@ fn error_code(error: &CassImportError) -> &'static str {
         CassImportError::InvalidJson { .. } => "invalid_json",
         CassImportError::InvalidSince { .. } => "invalid_since",
         CassImportError::Io { .. } => "io",
+        CassImportError::LedgerAttemptLost { .. } => "ledger_attempt_lost",
         CassImportError::Storage(_) => "storage",
     }
 }
@@ -2707,6 +2732,29 @@ mod tests {
     }
 
     #[test]
+    fn ledger_attempt_lost_error_has_safe_display_hint_and_code() -> TestResult {
+        let error = CassImportError::LedgerAttemptLost {
+            ledger_id: "/tmp/private/ledger".to_owned(),
+            expected_attempt_count: 7,
+        };
+        ensure_equal(
+            &error.to_string(),
+            &"CASS import ledger [REDACTED_PATH] completion lost its owner/attempt lease at attempt 7; retry the import".to_owned(),
+            "ledger attempt loss display",
+        )?;
+        ensure_equal(
+            &error.repair_hint(),
+            &Some("retry the CASS import to acquire a fresh owner/attempt lease"),
+            "ledger attempt loss repair hint",
+        )?;
+        ensure_equal(
+            &error_code(&error),
+            &"ledger_attempt_lost",
+            "ledger attempt loss error code",
+        )
+    }
+
+    #[test]
     fn failed_import_cursor_includes_subprocess_diagnostics_only_when_available() -> TestResult {
         let cursor = ImportCursor::new();
         let clean_cursor = import_cursor_json(&cursor, None);
@@ -2777,14 +2825,8 @@ mod tests {
         )
         .expect_err("stale owner/attempt must be surfaced to the CASS caller");
         ensure(
-            matches!(
-                stale,
-                CassImportError::Storage(DbError::MalformedRow {
-                    operation: DbOperation::CommitTransaction,
-                    ..
-                })
-            ),
-            format!("stale completion must map to storage: {stale:?}"),
+            matches!(stale, CassImportError::LedgerAttemptLost { .. }),
+            format!("stale completion must map to ledger lease loss: {stale:?}"),
         )?;
 
         let still_running = connection
@@ -2820,7 +2862,7 @@ mod tests {
         )
         .expect_err("missing owner must not authorize completion");
         ensure(
-            matches!(missing_owner, CassImportError::Storage(_)),
+            matches!(missing_owner, CassImportError::LedgerAttemptLost { .. }),
             format!("missing owner must return an explicit lease error: {missing_owner:?}"),
         )?;
 
@@ -2837,7 +2879,7 @@ mod tests {
         )
         .expect_err("a workspace B owner must not complete workspace A");
         ensure(
-            matches!(foreign_owner, CassImportError::Storage(_)),
+            matches!(foreign_owner, CassImportError::LedgerAttemptLost { .. }),
             format!("foreign owner must return an explicit lease error: {foreign_owner:?}"),
         )?;
 
@@ -2854,7 +2896,7 @@ mod tests {
         )
         .expect_err("an owner token must not complete a different ledger identity");
         ensure(
-            matches!(wrong_ledger, CassImportError::Storage(_)),
+            matches!(wrong_ledger, CassImportError::LedgerAttemptLost { .. }),
             format!("wrong ledger identity must return an explicit lease error: {wrong_ledger:?}"),
         )?;
 
@@ -2938,6 +2980,72 @@ mod tests {
             &completed.imported_span_count,
             &1,
             "durable span is reconciled into ledger count",
+        )?;
+        connection.close().map_err(|error| error.to_string())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cass_completion_replays_same_terminal_attempt_without_counter_delta() -> TestResult {
+        let root = unique_test_dir("cass-ledger-terminal-replay")?;
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
+        let database = root.join("ee.db");
+        let connection = DbConnection::open_file(&database).map_err(|error| error.to_string())?;
+        connection.migrate().map_err(|error| error.to_string())?;
+        let workspace_id =
+            ensure_workspace(&connection, &workspace).map_err(|error| error.to_string())?;
+        let ledger = ensure_running_ledger(&connection, &workspace_id, "cass://terminal-replay")
+            .map_err(|error| error.to_string())?;
+
+        let first_cursor = ImportCursor::new();
+        complete_ledger(
+            &connection,
+            &ledger.ledger.id,
+            ledger.ledger.attempt_count,
+            &ledger.owner_id,
+            &first_cursor,
+            2,
+            3,
+            &[],
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let committed = connection
+            .get_import_ledger_with_owner(&ledger.ledger.id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "committed ledger row disappeared".to_owned())?;
+
+        // A caller can retry after a terminal CAS whose response was lost.
+        // Deliberately supply different deltas and cursor state to prove the
+        // replay cannot double-apply counters or rewrite the first result.
+        let mut replay_cursor = ImportCursor::new();
+        replay_cursor.record_discovered();
+        complete_ledger(
+            &connection,
+            &ledger.ledger.id,
+            ledger.ledger.attempt_count,
+            &ledger.owner_id,
+            &replay_cursor,
+            99,
+            101,
+            &[],
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let replayed = connection
+            .get_import_ledger_with_owner(&ledger.ledger.id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "replayed ledger row disappeared".to_owned())?;
+        ensure_equal(
+            &replayed.ledger,
+            &committed.ledger,
+            "same terminal owner replay preserves the first completion",
+        )?;
+        ensure_equal(
+            &replayed.owner_id,
+            &committed.owner_id,
+            "same terminal owner replay preserves ownership",
         )?;
         connection.close().map_err(|error| error.to_string())
     }

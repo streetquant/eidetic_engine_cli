@@ -150,6 +150,19 @@ fn display_for_storage_preserves_safe_inner_wording() -> TestResult {
 }
 
 #[test]
+fn display_for_ledger_attempt_lost_redacts_ledger_identity() -> TestResult {
+    let error = CassImportError::LedgerAttemptLost {
+        ledger_id: "/tmp/private/ledger".to_string(),
+        expected_attempt_count: 7,
+    };
+    ensure_equal(
+        &format!("{error}"),
+        &"CASS import ledger [REDACTED_PATH] completion lost its owner/attempt lease at attempt 7; retry the import".to_string(),
+        "LedgerAttemptLost Display",
+    )
+}
+
+#[test]
 fn display_redacts_unix_windows_unc_file_uri_and_secret_material() -> TestResult {
     let secret = format!("sk_live_{}", "1234567890abcdef1234567890abcdef");
     let cases = [
