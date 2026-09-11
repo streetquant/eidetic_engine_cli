@@ -2454,14 +2454,15 @@ fn db_error_is_transient_sqlite_contention(error: &DbError) -> bool {
 /// (`remember_write_contention_is_retryable`) so the shared DB path and the
 /// remember path agree on what counts as retryable flock contention.
 ///
-/// Deliberately does NOT match "could not open database write lock" (a genuine
-/// path/permission failure) or the symlink-guard `InvalidPath` errors, so only
-/// true gate contention is retried.
+/// Deliberately does NOT match bounded gate exhaustion (the progress-aware
+/// stagnant-holder and absolute-deadline messages), "could not open database
+/// write lock" (a genuine path/permission failure), or the symlink-guard
+/// `InvalidPath` errors. Once the gate has exhausted its own bounded wait,
+/// re-entering an outer retry loop only amplifies contention and defeats the
+/// gate's deadline; only an ordinary contention result is retried here.
 fn write_owner_flock_contention_message_is_retryable(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("could not acquire database write lock")
-        || message.contains("database write lock holder made no progress")
-        || message.contains("database write lock wait deadline exceeded")
 }
 
 fn sqlmodel_error_is_transient_sqlite_contention(error: &sqlmodel_core::Error) -> bool {
@@ -57824,18 +57825,18 @@ mod tests {
             &true,
             "flock acquire-errno is transient",
         )?;
-        // The current progress-aware gate emits these messages when a holder
-        // stays stagnant or the absolute wait budget expires. Keep both
-        // outcomes retryable; otherwise the new fence silently regresses to a
-        // fast failure under cross-process contention.
+        // The progress-aware gate emits these messages when a holder stays
+        // stagnant or the absolute wait budget expires. Those bounded gate
+        // outcomes are terminal for the outer retry loops; retrying them
+        // would amplify contention and defeat the gate's deadline.
         for (message, context) in [
             (
                 "database write lock holder made no progress for 38000ms: Resource temporarily unavailable",
-                "stagnant holder is transient",
+                "stagnant holder exhaustion is terminal",
             ),
             (
                 "database write lock wait deadline exceeded after 300000ms: Resource temporarily unavailable",
-                "wait deadline is transient",
+                "wait deadline exhaustion is terminal",
             ),
         ] {
             let progress_timeout = super::DbError::InvalidPath {
@@ -57845,7 +57846,7 @@ mod tests {
             };
             ensure_equal(
                 &super::db_error_is_transient_sqlite_contention(&progress_timeout),
-                &true,
+                &false,
                 context,
             )?;
         }
