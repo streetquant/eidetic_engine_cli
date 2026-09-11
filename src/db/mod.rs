@@ -47670,7 +47670,7 @@ mod tests {
             "imp_02234567890123456789012345",
             &super::CompleteImportLedgerInput {
                 status: "completed".to_string(),
-                cursor_json: Some(r#"{\"complete\":true}"#.to_string()),
+                cursor_json: Some(r#"{"complete":true}"#.to_string()),
                 imported_session_delta: 1,
                 imported_span_delta: 1,
                 error_code: None,
@@ -47717,7 +47717,7 @@ mod tests {
             "imp_02234567890123456789012345",
             &super::CompleteImportLedgerInput {
                 status: "completed".to_string(),
-                cursor_json: Some(r#"{\"complete\":true,\"second\":true}"#.to_string()),
+                cursor_json: Some(r#"{"complete":true,"second":true}"#.to_string()),
                 imported_session_delta: 3,
                 imported_span_delta: 5,
                 error_code: None,
@@ -47785,7 +47785,7 @@ mod tests {
             "imp_32234567890123456789012345",
             &super::CompleteImportLedgerInput {
                 status: "completed".to_string(),
-                cursor_json: Some(r#"{\"stale\":\"success\"}"#.to_string()),
+                cursor_json: Some(r#"{"stale":"success"}"#.to_string()),
                 imported_session_delta: 9,
                 imported_span_delta: 11,
                 error_code: None,
@@ -47829,7 +47829,7 @@ mod tests {
             "imp_32234567890123456789012345",
             &super::CompleteImportLedgerInput {
                 status: "failed".to_string(),
-                cursor_json: Some(r#"{\"current\":\"failure\"}"#.to_string()),
+                cursor_json: Some(r#"{"current":"failure"}"#.to_string()),
                 imported_session_delta: 1,
                 imported_span_delta: 2,
                 error_code: Some("source_failed".to_string()),
@@ -47868,7 +47868,7 @@ mod tests {
             "imp_32234567890123456789012345",
             &super::CompleteImportLedgerInput {
                 status: "completed".to_string(),
-                cursor_json: Some(r#"{\"duplicate\":true}"#.to_string()),
+                cursor_json: Some(r#"{"duplicate":true}"#.to_string()),
                 imported_session_delta: 99,
                 imported_span_delta: 99,
                 error_code: None,
@@ -47910,7 +47910,7 @@ mod tests {
             "imp_42234567890123456789012345",
             &super::CompleteImportLedgerInput {
                 status: "failed".to_string(),
-                cursor_json: Some(r#"{\"stale\":\"failure\"}"#.to_string()),
+                cursor_json: Some(r#"{"stale":"failure"}"#.to_string()),
                 imported_session_delta: 7,
                 imported_span_delta: 7,
                 error_code: Some("stale_failure".to_string()),
@@ -47926,7 +47926,7 @@ mod tests {
             "imp_42234567890123456789012345",
             &super::CompleteImportLedgerInput {
                 status: "completed".to_string(),
-                cursor_json: Some(r#"{\"current\":\"success\"}"#.to_string()),
+                cursor_json: Some(r#"{"current":"success"}"#.to_string()),
                 imported_session_delta: 2,
                 imported_span_delta: 3,
                 error_code: None,
