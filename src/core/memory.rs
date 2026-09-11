@@ -676,6 +676,7 @@ pub fn remember_memory(
 /// [`remember_memory`] with the search-index publish optionally deferred
 /// (bd-2efx1): the index job is enqueued transactionally but left
 /// pending for a later coalesced drain. Batch-lane internal.
+#[cfg(test)]
 fn remember_memory_with_index_mode(
     options: &RememberMemoryOptions<'_>,
     defer_index_processing: bool,
@@ -1650,6 +1651,7 @@ fn remember_memory_inner_with_store(
                 &audit_details,
                 &index_input,
                 policy_bypass.as_ref(),
+                audit_lane,
                 idempotency_input.as_ref(),
             )
         },
@@ -4737,6 +4739,7 @@ pub(crate) fn record_prepared_remember_txn_write_in_txn(
         &write.index_input,
         write.finish.policy_bypass.as_ref(),
         None,
+        None,
     )
 }
 
@@ -4757,6 +4760,7 @@ fn record_remembered_memory_in_txn(
     audit_details: &str,
     index_input: &CreateSearchIndexJobInput,
     policy_bypass: Option<&RememberPolicyBypassReport>,
+    audit_lane: Option<&AuditLaneHandle>,
     idempotency_input: Option<&CreateRememberIdempotencyKeyInput>,
 ) -> crate::db::Result<()> {
     match embed_dedup_decision.content_simhash {
@@ -4791,14 +4795,17 @@ fn record_remembered_memory_in_txn(
             },
         )?;
     }
-    emit_remember_audit_events(
-        connection,
-        memory_id,
-        audit_id,
-        memory_input,
-        audit_details,
-        policy_bypass,
-    )?;
+    if audit_lane.is_none() {
+        emit_remember_audit_events(
+            connection,
+            None,
+            memory_id,
+            audit_id,
+            memory_input,
+            audit_details,
+            policy_bypass,
+        )?;
+    }
     if let Some(idempotency_input) = idempotency_input {
         connection.insert_remember_idempotency_key(idempotency_input)?;
     }
@@ -4822,6 +4829,7 @@ fn store_remembered_memory_with_retry(
     audit_details: &str,
     index_input: &CreateSearchIndexJobInput,
     policy_bypass: Option<&RememberPolicyBypassReport>,
+    audit_lane: Option<&AuditLaneHandle>,
     idempotency_input: Option<&CreateRememberIdempotencyKeyInput>,
 ) -> Result<(), DomainError> {
     for attempt in 0..REMEMBER_CONTENTION_MAX_ATTEMPTS {
@@ -4839,10 +4847,26 @@ fn store_remembered_memory_with_retry(
                 audit_details,
                 index_input,
                 policy_bypass,
+                audit_lane,
                 idempotency_input,
             )
         }) {
             Ok(()) => {
+                if let Some(audit_lane) = audit_lane {
+                    emit_remember_audit_events(
+                        connection,
+                        Some(audit_lane),
+                        memory_id,
+                        audit_id,
+                        memory_input,
+                        audit_details,
+                        policy_bypass,
+                    )
+                    .map_err(|error| DomainError::Storage {
+                        message: format!("Failed to emit remember audit event: {error}"),
+                        repair: Some("ee doctor".to_owned()),
+                    })?;
+                }
                 return Ok(());
             }
             Err(error) if remember_write_contention_is_retryable(&error) => {
@@ -5350,6 +5374,7 @@ fn trace_remember_embed_dedup_decision(
 
 fn emit_remember_audit_events(
     connection: &DbConnection,
+    audit_lane: Option<&AuditLaneHandle>,
     memory_id: &str,
     audit_id: &str,
     memory_input: &CreateMemoryInput,
@@ -5365,7 +5390,7 @@ fn emit_remember_audit_events(
         details: Some(audit_details.to_owned()),
     };
     emit_with_direct_fallback(
-        None,
+        audit_lane,
         AuditLaneEvent::from_audit_input(audit_id, 1, &memory_audit),
         |event| insert_audit_event(connection, event),
     )?;
@@ -5380,7 +5405,7 @@ fn emit_remember_audit_events(
                 details: Some(policy_bypass_audit_details(policy_bypass)),
             };
             emit_with_direct_fallback(
-                None,
+                audit_lane,
                 AuditLaneEvent::from_audit_input(policy_audit_id, 2, &policy_audit),
                 |event| insert_audit_event(connection, event),
             )?;
@@ -8321,29 +8346,6 @@ pub fn recover_remember_idempotency(
     })
 }
 
-fn record_remember_idempotency_key(
-    report: &RememberMemoryReport,
-    idempotency_key: &str,
-    request_hash: &str,
-) -> Result<(), DomainError> {
-    let connection = open_remember_database_with_retry(&report.database_path)?;
-    connection
-        .insert_remember_idempotency_key(&CreateRememberIdempotencyKeyInput {
-            workspace_id: report.workspace_id.clone(),
-            idempotency_key: idempotency_key.to_owned(),
-            content_hash: request_hash.to_owned(),
-            memory_id: report.memory_id.to_string(),
-        })
-        .map_err(|error| DomainError::Storage {
-            message: format!(
-                "Memory {} was stored, but recording idempotency key `{idempotency_key}` failed: {error}",
-                report.memory_id
-            ),
-            repair: Some("ee doctor --json".to_owned()),
-        })
-        .map(|_| ())
-}
-
 /// `remember_memory` layered with the bd-1pi9m.4 write controls:
 /// idempotent replay detection and near-duplicate reinforcement. With
 /// default controls this is exactly the plain create path.
@@ -8543,7 +8545,9 @@ pub fn remember_memory_with_controls_typed_fields_and_family(
                 &workspace_path,
                 &database_path,
                 &workspace_id,
-                idempotency_key.as_deref().expect("guarded by is_some"),
+                idempotency_key.as_deref().ok_or_else(|| {
+                    remember_usage_error("idempotency key was not prepared".to_owned())
+                })?,
                 request_hash,
                 options.dry_run,
             )? {
@@ -14304,6 +14308,7 @@ mod tests {
             &index_input,
             None,
             None,
+            None,
         )
         .map_err(|error| error.to_string())?;
 
@@ -14393,6 +14398,7 @@ mod tests {
             None,
             "{}",
             &index_input,
+            None,
             None,
             Some(&duplicate_identity),
         );
@@ -14657,6 +14663,7 @@ mod tests {
             Some("link_embeddedupnew0000000000000"),
             "{}",
             &index_input,
+            None,
             None,
             None,
         )
