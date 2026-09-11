@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eidetic-engine/schemas/ee.backup.import_history.v2.json",
+  "title": "ee.backup.import_history.v2",
+  "description": "Authenticated owner-bearing import history introduced with V122. The owner is covered by the chunk authentication header.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "backupId", "workspaceId", "chunkIndex", "chunkCount", "imports", "authentication"],
+  "properties": {
+    "schema": {"type": "string", "const": "ee.backup.import_history.v2"},
+    "backupId": {"type": "string"},
+    "workspaceId": {"type": "string"},
+    "chunkIndex": {"type": "integer", "minimum": 0},
+    "chunkCount": {"type": "integer", "minimum": 1},
+    "imports": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/checkpoint"}
+    },
+    "authentication": {"$ref": "#/$defs/authentication"}
+  },
+  "$defs": {
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ledger", "cassQuery"],
+      "properties": {
+        "ledger": {"$ref": "#/$defs/ledger"},
+        "cassQuery": {"type": ["string", "null"]}
+      }
+    },
+    "ledger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "workspaceId", "sourceKind", "sourceId", "status",
+        "cursorJson", "importedSessionCount", "importedSpanCount",
+        "attemptCount", "ownerId", "errorCode", "errorMessage", "startedAt",
+        "completedAt", "metadataJson", "createdAt", "updatedAt"
+      ],
+      "properties": {
+        "id": {"type": "string"},
+        "workspaceId": {"type": "string"},
+        "sourceKind": {"type": "string"},
+        "sourceId": {"type": "string"},
+        "status": {"type": "string"},
+        "cursorJson": {"type": ["string", "null"]},
+        "importedSessionCount": {"type": "integer", "minimum": 0},
+        "importedSpanCount": {"type": "integer", "minimum": 0},
+        "attemptCount": {"type": "integer", "minimum": 0},
+        "ownerId": {"type": "string", "minLength": 1},
+        "errorCode": {"type": ["string", "null"]},
+        "errorMessage": {"type": ["string", "null"]},
+        "startedAt": {"type": ["string", "null"]},
+        "completedAt": {"type": ["string", "null"]},
+        "metadataJson": {"type": ["string", "null"]},
+        "createdAt": {"type": "string"},
+        "updatedAt": {"type": "string"}
+      }
+    },
+    "authentication": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["schema", "keyId", "recordCount", "recordsRoot", "mac"],
+      "properties": {
+        "schema": {"type": "string", "const": "ee.mesh.native_import_auth.v1"},
+        "keyId": {"type": "string"},
+        "recordCount": {"type": "integer", "minimum": 0},
+        "recordsRoot": {"type": "string"},
+        "mac": {"type": "string"}
+      }
+    }
+  }
+}
