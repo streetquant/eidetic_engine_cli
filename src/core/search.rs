@@ -10593,6 +10593,18 @@ fn global_store_participates_in_scope(scope: MemoryScope) -> bool {
     )
 }
 
+/// A strict workspace/swarm request must verify each candidate against the
+/// memory database. A missing local row or an unreadable database therefore
+/// cannot be treated as an allowed passthrough candidate.
+#[must_use]
+fn strict_workspace_or_swarm_scope(options: &SearchOptions) -> bool {
+    options.strict_scope
+        && matches!(
+            options.memory_scope,
+            MemoryScope::Swarm | MemoryScope::Workspace
+        )
+}
+
 fn global_store_search_metadata(
     memory: &StoredMemory,
     reference_time: DateTime<Utc>,
@@ -10610,6 +10622,23 @@ fn global_store_search_metadata(
         "utility": memory.utility,
         "importance": memory.importance,
         "provenanceUri": &memory.provenance_uri,
+        // Global-lane hits bypass the local scope enrichment path,
+        // so carry the same standing facets that pack conflict precedence
+        // reads from workspace-backed hits.
+        "trust_class": &memory.trust_class,
+        "trustClass": &memory.trust_class,
+        "trust_subclass": &memory.trust_subclass,
+        "trustSubclass": &memory.trust_subclass,
+        "provenance_chain_hash": &memory.provenance_chain_hash,
+        "provenanceChainHash": &memory.provenance_chain_hash,
+        "provenance_chain_hash_version": &memory.provenance_chain_hash_version,
+        "provenanceChainHashVersion": &memory.provenance_chain_hash_version,
+        "provenance_verification_status": &memory.provenance_verification_status,
+        "provenanceVerificationStatus": &memory.provenance_verification_status,
+        "provenance_verified_at": &memory.provenance_verified_at,
+        "provenanceVerifiedAt": &memory.provenance_verified_at,
+        "provenance_verification_note": &memory.provenance_verification_note,
+        "provenanceVerificationNote": &memory.provenance_verification_note,
         "createdAt": &memory.created_at,
         "updatedAt": &memory.updated_at,
         "valid_from": &memory.valid_from,
@@ -12011,7 +12040,9 @@ fn apply_memory_scope_visibility_with_metadata_mode_collecting(
         options.memory_scope,
         MemoryScope::Swarm | MemoryScope::Workspace
     );
-    if passthrough_scope && !include_passthrough_analysis_metadata {
+    let strict_scope_requires_verification = strict_workspace_or_swarm_scope(options);
+    let allow_passthrough = passthrough_scope && !strict_scope_requires_verification;
+    if allow_passthrough && !include_passthrough_analysis_metadata {
         for hit in &hits {
             stats.record_candidate_id(true, Some(&hit.doc_id));
         }
@@ -12034,14 +12065,20 @@ fn apply_memory_scope_visibility_with_metadata_mode_collecting(
     let database_path = options.resolve_database_path();
     if !explicit_database_path && !database_path.exists() {
         for hit in &hits {
-            stats.record_candidate_id(passthrough_scope, Some(&hit.doc_id));
+            stats.record_candidate_id(allow_passthrough, Some(&hit.doc_id));
         }
-        if passthrough_scope {
+        if allow_passthrough {
             return (hits, stats);
         }
         degraded.push(SearchDegradation::scope_metadata_unavailable(
             "memory database does not exist",
         ));
+        if strict_scope_requires_verification {
+            degraded.push(SearchDegradation::scope_strict_excluded_evidence(
+                options.memory_scope,
+                hits.len(),
+            ));
+        }
         return (Vec::new(), stats);
     }
 
@@ -12049,14 +12086,20 @@ fn apply_memory_scope_visibility_with_metadata_mode_collecting(
         Ok(connection) => connection,
         Err(error) => {
             for hit in &hits {
-                stats.record_candidate_id(passthrough_scope, Some(&hit.doc_id));
+                stats.record_candidate_id(allow_passthrough, Some(&hit.doc_id));
             }
-            if passthrough_scope {
+            if allow_passthrough {
                 return (hits, stats);
             }
             degraded.push(SearchDegradation::scope_metadata_unavailable(
                 &error.to_string(),
             ));
+            if strict_scope_requires_verification {
+                degraded.push(SearchDegradation::scope_strict_excluded_evidence(
+                    options.memory_scope,
+                    hits.len(),
+                ));
+            }
             return (Vec::new(), stats);
         }
     };
@@ -12083,6 +12126,8 @@ fn apply_memory_scope_visibility_with_connection(
     connection: &DbConnection,
     mut preloaded_memories: Option<&mut BTreeMap<String, StoredMemory>>,
 ) -> (Vec<SearchHit>, MemoryScopeStats) {
+    let strict_scope_requires_verification = strict_workspace_or_swarm_scope(options);
+    let allow_passthrough = passthrough_scope && !strict_scope_requires_verification;
     let hit_doc_ids: BTreeSet<String> = hits.iter().map(|hit| hit.doc_id.clone()).collect();
     let hit_doc_refs: Vec<&str> = hit_doc_ids.iter().map(String::as_str).collect();
     let (mut scope_memories, read_error): (
@@ -12092,12 +12137,14 @@ fn apply_memory_scope_visibility_with_connection(
         Ok(memories) => (memories, None),
         Err(error) => (BTreeMap::new(), Some(error.to_string())),
     };
-    if let Some(preloaded) = preloaded_memories.as_deref() {
-        for memory_id in &hit_doc_ids {
-            if let Some(memory) = preloaded.get(memory_id) {
-                scope_memories
-                    .entry(memory_id.clone())
-                    .or_insert_with(|| memory.clone());
+    if !strict_scope_requires_verification {
+        if let Some(preloaded) = preloaded_memories.as_deref() {
+            for memory_id in &hit_doc_ids {
+                if let Some(memory) = preloaded.get(memory_id) {
+                    scope_memories
+                        .entry(memory_id.clone())
+                        .or_insert_with(|| memory.clone());
+                }
             }
         }
     }
@@ -12136,8 +12183,8 @@ fn apply_memory_scope_visibility_with_connection(
                 }
             }
             None => {
-                stats.record_candidate_id(passthrough_scope, Some(&hit.doc_id));
-                if passthrough_scope {
+                stats.record_candidate_id(allow_passthrough, Some(&hit.doc_id));
+                if allow_passthrough {
                     scoped_hits.push(hit);
                 }
             }
@@ -12997,6 +13044,63 @@ mod tests {
             valid_from: None,
             valid_to: None,
         }
+    }
+
+    #[test]
+    fn global_search_metadata_preserves_conflict_precedence_facets() -> TestResult {
+        let workspace = unique_test_dir("global-conflict-facets");
+        let connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
+        connection.migrate().map_err(|error| error.to_string())?;
+        let workspace_id = "wsp_01234567890123456789012345";
+        let memory_id = "mem_00000000000000000000000001";
+        connection
+            .insert_workspace(
+                workspace_id,
+                &CreateWorkspaceInput {
+                    path: workspace.display().to_string(),
+                    name: Some("global-conflict-facets".to_owned()),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let mut input = test_memory_input(workspace_id, "Global conflict facet fixture.");
+        input.trust_subclass = Some("signed_authority".to_owned());
+        connection
+            .insert_memory(memory_id, &input)
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute_raw(
+                "UPDATE memories SET provenance_verification_status = 'verified', provenance_verified_at = '2026-08-01T00:00:00Z', provenance_verification_note = 'fixture verified' WHERE id = 'mem_00000000000000000000000001'",
+            )
+            .map_err(|error| error.to_string())?;
+
+        let memory = connection
+            .get_memory(memory_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "global facet memory missing".to_owned())?;
+        let reference_time = DateTime::parse_from_rfc3339("2026-08-10T00:00:00Z")
+            .map_err(|error| error.to_string())?
+            .with_timezone(&Utc);
+        let metadata = global_store_search_metadata(&memory, reference_time);
+
+        assert_eq!(metadata["trust_class"], "human_explicit");
+        assert_eq!(metadata["trustClass"], "human_explicit");
+        assert_eq!(metadata["trust_subclass"], "signed_authority");
+        assert_eq!(metadata["trustSubclass"], "signed_authority");
+        assert_eq!(metadata["provenance_verification_status"], "verified");
+        assert_eq!(metadata["provenanceVerificationStatus"], "verified");
+        assert_eq!(
+            metadata["provenanceChainHash"],
+            serde_json::json!(&memory.provenance_chain_hash)
+        );
+
+        let trust = search_hit_pack_trust(&metadata);
+        assert_eq!(trust.class, TrustClass::HumanExplicit);
+        assert_eq!(trust.subclass.as_deref(), Some("signed_authority"));
+        assert_eq!(trust.authority_rank, 3);
+        assert_eq!(trust.verification_rank, 3);
+        assert_eq!(trust.confidence_milli, 900);
+
+        connection.close().map_err(|error| error.to_string())
     }
 
     fn fixture_hash_embedding_posture_for_search() -> EmbeddingPosture {
@@ -17022,7 +17126,7 @@ mod tests {
             true,
             SearchSourceMode::Hybrid,
             &Deterministic::from_seed(123),
-            None,
+            Some(Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>),
         )?;
 
         assert!(errors.is_empty(), "search returned errors: {errors:?}");
@@ -18453,6 +18557,210 @@ mod tests {
             EMBED_MODEL_UNAVAILABLE_FEATURE_FLAG
         );
         assert_eq!(rendered[0]["details"]["lexicalAvailable"], true);
+    }
+
+    #[test]
+    fn strict_workspace_and_swarm_scope_exclude_missing_memory_rows() -> TestResult {
+        let workspace = unique_test_dir("strict-scope-missing-row");
+        let connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
+        connection.migrate().map_err(|error| error.to_string())?;
+
+        let mut options = source_mode_test_options(SearchSourceMode::Hybrid, false);
+        options.workspace_path = workspace;
+        options.database_path = None;
+        options.strict_scope = true;
+        let hit = synthetic_hit("mem_00000000000000000000000001", 0.9);
+
+        for scope in [MemoryScope::Workspace, MemoryScope::Swarm] {
+            options.memory_scope = scope;
+            let mut degraded = Vec::new();
+            let (visible, stats) = apply_memory_scope_visibility_with_metadata_mode(
+                &options,
+                vec![hit.clone()],
+                &mut degraded,
+                Some(&connection),
+                true,
+            );
+            assert!(
+                visible.is_empty(),
+                "strict scope must fail closed for a missing memory row"
+            );
+            assert_eq!(stats.strict_violations, 1);
+            assert!(
+                degraded
+                    .iter()
+                    .any(|entry| entry.code == "scope_strict_excluded_evidence"),
+                "strict scope must report excluded evidence: {degraded:?}"
+            );
+        }
+
+        options.memory_scope = MemoryScope::Workspace;
+        options.strict_scope = false;
+        let mut degraded = Vec::new();
+        let (visible, stats) = apply_memory_scope_visibility_with_metadata_mode(
+            &options,
+            vec![hit],
+            &mut degraded,
+            Some(&connection),
+            true,
+        );
+        assert_eq!(
+            visible.len(),
+            1,
+            "permissive workspace scope retains passthrough compatibility"
+        );
+        assert_eq!(stats.strict_violations, 0);
+
+        connection.close().map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn strict_scope_does_not_admit_preloaded_memory_without_local_row() -> TestResult {
+        let workspace = unique_test_dir("strict-scope-preloaded-row");
+        let local_connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
+        local_connection
+            .migrate()
+            .map_err(|error| error.to_string())?;
+
+        let source_connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
+        source_connection
+            .migrate()
+            .map_err(|error| error.to_string())?;
+        let source_workspace_id = "wsp_01234567890123456789012345";
+        let memory_id = "mem_00000000000000000000000001";
+        source_connection
+            .insert_workspace(
+                source_workspace_id,
+                &CreateWorkspaceInput {
+                    path: workspace.display().to_string(),
+                    name: Some("strict-scope-preloaded-row".to_owned()),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        source_connection
+            .insert_memory(
+                memory_id,
+                &test_memory_input(source_workspace_id, "Preloaded global memory."),
+            )
+            .map_err(|error| error.to_string())?;
+        let preloaded_memory = source_connection
+            .get_memory(memory_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "preloaded fixture memory missing".to_owned())?;
+        let mut preloaded = BTreeMap::from([(memory_id.to_owned(), preloaded_memory)]);
+
+        let mut options = source_mode_test_options(SearchSourceMode::Hybrid, false);
+        options.workspace_path = workspace;
+        options.memory_scope = MemoryScope::Workspace;
+        options.strict_scope = true;
+        let mut degraded = Vec::new();
+        let (visible, stats) = apply_memory_scope_visibility_with_metadata_mode_collecting(
+            &options,
+            vec![synthetic_hit(memory_id, 0.9)],
+            &mut degraded,
+            Some(&local_connection),
+            true,
+            Some(&mut preloaded),
+        );
+
+        assert!(
+            visible.is_empty(),
+            "strict scope must verify a local row instead of trusting preloaded evidence"
+        );
+        assert_eq!(stats.strict_violations, 1);
+        assert!(
+            degraded
+                .iter()
+                .any(|entry| entry.code == "scope_strict_excluded_evidence"),
+            "strict preloaded fallback must report excluded evidence: {degraded:?}"
+        );
+
+        source_connection
+            .close()
+            .map_err(|error| error.to_string())?;
+        local_connection.close().map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn strict_scope_excludes_hits_when_memory_read_fails() -> TestResult {
+        let workspace = unique_test_dir("strict-scope-read-error");
+        let connection = DbConnection::open_memory().map_err(|error| error.to_string())?;
+        connection.migrate().map_err(|error| error.to_string())?;
+        connection
+            .execute_raw("PRAGMA foreign_keys = OFF")
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute_raw("ALTER TABLE memories RENAME TO memories_unavailable")
+            .map_err(|error| error.to_string())?;
+
+        let mut options = source_mode_test_options(SearchSourceMode::Hybrid, false);
+        options.workspace_path = workspace;
+        options.database_path = None;
+        options.memory_scope = MemoryScope::Swarm;
+        options.strict_scope = true;
+        let mut degraded = Vec::new();
+        let (visible, stats) = apply_memory_scope_visibility_with_metadata_mode(
+            &options,
+            vec![synthetic_hit("mem_00000000000000000000000001", 0.9)],
+            &mut degraded,
+            Some(&connection),
+            true,
+        );
+
+        assert!(
+            visible.is_empty(),
+            "read failure must fail closed in strict scope"
+        );
+        assert_eq!(stats.strict_violations, 1);
+        assert!(
+            degraded
+                .iter()
+                .any(|entry| entry.code == "scope_metadata_unavailable"),
+            "read failure must remain visible as a degradation: {degraded:?}"
+        );
+        assert!(
+            degraded
+                .iter()
+                .any(|entry| entry.code == "scope_strict_excluded_evidence"),
+            "strict read failure must report excluded evidence: {degraded:?}"
+        );
+
+        connection.close().map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn strict_scope_excludes_hits_when_database_cannot_open() -> TestResult {
+        let workspace = unique_test_dir("strict-scope-open-error");
+        let mut options = source_mode_test_options(SearchSourceMode::Hybrid, false);
+        options.workspace_path = workspace.clone();
+        options.database_path = Some(workspace.join("missing.db"));
+        options.memory_scope = MemoryScope::Workspace;
+        options.strict_scope = true;
+        let mut degraded = Vec::new();
+        let (visible, stats) = apply_memory_scope_visibility_with_metadata_mode(
+            &options,
+            vec![synthetic_hit("mem_00000000000000000000000001", 0.9)],
+            &mut degraded,
+            None,
+            true,
+        );
+
+        assert!(
+            visible.is_empty(),
+            "open failure must fail closed in strict scope"
+        );
+        assert_eq!(stats.strict_violations, 1);
+        assert!(
+            degraded
+                .iter()
+                .any(|entry| entry.code == "scope_metadata_unavailable")
+        );
+        assert!(
+            degraded
+                .iter()
+                .any(|entry| entry.code == "scope_strict_excluded_evidence")
+        );
+        Ok(())
     }
 
     #[test]
