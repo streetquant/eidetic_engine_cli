@@ -22649,7 +22649,7 @@ mod tests {
             let db = DbConnection::open_file(&database).map_err(|e| e.to_string())?;
             let candidate = format!("curate_{:026}", 9);
             db.insert_curation_candidate(&candidate, &crate::db::CreateCurationCandidateInput {
-                workspace_id: workspace_id.clone(), candidate_type: "rule_proposal".to_owned(), target_memory_id: Some(memory_id.clone()),
+                workspace_id: workspace_id.clone(), candidate_type: "rule".to_owned(), target_memory_id: Some(memory_id.clone()),
                 proposed_content: Some("review the release".to_owned()), proposed_confidence: None,
                 proposed_trust_class: None, source_type: "human_request".to_owned(),
                 source_id: None, reason: "review".to_owned(), confidence: 0.75, status: None, created_at: None, ttl_expires_at: None,
