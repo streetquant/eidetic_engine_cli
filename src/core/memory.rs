@@ -3173,6 +3173,10 @@ impl PreparedRememberTxnWrite {
         &self.finish.memory_id
     }
 
+    pub(crate) fn audit_id(&self) -> &str {
+        &self.finish.audit_id
+    }
+
     // Accessor kept for parity with memory_id()/index_dir(); not yet consumed.
     #[allow(dead_code)]
     pub(crate) fn workspace_id(&self) -> &str {

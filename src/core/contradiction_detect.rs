@@ -28,7 +28,7 @@ use chrono::{DateTime, Utc};
 use fnx_classes::Graph;
 use fnx_runtime::CompatibilityMode;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::core::contradiction_guard::{
     ContradictionPrecedence, authority_subclass_rank, confidence_rank_milli,
@@ -870,6 +870,10 @@ pub struct GatheredConflictEdges {
     /// with `resolution=both_valid` metadata): suppressed from the actionable
     /// pair surface, bd-3a1op.4.
     pub both_valid_resolved: std::collections::BTreeSet<(String, String)>,
+    /// Canonical pairs settled by a scope-split resolution. The original
+    /// contradiction edge remains durable history, while this marker keeps it
+    /// off the actionable surface after both sides receive their scopes.
+    pub scope_split_resolved: std::collections::BTreeSet<(String, String)>,
 }
 
 impl GatheredConflictEdges {
@@ -948,6 +952,7 @@ pub fn gather_explicit_conflict_edges_at(
 
     let mut edges = Vec::new();
     let mut both_valid_resolved = std::collections::BTreeSet::new();
+    let mut scope_split_resolved = std::collections::BTreeSet::new();
     for link in &links {
         let signal = match link.relation_enum() {
             Some(MemoryLinkRelation::Contradicts) => ExplicitConflictSignal::ContradictionLink,
@@ -956,20 +961,24 @@ pub fn gather_explicit_conflict_edges_at(
                 // A reviewed both-valid resolution (bd-3a1op.4) marks the pair
                 // as legitimate tension; record it so the surface suppresses
                 // the pair instead of re-flagging a settled conflict.
-                let resolved = link
+                let resolution = link
                     .metadata_json
                     .as_deref()
                     .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
                     .and_then(|meta| {
                         meta.get("resolution")
                             .and_then(serde_json::Value::as_str)
-                            .map(|value| value == "both_valid")
-                    })
-                    .unwrap_or(false);
-                if resolved {
+                            .map(str::to_owned)
+                    });
+                if matches!(resolution.as_deref(), Some("both_valid" | "scope_split")) {
                     let (a, b) = (link.src_memory_id.as_str(), link.dst_memory_id.as_str());
                     let pair = if a <= b { (a, b) } else { (b, a) };
-                    both_valid_resolved.insert((pair.0.to_owned(), pair.1.to_owned()));
+                    let pair = (pair.0.to_owned(), pair.1.to_owned());
+                    if resolution.as_deref() == Some("scope_split") {
+                        scope_split_resolved.insert(pair);
+                    } else {
+                        both_valid_resolved.insert(pair);
+                    }
                 }
                 continue;
             }
@@ -1030,6 +1039,7 @@ pub fn gather_explicit_conflict_edges_at(
             Some(read_errors.join("; "))
         },
         both_valid_resolved,
+        scope_split_resolved,
     }
 }
 
@@ -1503,6 +1513,9 @@ fn assemble_conflict_surface_components(
         if gathered
             .both_valid_resolved
             .contains(&(low.clone(), high.clone()))
+            || gathered
+                .scope_split_resolved
+                .contains(&(low.clone(), high.clone()))
         {
             continue;
         }
@@ -1516,7 +1529,11 @@ fn assemble_conflict_surface_components(
         // A tombstoned side means the conflict was already resolved (superseded,
         // rejected, or expired): the pair is history, not an actionable conflict.
         // Deterministic — keyed on the persisted tombstone, never wall clock.
-        if a.tombstoned_at.is_some() || b.tombstoned_at.is_some() {
+        if a.tombstoned_at.is_some()
+            || b.tombstoned_at.is_some()
+            || !body_memory_is_current(&a, reference_time)
+            || !body_memory_is_current(&b, reference_time)
+        {
             continue;
         }
         let (preferred, reason, a_pref, b_pref) = preferred_side_at(&a, &b, reference_time);
@@ -1617,7 +1634,7 @@ pub fn assemble_conflict_surface_v2_at(
 pub const CONFLICT_RESOLVE_SCHEMA_V1: &str = "ee.conflict.resolve.v1";
 
 /// Resolution verb vocabulary (ADR 0066 verb table).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ResolveVerb {
     /// Keeper supersedes the loser: supersede link + validity close + decision.
@@ -1655,7 +1672,7 @@ impl ResolveVerb {
 /// One planned mutation atom. Every atom maps 1:1 onto an EXISTING audited
 /// core operation (`decide_record`, `expire_memory`, `update_memory_link`,
 /// `update_memory_tags`) — the plan never introduces a novel mutation path.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "camelCase")]
 pub enum PlannedResolutionAction {
     /// `decide_record` — when `supersedes` is set the one atom also creates
@@ -1676,6 +1693,10 @@ pub enum PlannedResolutionAction {
         from: String,
         to: String,
         relation: String,
+        /// Optional durable resolution marker carried by the link action.
+        /// Plain related links remain observational and do not settle a pair.
+        #[serde(default)]
+        metadata_json: Option<String>,
     },
     /// `update_memory_tags` patch(add) — audited scope tagging.
     #[serde(rename_all = "camelCase")]
@@ -1686,7 +1707,7 @@ pub enum PlannedResolutionAction {
 }
 
 /// The dry-run-visible mutation plan for one conflict pair.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConflictResolutionPlan {
     pub conflict_id: String,
@@ -1735,6 +1756,24 @@ pub enum ConflictResolutionOutcome {
 
 fn decision_topic(pair: &ConflictPairView) -> String {
     format!("conflict:{}", pair.conflict_id)
+}
+
+fn alternatives_with_fallback(
+    chosen: &str,
+    preferred: Option<String>,
+    fallback: &str,
+) -> Vec<String> {
+    let mut alternatives = Vec::new();
+    if let Some(preferred) = preferred
+        && !preferred.trim().is_empty()
+        && preferred != chosen
+    {
+        alternatives.push(preferred);
+    }
+    if alternatives.is_empty() && fallback != chosen {
+        alternatives.push(fallback.to_owned());
+    }
+    alternatives
 }
 
 fn head(content: &str) -> String {
@@ -1848,30 +1887,42 @@ pub fn plan_conflict_resolution(
 
     let actions = match request.verb {
         ResolveVerb::Supersede => {
-            // One existing atom: decide_record(supersedes=loser) creates the
-            // decision memory, the supersede link, AND closes the loser.
+            // The transaction executor creates the decision, supersede link,
+            // and validity close as one durable operation.
+            let chosen = format!("keep {}", keep.as_deref().unwrap_or_default());
             vec![PlannedResolutionAction::RecordDecision {
                 topic: decision_topic(pair),
-                chosen: format!("keep {}", keep.as_deref().unwrap_or_default()),
-                alternatives: loser_head.into_iter().collect(),
+                alternatives: alternatives_with_fallback(
+                    &chosen,
+                    loser_head,
+                    &format!("reject {}", lose.as_deref().unwrap_or_default()),
+                ),
+                chosen,
                 supersedes: lose.clone(),
             }]
         }
-        ResolveVerb::RejectOne => vec![
-            PlannedResolutionAction::ExpireMemory {
-                memory_id: lose.clone().unwrap_or_default(),
-                reason: request.reason.to_owned(),
-            },
-            PlannedResolutionAction::RecordDecision {
-                topic: decision_topic(pair),
-                chosen: format!(
-                    "keep {}; reject the other side",
-                    keep.as_deref().unwrap_or_default()
-                ),
-                alternatives: loser_head.into_iter().collect(),
-                supersedes: None,
-            },
-        ],
+        ResolveVerb::RejectOne => {
+            let chosen = format!(
+                "keep {}; reject the other side",
+                keep.as_deref().unwrap_or_default()
+            );
+            vec![
+                PlannedResolutionAction::ExpireMemory {
+                    memory_id: lose.clone().unwrap_or_default(),
+                    reason: request.reason.to_owned(),
+                },
+                PlannedResolutionAction::RecordDecision {
+                    topic: decision_topic(pair),
+                    alternatives: alternatives_with_fallback(
+                        &chosen,
+                        loser_head,
+                        &format!("keep only {}", keep.as_deref().unwrap_or_default()),
+                    ),
+                    chosen,
+                    supersedes: None,
+                },
+            ]
+        }
         ResolveVerb::ScopeSplit => {
             if request.scope_a_tags.is_empty() || request.scope_b_tags.is_empty() {
                 return ConflictResolutionOutcome::InvalidRequest {
@@ -1894,6 +1945,20 @@ pub fn plan_conflict_resolution(
                     memory_id: pair.memory_b.id.clone(),
                     tags: request.scope_b_tags.clone(),
                 },
+                PlannedResolutionAction::CreateLink {
+                    from: pair.memory_a.id.clone(),
+                    to: pair.memory_b.id.clone(),
+                    relation: "related".to_owned(),
+                    metadata_json: Some(
+                        serde_json::json!({
+                            "resolution": "scope_split",
+                            "conflictId": pair.conflict_id,
+                            "scopeA": request.scope_a_tags,
+                            "scopeB": request.scope_b_tags,
+                        })
+                        .to_string(),
+                    ),
+                },
                 PlannedResolutionAction::RecordDecision {
                     topic: decision_topic(pair),
                     chosen: format!(
@@ -1903,7 +1968,10 @@ pub fn plan_conflict_resolution(
                         pair.memory_b.id,
                         request.scope_b_tags.join(",")
                     ),
-                    alternatives: Vec::new(),
+                    alternatives: vec![
+                        format!("scope A: {}", pair.memory_a.id),
+                        format!("scope B: {}", pair.memory_b.id),
+                    ],
                     supersedes: None,
                 },
             ]
@@ -1913,11 +1981,21 @@ pub fn plan_conflict_resolution(
                 from: pair.memory_a.id.clone(),
                 to: pair.memory_b.id.clone(),
                 relation: "related".to_owned(),
+                metadata_json: Some(
+                    serde_json::json!({
+                        "resolution": "both_valid",
+                        "conflictId": pair.conflict_id,
+                    })
+                    .to_string(),
+                ),
             },
             PlannedResolutionAction::RecordDecision {
                 topic: decision_topic(pair),
                 chosen: "both-valid: the tension is legitimate; both memories stand".to_owned(),
-                alternatives: Vec::new(),
+                alternatives: vec![
+                    format!("keep only {}", pair.memory_a.id),
+                    format!("keep only {}", pair.memory_b.id),
+                ],
                 supersedes: None,
             },
         ],
@@ -2735,6 +2813,72 @@ mod tests {
     }
 
     #[test]
+    fn surface_drops_pairs_with_an_expired_validity_side() {
+        let connection = open_seeded_db();
+        seed_memory(&connection, MEM_A);
+        seed_memory(&connection, MEM_B);
+        seed_link(
+            &connection,
+            LINK_1,
+            MEM_A,
+            MEM_B,
+            MemoryLinkRelation::Contradicts,
+        );
+        connection
+            .expire_memory_valid_to(MEM_B, "2020-01-01T00:00:00Z")
+            .expect("expire loser validity");
+        let reference_time = chrono::DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+            .expect("reference time")
+            .with_timezone(&chrono::Utc);
+        let surface = assemble_conflict_surface_at(
+            &connection,
+            ContradictionDetectionConfig::default(),
+            reference_time,
+        );
+        assert!(
+            surface.pairs.is_empty(),
+            "expired validity side must leave the actionable surface"
+        );
+    }
+
+    #[test]
+    fn surface_suppresses_scope_split_resolved_pairs() {
+        let connection = open_seeded_db();
+        seed_memory(&connection, MEM_A);
+        seed_memory(&connection, MEM_B);
+        seed_link(
+            &connection,
+            LINK_1,
+            MEM_A,
+            MEM_B,
+            MemoryLinkRelation::Contradicts,
+        );
+        connection
+            .insert_memory_link(
+                LINK_2,
+                &CreateMemoryLinkInput {
+                    src_memory_id: MEM_A.to_owned(),
+                    dst_memory_id: MEM_B.to_owned(),
+                    relation: MemoryLinkRelation::Related,
+                    weight: 1.0,
+                    confidence: 1.0,
+                    directed: false,
+                    evidence_count: 1,
+                    last_reinforced_at: None,
+                    source: MemoryLinkSource::Agent,
+                    created_by: Some("conflict-resolve-test".to_owned()),
+                    metadata_json: Some(
+                        r#"{"resolution":"scope_split","conflictId":"cfl_x"}"#.to_owned(),
+                    ),
+                },
+            )
+            .expect("insert scope split marker");
+        let surface =
+            assemble_conflict_surface(&connection, ContradictionDetectionConfig::default());
+        assert!(surface.pairs.is_empty());
+    }
+
+    #[test]
     fn surface_suppresses_both_valid_resolved_pairs() {
         // `ee conflict resolve --verb both-valid` records a related link with
         // resolution metadata; the settled pair must stop being re-flagged.
@@ -3097,7 +3241,7 @@ mod tests {
         let ConflictResolutionOutcome::Plan(plan) = outcome else {
             panic!("expected a plan, got {outcome:?}");
         };
-        assert_eq!(plan.actions.len(), 3);
+        assert_eq!(plan.actions.len(), 4);
         assert!(matches!(
             &plan.actions[0],
             PlannedResolutionAction::AddTags { memory_id, tags }
@@ -3105,8 +3249,49 @@ mod tests {
         ));
         assert!(matches!(
             &plan.actions[2],
-            PlannedResolutionAction::RecordDecision { .. }
+            PlannedResolutionAction::CreateLink {
+                relation,
+                metadata_json: Some(metadata),
+                ..
+            } if relation == "related" && metadata.contains("scope_split")
         ));
+        assert!(matches!(
+            &plan.actions[3],
+            PlannedResolutionAction::RecordDecision { alternatives, .. }
+                if !alternatives.is_empty()
+        ));
+    }
+
+    #[test]
+    fn scope_split_and_both_valid_decisions_have_alternatives() {
+        for (verb, scope_a_tags, scope_b_tags) in [
+            (
+                ResolveVerb::ScopeSplit,
+                vec!["rust".to_owned()],
+                vec!["python".to_owned()],
+            ),
+            (ResolveVerb::BothValid, Vec::new(), Vec::new()),
+        ] {
+            let request = ConflictResolveRequest {
+                memory_a: MEM_A,
+                memory_b: MEM_B,
+                verb,
+                keep: None,
+                reason: "test rationale",
+                scope_a_tags,
+                scope_b_tags,
+            };
+            let ConflictResolutionOutcome::Plan(plan) =
+                plan_conflict_resolution(&fixture_surface(), &request)
+            else {
+                panic!("expected a plan for {}", verb.as_str());
+            };
+            assert!(plan.actions.iter().any(|action| matches!(
+                action,
+                PlannedResolutionAction::RecordDecision { alternatives, .. }
+                    if !alternatives.is_empty()
+            )));
+        }
     }
 
     #[test]

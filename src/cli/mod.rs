@@ -17949,87 +17949,172 @@ where
         };
         return write_domain_error(&error, cli.wants_json(), stdout, stderr);
     };
-    let surface = match conflict::build_conflict_surface(workspace) {
-        Ok(surface) => surface,
-        Err(error) => return write_domain_error(&error, cli.wants_json(), stdout, stderr),
-    };
 
     fn split_tags(raw: Option<&String>) -> Vec<String> {
-        raw.map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|tag| !tag.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+        let mut tags: Vec<String> = raw
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        tags.sort_unstable();
+        tags.dedup();
+        tags
     }
 
     let reason = args
         .reason
         .clone()
         .unwrap_or_else(|| format!("Resolved via ee conflict resolve --verb {}.", verb.as_str()));
+    let scope_a_tags = split_tags(args.scope_a_tags.as_ref());
+    let scope_b_tags = split_tags(args.scope_b_tags.as_ref());
     let request = ConflictResolveRequest {
         memory_a: &args.memory_a,
         memory_b: &args.memory_b,
         verb,
         keep: args.keep.as_deref(),
         reason: &reason,
-        scope_a_tags: split_tags(args.scope_a_tags.as_ref()),
-        scope_b_tags: split_tags(args.scope_b_tags.as_ref()),
+        scope_a_tags,
+        scope_b_tags,
     };
-
-    let plan = match plan_conflict_resolution(&surface, &request) {
-        ConflictResolutionOutcome::Plan(plan) => plan,
-        ConflictResolutionOutcome::StaleSurface { current_pairs } => {
-            let error = DomainError::UsageCodeWithDetails {
-                code: "conflict_resolve_stale_surface",
-                message: format!(
-                    "({}, {}) is not a pair on the CURRENT conflict surface; workspace state \
-                     moved since the conflict was inspected.",
-                    args.memory_a, args.memory_b
-                ),
-                repair: Some(
-                    "ee conflict explain <memory-id> --json  # re-orient on the live surface"
-                        .to_owned(),
-                ),
-                details_json: serde_json::json!({ "currentPairs": current_pairs }).to_string(),
-            };
-            return write_domain_error(&error, cli.wants_json(), stdout, stderr);
-        }
-        ConflictResolutionOutcome::PolicyDenied { message, repair } => {
-            let error = DomainError::PolicyDenied {
-                message,
-                repair: Some(repair),
-            };
-            return write_domain_error(&error, cli.wants_json(), stdout, stderr);
-        }
-        ConflictResolutionOutcome::InvalidRequest { message, repair } => {
-            let error = DomainError::Usage {
-                message,
-                repair: Some(repair),
-            };
-            return write_domain_error(&error, cli.wants_json(), stdout, stderr);
-        }
-    };
-
     let database_path = workspace.join(".ee").join("ee.db");
-    let mut results: Option<Vec<conflict::ResolutionActionResult>> = None;
-    let mut status = "planned";
-    if args.apply {
-        match conflict::execute_conflict_resolution(
+
+    let operation_id = if args.apply {
+        match conflict::conflict_operation_id(
             workspace,
             &database_path,
+            &args.memory_a,
+            &args.memory_b,
+            verb.as_str(),
+            args.keep.as_deref(),
+            &reason,
+            &request.scope_a_tags,
+            &request.scope_b_tags,
+            args.actor.as_deref(),
+        ) {
+            Ok(operation_id) => Some(operation_id),
+            Err(error) => return write_domain_error(&error, cli.wants_json(), stdout, stderr),
+        }
+    } else {
+        None
+    };
+
+    let mut replayed = false;
+    let mut results: Option<Vec<conflict::ResolutionActionResult>> = None;
+    let plan = if let Some(operation_id) = operation_id.as_deref() {
+        match conflict::load_conflict_resolution_replay(workspace, &database_path, operation_id) {
+            Ok(Some((plan, report))) => {
+                replayed = true;
+                results = Some(report.results);
+                plan
+            }
+            Ok(None) => {
+                let surface = match conflict::build_conflict_surface(workspace) {
+                    Ok(surface) => surface,
+                    Err(error) => {
+                        return write_domain_error(&error, cli.wants_json(), stdout, stderr);
+                    }
+                };
+                match plan_conflict_resolution(&surface, &request) {
+                    ConflictResolutionOutcome::Plan(plan) => plan,
+                    ConflictResolutionOutcome::StaleSurface { current_pairs } => {
+                        let error = DomainError::UsageCodeWithDetails {
+                            code: "conflict_resolve_stale_surface",
+                            message: format!(
+                                "({}, {}) is not a pair on the CURRENT conflict surface; workspace state moved since the conflict was inspected.",
+                                args.memory_a, args.memory_b
+                            ),
+                            repair: Some(
+                                "ee conflict explain <memory-id> --json  # re-orient on the live surface"
+                                    .to_owned(),
+                            ),
+                            details_json: serde_json::json!({ "currentPairs": current_pairs })
+                                .to_string(),
+                        };
+                        return write_domain_error(&error, cli.wants_json(), stdout, stderr);
+                    }
+                    ConflictResolutionOutcome::PolicyDenied { message, repair } => {
+                        let error = DomainError::PolicyDenied {
+                            message,
+                            repair: Some(repair),
+                        };
+                        return write_domain_error(&error, cli.wants_json(), stdout, stderr);
+                    }
+                    ConflictResolutionOutcome::InvalidRequest { message, repair } => {
+                        let error = DomainError::Usage {
+                            message,
+                            repair: Some(repair),
+                        };
+                        return write_domain_error(&error, cli.wants_json(), stdout, stderr);
+                    }
+                }
+            }
+            Err(error) => return write_domain_error(&error, cli.wants_json(), stdout, stderr),
+        }
+    } else {
+        let surface = match conflict::build_conflict_surface(workspace) {
+            Ok(surface) => surface,
+            Err(error) => return write_domain_error(&error, cli.wants_json(), stdout, stderr),
+        };
+        match plan_conflict_resolution(&surface, &request) {
+            ConflictResolutionOutcome::Plan(plan) => plan,
+            ConflictResolutionOutcome::StaleSurface { current_pairs } => {
+                let error = DomainError::UsageCodeWithDetails {
+                    code: "conflict_resolve_stale_surface",
+                    message: format!(
+                        "({}, {}) is not a pair on the CURRENT conflict surface; workspace state moved since the conflict was inspected.",
+                        args.memory_a, args.memory_b
+                    ),
+                    repair: Some(
+                        "ee conflict explain <memory-id> --json  # re-orient on the live surface"
+                            .to_owned(),
+                    ),
+                    details_json: serde_json::json!({ "currentPairs": current_pairs }).to_string(),
+                };
+                return write_domain_error(&error, cli.wants_json(), stdout, stderr);
+            }
+            ConflictResolutionOutcome::PolicyDenied { message, repair } => {
+                let error = DomainError::PolicyDenied {
+                    message,
+                    repair: Some(repair),
+                };
+                return write_domain_error(&error, cli.wants_json(), stdout, stderr);
+            }
+            ConflictResolutionOutcome::InvalidRequest { message, repair } => {
+                let error = DomainError::Usage {
+                    message,
+                    repair: Some(repair),
+                };
+                return write_domain_error(&error, cli.wants_json(), stdout, stderr);
+            }
+        }
+    };
+
+    let mut status = "planned";
+    if args.apply && !replayed {
+        let Some(operation_id) = operation_id.as_deref() else {
+            unreachable!("apply conflict resolution always has an operation id");
+        };
+        match conflict::execute_conflict_resolution_idempotent(
+            workspace,
+            &database_path,
+            operation_id,
             &plan,
             &reason,
             args.actor.as_deref(),
         ) {
-            Ok(applied) => {
-                results = Some(applied);
+            Ok(report) => {
+                replayed = report.replayed;
+                results = Some(report.results);
                 status = "applied";
             }
             Err(error) => return write_domain_error(&error, cli.wants_json(), stdout, stderr),
         }
+    } else if args.apply {
+        status = "applied";
     }
 
     let data = serde_json::json!({
@@ -18039,17 +18124,21 @@ where
         "persisted": args.apply,
         "verb": verb.as_str(),
         "reason": reason,
+        "operationId": operation_id,
+        "replayed": replayed,
         "plan": plan,
         "results": results,
     });
     match cli.renderer() {
         output::Renderer::Human | output::Renderer::Markdown => {
+            let replay_suffix = if replayed { " (replayed)" } else { "" };
             let mut text = format!(
-                "conflict resolve {} — {} ↔ {} ({}):\n",
+                "conflict resolve {} — {} ↔ {} ({}{}):\n",
                 verb.as_str(),
                 plan.memory_a,
                 plan.memory_b,
-                status
+                status,
+                replay_suffix
             );
             for action in &plan.actions {
                 text.push_str(&format!(
