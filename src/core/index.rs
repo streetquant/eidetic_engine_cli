@@ -6341,6 +6341,30 @@ pub(crate) async fn prepare_search_embedder_for_workspace(
                 }
             })?
         {
+            #[cfg(test)]
+            if let Some(stack) = TEST_WORKSPACE_EMBEDDER_STACK_OVERRIDES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .ok()
+                .and_then(|overrides| overrides.get(&workspace_id).cloned())
+            {
+                let backend = if stack.fast().is_semantic() {
+                    EmbedBackend::NeuralLocal
+                } else {
+                    EmbedBackend::HashFallback
+                };
+                let model_resolution = if stack.fast().is_semantic() {
+                    EmbedModelResolution::ready(EmbedModelSource::Registered)
+                } else {
+                    EmbedModelResolution::deterministic_hash()
+                };
+                return Ok(EmbedderPreparation::new(
+                    backend,
+                    model_resolution,
+                    started.elapsed(),
+                    stack.fast_arc(),
+                ));
+            }
             if let Some(selection) = workspace_registry_embedder_selection(&db, &workspace_id)
                 .map_err(|error| SearchError::SubsystemError {
                     subsystem: "model registry",
