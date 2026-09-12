@@ -9,6 +9,8 @@
     "status",
     "dryRun",
     "persisted",
+    "operationId",
+    "replayed",
     "verb",
     "reason",
     "plan"
@@ -28,6 +30,14 @@
     },
     "persisted": {
       "type": "boolean"
+    },
+    "operationId": {
+      "type": ["string", "null"],
+      "description": "Deterministic operation receipt id when --apply is requested; null for a dry run."
+    },
+    "replayed": {
+      "type": "boolean",
+      "description": "True when the durable operation receipt was returned without applying mutations again."
     },
     "verb": {
       "type": "string",

@@ -107,6 +107,7 @@ pub mod audit_actions {
     pub const MEMORY_TAG_REMOVE: &str = "memory.tag.remove";
     pub const MEMORY_TAG_SET: &str = "memory.tag.set";
     pub const MEMORY_LINK_CREATE: &str = "memory.link.create";
+    pub const MEMORY_LINK_UPDATE: &str = "memory.link.update";
     /// `ee remember --reinforce` strengthened an existing near-duplicate
     /// memory instead of inserting a new row (bd-1pi9m.4). Details carry
     /// `ee.audit.memory_reinforce.v1`: similarity, threshold, sourceUris,
@@ -29211,6 +29212,28 @@ impl DbConnection {
         )?;
 
         rows.first().map(stored_memory_link_from_row).transpose()
+    }
+
+    /// Update only the metadata on an existing memory link.
+    ///
+    /// Conflict resolution uses this to upgrade a pre-existing plain Related
+    /// edge with its durable scope/both-valid marker while retaining the
+    /// original edge identity and provenance. The database CHECK constraint
+    /// continues to validate JSON metadata.
+    pub fn update_memory_link_metadata(
+        &self,
+        id: &str,
+        metadata_json: Option<&str>,
+    ) -> Result<bool> {
+        let affected = self.execute_for(
+            DbOperation::Execute,
+            "UPDATE memory_links SET metadata_json = ?1 WHERE id = ?2",
+            &[
+                metadata_json.map_or(Value::Null, |metadata| Value::Text(metadata.to_owned())),
+                Value::Text(id.to_owned()),
+            ],
+        )?;
+        Ok(affected > 0)
     }
 
     /// Find the row occupying the unique ordered endpoint/relation key.

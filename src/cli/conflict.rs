@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::contradiction_detect::{
     ConflictResolutionPlan, ConflictSurface, ContradictionDetectionConfig, PlannedResolutionAction,
-    assemble_conflict_surface,
+    assemble_conflict_surface_for_workspace,
 };
 use crate::db::{DbConnection, MemoryLinkRelation, MemoryLinkSource};
 use crate::models::{DomainError, MemoryId, RESPONSE_SCHEMA_V2};
@@ -205,6 +205,12 @@ fn read_operation_receipt_db(
             "conflict operation receipt {operation_id} has an identity mismatch"
         )));
     }
+    if receipt.schema != CONFLICT_OPERATION_RECEIPT_SCHEMA {
+        return Err(conflict_malformed(format!(
+            "conflict operation receipt {operation_id} has schema {}",
+            receipt.schema
+        )));
+    }
     Ok(Some(receipt))
 }
 
@@ -303,7 +309,11 @@ fn current_pair_matches(
     {
         return Ok(false);
     }
-    let surface = assemble_conflict_surface(connection, ContradictionDetectionConfig::default());
+    let surface = assemble_conflict_surface_for_workspace(
+        connection,
+        workspace_id,
+        ContradictionDetectionConfig::default(),
+    );
     Ok(surface.pairs.iter().any(|pair| {
         pair.conflict_id == plan.conflict_id
             && ((pair.memory_a.id == plan.memory_a && pair.memory_b.id == plan.memory_b)
@@ -522,6 +532,22 @@ fn add_tags_in_txn(
     Ok(vec![audit_id])
 }
 
+fn merge_link_metadata(existing: Option<&str>, requested: &str) -> crate::db::Result<String> {
+    let requested_value: serde_json::Value = serde_json::from_str(requested)
+        .map_err(|error| conflict_malformed(format!("invalid conflict link metadata: {error}")))?;
+    let Some(requested_object) = requested_value.as_object() else {
+        return Ok(requested.to_owned());
+    };
+    let mut merged = existing
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    merged.extend(requested_object.clone());
+    serde_json::to_string(&serde_json::Value::Object(merged)).map_err(|error| {
+        conflict_malformed(format!("cannot serialize conflict link metadata: {error}"))
+    })
+}
+
 fn create_link_in_txn(
     connection: &DbConnection,
     workspace_id: &str,
@@ -550,7 +576,53 @@ fn create_link_in_txn(
     let existing = connection
         .get_memory_link_by_edge(from, to, relation)?
         .or(connection.get_memory_link_by_edge(to, from, relation)?);
-    if existing.is_some() {
+    if let Some(existing) = existing {
+        // A pre-existing plain Related edge must be upgraded with the durable
+        // resolution marker. Without this update, scope-split would leave the
+        // contradiction actionable after tagging both sides, and replay would
+        // have no evidence that the edge settled the pair.
+        if relation == MemoryLinkRelation::Related && metadata_json.is_some() {
+            let Some(metadata_json) = metadata_json else {
+                return Ok(Vec::new());
+            };
+            let merged_metadata =
+                merge_link_metadata(existing.metadata_json.as_deref(), metadata_json)?;
+            if !connection.update_memory_link_metadata(&existing.id, Some(&merged_metadata))? {
+                return Err(conflict_malformed(format!(
+                    "existing memory link {} disappeared during conflict resolution",
+                    existing.id
+                )));
+            }
+            let audit_id = crate::db::generate_audit_id();
+            connection.insert_audit(
+                &audit_id,
+                &crate::db::CreateAuditInput {
+                    workspace_id: Some(workspace_id.to_owned()),
+                    actor: actor
+                        .map(str::to_owned)
+                        .or_else(|| Some("ee conflict resolve".to_owned())),
+                    action: crate::db::audit_actions::MEMORY_LINK_UPDATE.to_owned(),
+                    target_type: Some("memory_link".to_owned()),
+                    target_id: Some(existing.id.clone()),
+                    details: Some(
+                        serde_json::json!({
+                            "schema": "ee.audit.memory_link.v1",
+                            "linkId": existing.id,
+                            "sourceMemoryId": existing.src_memory_id,
+                            "targetMemoryId": existing.dst_memory_id,
+                            "relation": relation.as_str(),
+                            "resolution": plan.verb.as_str(),
+                            "previousMetadata": existing.metadata_json
+                                .as_deref()
+                                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
+                            "metadata": serde_json::from_str::<serde_json::Value>(&merged_metadata).ok(),
+                        })
+                        .to_string(),
+                    ),
+                },
+            )?;
+            return Ok(vec![audit_id]);
+        }
         return Ok(Vec::new());
     }
     let link_id = conflict_memory_link_id();
@@ -912,8 +984,10 @@ fn open_workspace_db(workspace: &Path) -> Result<DbConnection, DomainError> {
 /// Build the full read-only conflict surface for a workspace.
 pub fn build_conflict_surface(workspace: &Path) -> Result<ConflictSurface, DomainError> {
     let connection = open_workspace_db(workspace)?;
-    Ok(assemble_conflict_surface(
+    let workspace_id = crate::core::memory::workspace_id_for_database(&connection, workspace);
+    Ok(assemble_conflict_surface_for_workspace(
         &connection,
+        &workspace_id,
         ContradictionDetectionConfig::default(),
     ))
 }
@@ -1011,8 +1085,9 @@ mod tests {
     use super::{
         CONFLICT_OPERATION_AUDIT_ACTION, ConflictCommand, ConflictExecutionReport,
         ConflictListArgs, ConflictResolutionPlan, PlannedResolutionAction, build_conflict_surface,
-        conflict_operation_id, execute_conflict_resolution_idempotent, render_conflict_human,
-        render_conflict_json, truncate_body,
+        build_conflict_surface_for_memory, conflict_operation_id,
+        execute_conflict_resolution_idempotent, load_conflict_resolution_replay,
+        render_conflict_human, render_conflict_json, truncate_body,
     };
     use crate::core::contradiction_detect::{
         CONFLICT_SURFACE_SCHEMA_V1, ConflictSurface, ResolveVerb,
@@ -1025,7 +1100,12 @@ mod tests {
 
     const MEMORY_A: &str = "mem_00000000000000000000000001";
     const MEMORY_B: &str = "mem_00000000000000000000000002";
+    const MEMORY_C: &str = "mem_00000000000000000000000003";
+    const MEMORY_D: &str = "mem_00000000000000000000000004";
     const LINK_ID: &str = "link_00000000000000000000000001";
+    const LINK_OTHER_ID: &str = "link_00000000000000000000000002";
+    const LINK_CROSS_WORKSPACE_ID: &str = "link_00000000000000000000000003";
+    const LINK_RELATED_ID: &str = "link_00000000000000000000000004";
 
     struct ConflictFixture {
         _temp: tempfile::TempDir,
@@ -1227,6 +1307,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_surfaces_are_scoped_to_the_requested_workspace() {
+        let fixture = fixture();
+        let other_workspace = fixture.workspace.join("other-workspace");
+        std::fs::create_dir(&other_workspace).expect("other workspace directory");
+        let other_workspace = other_workspace
+            .canonicalize()
+            .expect("canonical other workspace");
+        let other_workspace_id = stable_workspace_id(&other_workspace);
+        let connection = DbConnection::open_file(&fixture.database).expect("reopen fixture");
+        connection
+            .insert_workspace(
+                &other_workspace_id,
+                &CreateWorkspaceInput {
+                    path: other_workspace.to_string_lossy().into_owned(),
+                    name: Some("other conflict workspace".to_owned()),
+                },
+            )
+            .expect("other workspace row");
+        for (id, content) in [(MEMORY_C, "claim C"), (MEMORY_D, "claim D")] {
+            connection
+                .insert_memory(
+                    id,
+                    &CreateMemoryInput {
+                        workspace_id: other_workspace_id.clone(),
+                        level: "semantic".to_owned(),
+                        kind: "fact".to_owned(),
+                        content: content.to_owned(),
+                        workflow_id: None,
+                        confidence: 0.9,
+                        utility: 0.8,
+                        importance: 0.7,
+                        provenance_uri: None,
+                        trust_class: "agent_assertion".to_owned(),
+                        trust_subclass: None,
+                        tags: Vec::new(),
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                )
+                .expect("other workspace memory row");
+        }
+        connection
+            .insert_memory_link(
+                LINK_OTHER_ID,
+                &CreateMemoryLinkInput {
+                    src_memory_id: MEMORY_C.to_owned(),
+                    dst_memory_id: MEMORY_D.to_owned(),
+                    relation: MemoryLinkRelation::Contradicts,
+                    weight: 1.0,
+                    confidence: 1.0,
+                    directed: false,
+                    evidence_count: 1,
+                    last_reinforced_at: None,
+                    source: MemoryLinkSource::Agent,
+                    created_by: Some("scope fixture".to_owned()),
+                    metadata_json: None,
+                },
+            )
+            .expect("other workspace contradiction edge");
+        connection
+            .insert_memory_link(
+                LINK_CROSS_WORKSPACE_ID,
+                &CreateMemoryLinkInput {
+                    src_memory_id: MEMORY_A.to_owned(),
+                    dst_memory_id: MEMORY_C.to_owned(),
+                    relation: MemoryLinkRelation::Contradicts,
+                    weight: 1.0,
+                    confidence: 1.0,
+                    directed: false,
+                    evidence_count: 1,
+                    last_reinforced_at: None,
+                    source: MemoryLinkSource::Agent,
+                    created_by: Some("scope fixture".to_owned()),
+                    metadata_json: None,
+                },
+            )
+            .expect("cross workspace contradiction edge");
+        drop(connection);
+
+        let surface = build_conflict_surface(&fixture.workspace).expect("scoped surface");
+        assert_eq!(surface.pairs.len(), 1);
+        assert_eq!(surface.explicit_edge_count, 1);
+        assert!(surface.pairs.iter().all(|pair| {
+            pair.memory_a.id != MEMORY_C
+                && pair.memory_a.id != MEMORY_D
+                && pair.memory_b.id != MEMORY_C
+                && pair.memory_b.id != MEMORY_D
+        }));
+        let focused_other = build_conflict_surface_for_memory(&fixture.workspace, MEMORY_C)
+            .expect("scoped explain");
+        assert!(focused_other.pairs.is_empty());
+        assert!(focused_other.clusters.is_empty());
+    }
+
     fn reject_one_plan(conflict_id: String) -> ConflictResolutionPlan {
         ConflictResolutionPlan {
             conflict_id: conflict_id.clone(),
@@ -1400,6 +1575,71 @@ mod tests {
     }
 
     #[test]
+    fn scope_split_upgrades_a_plain_related_edge_with_resolution_metadata() {
+        let fixture = fixture();
+        let connection = DbConnection::open_file(&fixture.database).expect("reopen fixture");
+        connection
+            .insert_memory_link(
+                LINK_RELATED_ID,
+                &CreateMemoryLinkInput {
+                    src_memory_id: MEMORY_A.to_owned(),
+                    dst_memory_id: MEMORY_B.to_owned(),
+                    relation: MemoryLinkRelation::Related,
+                    weight: 1.0,
+                    confidence: 1.0,
+                    directed: false,
+                    evidence_count: 1,
+                    last_reinforced_at: None,
+                    source: MemoryLinkSource::Agent,
+                    created_by: Some("plain related edge".to_owned()),
+                    metadata_json: Some(r#"{"provenance":"legacy"}"#.to_owned()),
+                },
+            )
+            .expect("plain related edge");
+        drop(connection);
+
+        let plan = scope_split_plan(live_conflict_id(&fixture));
+        let operation_id = operation_id_with_scopes(&fixture);
+        let report = execute_conflict_resolution_idempotent(
+            &fixture.workspace,
+            &fixture.database,
+            &operation_id,
+            &plan,
+            "fixture rationale",
+            Some("fixture-test"),
+        )
+        .expect("scope split with existing related edge");
+        assert!(!report.replayed);
+        assert!(
+            !report.results[2].audit_ids.is_empty(),
+            "upgrading an existing Related edge must be audited"
+        );
+
+        let connection = DbConnection::open_file(&fixture.database).expect("reopen fixture");
+        let related = connection
+            .get_memory_link_by_edge(MEMORY_A, MEMORY_B, MemoryLinkRelation::Related)
+            .expect("related edge query")
+            .expect("related edge");
+        let metadata: serde_json::Value = serde_json::from_str(
+            related
+                .metadata_json
+                .as_deref()
+                .expect("scope split metadata"),
+        )
+        .expect("scope split metadata json");
+        assert_eq!(metadata["provenance"], "legacy");
+        assert_eq!(metadata["resolution"], "scope_split");
+        assert_eq!(metadata["scopeA"], serde_json::json!(["scope-a"]));
+        assert_eq!(metadata["scopeB"], serde_json::json!(["scope-b"]));
+        assert!(
+            build_conflict_surface(&fixture.workspace)
+                .expect("post-scope-split surface")
+                .pairs
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn reject_one_expires_loser_and_records_durable_decision() {
         let fixture = fixture();
         let plan = reject_one_plan(live_conflict_id(&fixture));
@@ -1544,5 +1784,42 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn durable_receipt_replays_after_connection_reopen() {
+        let fixture = fixture();
+        let plan = both_valid_plan(live_conflict_id(&fixture));
+        let operation_id = operation_id(&fixture, "durable-reopen");
+        let first = execute_conflict_resolution_idempotent(
+            &fixture.workspace,
+            &fixture.database,
+            &operation_id,
+            &plan,
+            "fixture rationale",
+            Some("fixture-test"),
+        )
+        .expect("first durable apply");
+        assert!(!first.replayed);
+
+        let connection = DbConnection::open_file(&fixture.database).expect("reopen durable db");
+        let receipt = connection
+            .get_audit(&operation_id)
+            .expect("durable receipt query")
+            .expect("durable receipt");
+        let details: serde_json::Value =
+            serde_json::from_str(receipt.details.as_deref().expect("receipt details"))
+                .expect("receipt json");
+        assert_eq!(details["schema"], "ee.audit.conflict_resolution.v1");
+        assert_eq!(details["operationId"], operation_id);
+        drop(connection);
+
+        let (replayed_plan, replayed) =
+            load_conflict_resolution_replay(&fixture.workspace, &fixture.database, &operation_id)
+                .expect("load durable replay")
+                .expect("durable replay receipt");
+        assert_eq!(replayed_plan, plan);
+        assert!(replayed.replayed);
+        assert_eq!(replayed.results, first.results);
     }
 }

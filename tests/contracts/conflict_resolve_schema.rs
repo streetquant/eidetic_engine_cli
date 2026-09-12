@@ -92,6 +92,8 @@ fn conflict_resolve_verbs_plan_and_evidence_are_pinned() -> TestResult {
         "status",
         "dryRun",
         "persisted",
+        "operationId",
+        "replayed",
         "verb",
         "reason",
         "plan",
@@ -102,6 +104,23 @@ fn conflict_resolve_verbs_plan_and_evidence_are_pinned() -> TestResult {
     ensure(
         required == expected,
         format!("report required set drifted: {required:?}"),
+    )?;
+    ensure(
+        schema
+            .pointer("/properties/operationId/type")
+            .and_then(Value::as_array)
+            .is_some_and(|types| {
+                types.iter().any(|value| value.as_str() == Some("string"))
+                    && types.iter().any(|value| value.as_str() == Some("null"))
+            }),
+        "operationId must declare string-or-null output type",
+    )?;
+    ensure(
+        schema
+            .pointer("/properties/replayed/type")
+            .and_then(Value::as_str)
+            == Some("boolean"),
+        "replayed must declare boolean output type",
     )?;
 
     // The ADR 0066 verb table, exactly.

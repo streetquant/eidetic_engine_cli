@@ -939,8 +939,63 @@ pub fn gather_explicit_conflict_edges_at(
     connection: &DbConnection,
     reference_time: DateTime<Utc>,
 ) -> GatheredConflictEdges {
+    gather_explicit_conflict_edges_at_with_scope(connection, None, reference_time)
+}
+
+/// Gather explicit conflict edges from one workspace only.
+///
+/// A database may contain several workspace rows (for example after a
+/// migration or when a shared store is used). Conflict surfaces exposed by a
+/// workspace command must never join those rows into one graph. The scope is
+/// applied to both link endpoints and body inference before graph detection so
+/// clusters, counts, and degradation details cannot disclose another
+/// workspace's memory ids.
+#[must_use]
+pub fn gather_explicit_conflict_edges_for_workspace(
+    connection: &DbConnection,
+    workspace_id: &str,
+) -> GatheredConflictEdges {
+    gather_explicit_conflict_edges_at_for_workspace(connection, workspace_id, Utc::now())
+}
+
+/// Gather explicit conflict edges from one workspace at a caller-supplied time.
+#[must_use]
+pub fn gather_explicit_conflict_edges_at_for_workspace(
+    connection: &DbConnection,
+    workspace_id: &str,
+    reference_time: DateTime<Utc>,
+) -> GatheredConflictEdges {
+    gather_explicit_conflict_edges_at_with_scope(connection, Some(workspace_id), reference_time)
+}
+
+fn gather_explicit_conflict_edges_at_with_scope(
+    connection: &DbConnection,
+    workspace_id: Option<&str>,
+    reference_time: DateTime<Utc>,
+) -> GatheredConflictEdges {
     let gathered = GATHERED_SIGNAL_KINDS.to_vec();
     let deferred = DEFERRED_SIGNAL_KINDS.to_vec();
+
+    let mut read_errors = Vec::new();
+    let scoped_memory_ids = match workspace_id {
+        Some(workspace_id) => {
+            match connection.list_memories_for_retrieval(workspace_id, None, true) {
+                Ok(memories) => Some(
+                    memories
+                        .into_iter()
+                        .map(|memory| memory.id)
+                        .collect::<BTreeSet<_>>(),
+                ),
+                Err(error) => {
+                    read_errors.push(format!(
+                        "memories for workspace {workspace_id} could not be read: {error}"
+                    ));
+                    Some(BTreeSet::new())
+                }
+            }
+        }
+        None => None,
+    };
 
     let (links, link_error) = match connection.list_all_memory_links(None) {
         Ok(links) => (links, None),
@@ -950,10 +1005,20 @@ pub fn gather_explicit_conflict_edges_at(
         ),
     };
 
+    if let Some(error) = link_error {
+        read_errors.push(error);
+    }
+
     let mut edges = Vec::new();
     let mut both_valid_resolved = std::collections::BTreeSet::new();
     let mut scope_split_resolved = std::collections::BTreeSet::new();
     for link in &links {
+        if let Some(scoped_memory_ids) = scoped_memory_ids.as_ref()
+            && (!scoped_memory_ids.contains(&link.src_memory_id)
+                || !scoped_memory_ids.contains(&link.dst_memory_id))
+        {
+            continue;
+        }
         let signal = match link.relation_enum() {
             Some(MemoryLinkRelation::Contradicts) => ExplicitConflictSignal::ContradictionLink,
             Some(MemoryLinkRelation::Supersedes) => ExplicitConflictSignal::Supersession,
@@ -993,31 +1058,40 @@ pub fn gather_explicit_conflict_edges_at(
         ));
     }
 
-    let mut read_errors = Vec::new();
-    if let Some(error) = link_error {
-        read_errors.push(error);
-    }
     let mut current_memories = Vec::new();
     let mut body_inference_read_error = false;
-    match connection.list_workspaces() {
-        Ok(workspaces) => {
-            for workspace in workspaces {
-                match connection.list_memories_for_retrieval(&workspace.id, None, false) {
-                    Ok(memories) => current_memories.extend(memories),
-                    Err(error) => {
-                        body_inference_read_error = true;
-                        read_errors.push(format!(
-                            "memories for workspace {} could not be read: {error}",
-                            workspace.id
-                        ));
-                    }
+    match workspace_id {
+        Some(workspace_id) => {
+            match connection.list_memories_for_retrieval(workspace_id, None, false) {
+                Ok(memories) => current_memories.extend(memories),
+                Err(error) => {
+                    body_inference_read_error = true;
+                    read_errors.push(format!(
+                        "memories for workspace {workspace_id} could not be read: {error}"
+                    ));
                 }
             }
         }
-        Err(error) => {
-            body_inference_read_error = true;
-            read_errors.push(format!("workspaces could not be read: {error}"));
-        }
+        None => match connection.list_workspaces() {
+            Ok(workspaces) => {
+                for workspace in workspaces {
+                    match connection.list_memories_for_retrieval(&workspace.id, None, false) {
+                        Ok(memories) => current_memories.extend(memories),
+                        Err(error) => {
+                            body_inference_read_error = true;
+                            read_errors.push(format!(
+                                "memories for workspace {} could not be read: {error}",
+                                workspace.id
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                body_inference_read_error = true;
+                read_errors.push(format!("workspaces could not be read: {error}"));
+            }
+        },
     }
     // An incomplete semantic corpus cannot prove that inferred pairs are
     // complete. Fail closed for unknown body evidence while retaining all
@@ -1064,6 +1138,36 @@ pub fn detect_explicit_contradictions_from_connection_at(
     reference_time: DateTime<Utc>,
 ) -> (ContradictionDetectionReport, GatheredConflictEdges) {
     let gathered = gather_explicit_conflict_edges_at(connection, reference_time);
+    let all_edges = gathered.all_edges();
+    let report = detect_explicit_contradictions(&all_edges, config);
+    (report, gathered)
+}
+
+/// Gather and detect contradictions from one workspace only.
+#[must_use]
+pub fn detect_explicit_contradictions_from_connection_for_workspace(
+    connection: &DbConnection,
+    workspace_id: &str,
+    config: ContradictionDetectionConfig,
+) -> (ContradictionDetectionReport, GatheredConflictEdges) {
+    detect_explicit_contradictions_from_connection_at_for_workspace(
+        connection,
+        workspace_id,
+        config,
+        Utc::now(),
+    )
+}
+
+/// Gather and detect contradictions from one workspace at a caller-supplied time.
+#[must_use]
+pub fn detect_explicit_contradictions_from_connection_at_for_workspace(
+    connection: &DbConnection,
+    workspace_id: &str,
+    config: ContradictionDetectionConfig,
+    reference_time: DateTime<Utc>,
+) -> (ContradictionDetectionReport, GatheredConflictEdges) {
+    let gathered =
+        gather_explicit_conflict_edges_at_for_workspace(connection, workspace_id, reference_time);
     let all_edges = gathered.all_edges();
     let report = detect_explicit_contradictions(&all_edges, config);
     (report, gathered)
@@ -1476,9 +1580,19 @@ fn assemble_conflict_surface_components(
     connection: &DbConnection,
     config: ContradictionDetectionConfig,
     reference_time: DateTime<Utc>,
+    workspace_id: Option<&str>,
 ) -> ConflictSurfaceComponents {
-    let (report, gathered) =
-        detect_explicit_contradictions_from_connection_at(connection, config, reference_time);
+    let (report, gathered) = match workspace_id {
+        Some(workspace_id) => detect_explicit_contradictions_from_connection_at_for_workspace(
+            connection,
+            workspace_id,
+            config,
+            reference_time,
+        ),
+        None => {
+            detect_explicit_contradictions_from_connection_at(connection, config, reference_time)
+        }
+    };
 
     let mut degraded: Vec<String> = Vec::new();
     if let Some(error) = &gathered.read_error {
@@ -1602,7 +1716,29 @@ pub fn assemble_conflict_surface_at(
     config: ContradictionDetectionConfig,
     reference_time: DateTime<Utc>,
 ) -> ConflictSurface {
-    assemble_conflict_surface_components(connection, config, reference_time).into_v1()
+    assemble_conflict_surface_components(connection, config, reference_time, None).into_v1()
+}
+
+/// Assemble the stable v1 conflict surface for one workspace only.
+#[must_use]
+pub fn assemble_conflict_surface_for_workspace(
+    connection: &DbConnection,
+    workspace_id: &str,
+    config: ContradictionDetectionConfig,
+) -> ConflictSurface {
+    assemble_conflict_surface_at_for_workspace(connection, workspace_id, config, Utc::now())
+}
+
+/// Assemble the stable v1 conflict surface for one workspace at a fixed time.
+#[must_use]
+pub fn assemble_conflict_surface_at_for_workspace(
+    connection: &DbConnection,
+    workspace_id: &str,
+    config: ContradictionDetectionConfig,
+    reference_time: DateTime<Utc>,
+) -> ConflictSurface {
+    assemble_conflict_surface_components(connection, config, reference_time, Some(workspace_id))
+        .into_v1()
 }
 
 /// Assemble the additive v2 read-only conflict surface carrying every
@@ -1623,7 +1759,7 @@ pub fn assemble_conflict_surface_v2_at(
     config: ContradictionDetectionConfig,
     reference_time: DateTime<Utc>,
 ) -> ConflictSurfaceV2 {
-    assemble_conflict_surface_components(connection, config, reference_time).into_v2()
+    assemble_conflict_surface_components(connection, config, reference_time, None).into_v2()
 }
 
 // ---------------------------------------------------------------------------
