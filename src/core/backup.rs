@@ -24496,6 +24496,173 @@ mod tests {
     }
 
     #[test]
+    fn backup_restore_rearms_running_index_jobs_without_replaying_publish_leases() -> TestResult {
+        let (tempdir, workspace, database) = fixture().map_err(|error| error.message())?;
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(1)).to_string();
+        let job_id = "sidx_ee08_backup_remote_owner_0000001";
+        let lock_id = crate::db::AdvisoryLockId::index(&workspace_id);
+        let holder_id = "remote-node:backup-publisher-9:ee08";
+
+        let source = DbConnection::open_file(&database).map_err(|error| error.to_string())?;
+        source
+            .insert_search_index_job(
+                job_id,
+                &crate::db::CreateSearchIndexJobInput {
+                    workspace_id: workspace_id.clone(),
+                    job_type: crate::db::SearchIndexJobType::Incremental,
+                    document_source: Some("cass".to_owned()),
+                    document_id: Some("session-ee08-backup".to_owned()),
+                    documents_total: 7,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        ensure(
+            source
+                .start_search_index_job(job_id)
+                .map_err(|error| error.to_string())?,
+            "backup fixture job enters running state",
+        )?;
+        ensure(
+            source
+                .update_search_index_job_progress(job_id, 3)
+                .map_err(|error| error.to_string())?,
+            "backup fixture job records partial progress",
+        )?;
+        ensure(
+            source
+                .acquire_advisory_lock(
+                    &lock_id,
+                    holder_id,
+                    Some(600),
+                    Some("EE-08 backup lease owner"),
+                )
+                .map_err(|error| error.to_string())?
+                .is_acquired(),
+            "backup fixture acquires remote publisher lease",
+        )?;
+        let source_job = source
+            .get_search_index_job(job_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("backup fixture job disappeared")?;
+        ensure_equal(
+            source
+                .is_lock_held(&lock_id)
+                .map_err(|error| error.to_string())?
+                .map(|lock| lock.holder_id),
+            Some(holder_id.to_owned()),
+            "source lease owner is persisted before backup",
+        )?;
+        source.close().map_err(|error| error.to_string())?;
+
+        let backup = create_backup(&BackupCreateOptions {
+            workspace_path: workspace.clone(),
+            database_path: Some(database.clone()),
+            output_dir: None,
+            label: Some("ee08-lease-owner".to_owned()),
+            redaction_level: RedactionLevel::None,
+            include_derived: false,
+            include_graph_cache: false,
+            dry_run: false,
+        })
+        .map_err(|error| error.message())?;
+        let lease_inventory = backup
+            .recovery_inventory
+            .entries
+            .iter()
+            .find(|entry| entry.table == "ee_advisory_locks")
+            .ok_or("backup inventory omits advisory-lock policy")?;
+        ensure_equal(
+            lease_inventory.row_count,
+            1,
+            "backup observes the remote lease row",
+        )?;
+        ensure_equal(
+            lease_inventory.disposition.as_str(),
+            "intentionally_ephemeral",
+            "advisory leases remain ephemeral in backup policy",
+        )?;
+        ensure_equal(
+            lease_inventory.coverage.as_str(),
+            "intentionally_not_replayed",
+            "advisory leases are never replayed on restore",
+        )?;
+        let restored = restore_backup_to_side_path(&BackupRestoreOptions {
+            workspace_path: workspace,
+            backup_path: PathBuf::from(&backup.backup_path),
+            side_path: tempdir.path().join("restored-ee08-lease-owner"),
+            restore_graph_cache: false,
+            dry_run: false,
+        })
+        .map_err(|error| error.message())?;
+        ensure_equal(
+            restored.restored_search_index_job_count,
+            1,
+            "running job is included in restored work history",
+        )?;
+
+        let restored_db = DbConnection::open_file(&restored.restored_database_path)
+            .map_err(|error| error.to_string())?;
+        let restored_workspace = restored_db
+            .list_workspaces()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next()
+            .ok_or("missing restored workspace")?;
+        let restored_lock_id = crate::db::AdvisoryLockId::index(&restored_workspace.id);
+        ensure(
+            restored_db
+                .is_lock_held(&restored_lock_id)
+                .map_err(|error| error.to_string())?
+                .is_none(),
+            "remote publisher lease is not replayed into restored database",
+        )?;
+        let restored_job = restored_db
+            .get_search_index_job(job_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("running job missing after restore")?;
+        ensure_equal(
+            restored_job.workspace_id.as_str(),
+            restored_workspace.id.as_str(),
+            "restored job is rebound to restored workspace",
+        )?;
+        ensure_equal(
+            restored_job.status.as_str(),
+            "pending",
+            "running job is rearmed after restore",
+        )?;
+        ensure_equal(
+            restored_job.documents_indexed,
+            0,
+            "partial publication progress is not resumed without its worker",
+        )?;
+        ensure(
+            restored_job.started_at.is_none()
+                && restored_job.completed_at.is_none()
+                && restored_job.error_message.is_none(),
+            "restored job has no stale worker lifecycle fields",
+        )?;
+        restored_db.close().map_err(|error| error.to_string())?;
+
+        let source_after = DbConnection::open_file(&database).map_err(|error| error.to_string())?;
+        ensure_equal(
+            source_after
+                .get_search_index_job(job_id)
+                .map_err(|error| error.to_string())?,
+            Some(source_job),
+            "backup and restore leave source job unchanged",
+        )?;
+        ensure_equal(
+            source_after
+                .is_lock_held(&lock_id)
+                .map_err(|error| error.to_string())?
+                .map(|lock| lock.holder_id),
+            Some(holder_id.to_owned()),
+            "backup and restore leave source lease owner unchanged",
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn work_history_restore_validates_risk_and_rejects_invalid_rows_atomically() -> TestResult {
         for defect in [
             "duplicate_entry",
