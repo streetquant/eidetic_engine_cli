@@ -24510,7 +24510,7 @@ mod tests {
                 &crate::db::CreateSearchIndexJobInput {
                     workspace_id: workspace_id.clone(),
                     job_type: crate::db::SearchIndexJobType::Incremental,
-                    document_source: Some("cass".to_owned()),
+                    document_source: Some("session".to_owned()),
                     document_id: Some("session-ee08-backup".to_owned()),
                     documents_total: 7,
                 },

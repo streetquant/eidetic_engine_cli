@@ -38,7 +38,7 @@ fn insert_running_job(connection: &DbConnection, job_id: &str) -> TestResult {
             &CreateSearchIndexJobInput {
                 workspace_id: WORKSPACE_ID.to_owned(),
                 job_type: SearchIndexJobType::Incremental,
-                document_source: Some("cass".to_owned()),
+                document_source: Some("session".to_owned()),
                 document_id: Some(format!("session-{job_id}")),
                 documents_total: 7,
             },
