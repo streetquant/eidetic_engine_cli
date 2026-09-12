@@ -44058,6 +44058,25 @@ where
             Ok(report) => report,
             Err(error) => return write_domain_error(&error, cli.wants_json(), stdout, stderr),
         };
+    // GH #35: migrations are the other place a large batch of frames lands in
+    // the WAL sidecar, and the automatic checkpoint threshold is a flat 64 MB
+    // that a small store never reaches. Left alone, every later connection open
+    // replays them. Fold them in here for the same reason `ee init` does.
+    //
+    // Best-effort: a checkpoint that reports `busy` because a concurrent reader
+    // holds a pin is not a migration failure, and reporting it as one would be
+    // both wrong and alarming right after a successful schema change.
+    let wal_checkpoint_status = if applied.is_empty() {
+        "skipped_no_migrations_applied"
+    } else {
+        match conn.wal_checkpoint(crate::db::WalCheckpointMode::Truncate) {
+            Ok(report) if report.busy => "busy",
+            Ok(report) if report.checkpointed_frames > 0 => "checkpointed",
+            Ok(_) => "empty",
+            Err(_) => "failed",
+        }
+    };
+
     let applied_count = applied.len();
     let skipped_count = skipped.len();
     let json = serde_json::json!({
@@ -44065,6 +44084,7 @@ where
         "success": true,
         "data": {
             "command": "migrate run",
+            "walCheckpoint": wal_checkpoint_status,
             "databasePath": database_path.display().to_string(),
             "dryRun": false,
             "applied": applied.clone(),
@@ -63039,7 +63059,9 @@ where
 
     if args.dry_run {
         let before = match connection.wal_status() {
-            Ok(status) => WalStatusReport::from_wal_status(status, threshold),
+            Ok(status) => {
+                WalStatusReport::from_wal_status_with_database(status, threshold, &database_path)
+            }
             Err(error) => {
                 let data = serde_json::json!({
                     "schema": MAINTENANCE_RUN_SCHEMA_V1,
@@ -63136,8 +63158,16 @@ where
             return write_maintenance_response(cli, stdout, false, data);
         }
     };
-    let before = WalStatusReport::from_wal_status(checkpoint.before.clone(), threshold);
-    let after = WalStatusReport::from_wal_status(checkpoint.after.clone(), threshold);
+    let before = WalStatusReport::from_wal_status_with_database(
+        checkpoint.before.clone(),
+        threshold,
+        &database_path,
+    );
+    let after = WalStatusReport::from_wal_status_with_database(
+        checkpoint.after.clone(),
+        threshold,
+        &database_path,
+    );
     let checkpoint_outcome = crate::db::read_pool::note_process_checkpoint_outcome(
         &crate::db::DatabaseConfig::file(database_path.clone()),
         checkpoint.busy,
@@ -63184,7 +63214,7 @@ where
         "checkpointBlockerVisibility": checkpoint_blocker_visibility,
         "before": wal_status_report_json(&before),
         "after": wal_status_report_json(&after),
-        "next": if after.exceeds_threshold() {
+        "next": if after.warrants_checkpoint() {
             "ee maintenance wal-checkpoint --workspace . --mode truncate --json"
         } else {
             "ee status --workspace . --json"
@@ -63200,6 +63230,9 @@ fn wal_status_report_json(report: &WalStatusReport) -> serde_json::Value {
         "pageSize": report.page_size,
         "checkpointThresholdBytes": report.checkpoint_threshold_bytes,
         "exceedsThreshold": report.exceeds_threshold(),
+        "databaseBytes": report.database_bytes,
+        "exceedsDatabaseSize": report.exceeds_database_size(),
+        "warrantsCheckpoint": report.warrants_checkpoint(),
     })
 }
 
