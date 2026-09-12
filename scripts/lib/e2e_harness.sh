@@ -172,7 +172,7 @@ end_temp_workspace() {
     if [ "${EE_E2E_KEEP:-0}" != "1" ]; then
         local ws
         for ws in "${HARNESS_TMP_WORKSPACES[@]}"; do
-            case "$ws" in /tmp/*|"${TMPDIR%/}"/*|"${EE_E2E_TMPDIR%/}"/*) rm -rf "$ws" 2>/dev/null || true;; esac
+            case "$ws" in /tmp/*|"${TMPDIR:-/tmp}"/*|"${EE_E2E_TMPDIR:-/tmp}"/*) rm -rf "$ws" 2>/dev/null || true;; esac
         done
         HARNESS_TMP_WORKSPACES=()
     fi
