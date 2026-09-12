@@ -81,7 +81,7 @@ fn assert_eq_debug<T: Debug + PartialEq>(actual: &T, expected: &T, context: &str
 #[test]
 fn public_requeue_preserves_unprobeable_remote_holder_then_requeues_after_release() -> TestResult {
     let connection = connection()?;
-    let job_id = "sidx_ee08_remote_holder_00000000001";
+    let job_id = "sidx_ee08_remote_00000000000001";
     insert_running_job(&connection, job_id)?;
 
     let lock_id = AdvisoryLockId::index(WORKSPACE_ID);
@@ -165,8 +165,8 @@ fn public_requeue_is_atomic_for_multiple_jobs_under_one_live_or_remote_holder() 
     ] {
         let connection = connection()?;
         let job_ids = [
-            format!("sidx_ee08_{label}_atomic_a_0000000001"),
-            format!("sidx_ee08_{label}_atomic_b_0000000001"),
+            "sidx_ee08_atomic_a_000000000001".to_owned(),
+            "sidx_ee08_atomic_b_000000000001".to_owned(),
         ];
         for job_id in &job_ids {
             insert_running_job(&connection, job_id)?;
@@ -249,7 +249,7 @@ fn public_requeue_is_atomic_for_multiple_jobs_under_one_live_or_remote_holder() 
 #[test]
 fn public_requeue_recovers_dead_owner_idempotently_without_replaying_the_lease() -> TestResult {
     let connection = connection()?;
-    let job_id = "sidx_ee08_dead_owner_00000000001";
+    let job_id = "sidx_ee08_dead_0000000000000001";
     insert_running_job(&connection, job_id)?;
 
     let lock_id = AdvisoryLockId::index(WORKSPACE_ID);
