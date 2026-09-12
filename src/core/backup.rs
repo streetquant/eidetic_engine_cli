@@ -24499,7 +24499,7 @@ mod tests {
     fn backup_restore_rearms_running_index_jobs_without_replaying_publish_leases() -> TestResult {
         let (tempdir, workspace, database) = fixture().map_err(|error| error.message())?;
         let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(1)).to_string();
-        let job_id = "sidx_ee08_backup_remote_owner_0000001";
+        let job_id = "sidx_ee08_backup_remote_0000001";
         let lock_id = crate::db::AdvisoryLockId::index(&workspace_id);
         let holder_id = "remote-node:backup-publisher-9:ee08";
 
