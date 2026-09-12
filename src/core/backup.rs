@@ -24586,10 +24586,14 @@ mod tests {
             "intentionally_not_replayed",
             "advisory leases are never replayed on restore",
         )?;
+        let side_path = tempdir.path().join("restored-ee08-lease-owner");
+        let restored_workspace_id = crate::core::workspace::stable_workspace_id(&side_path);
+        let _embedder_guard =
+            crate::core::index::install_test_hash_workspace_embedder(&restored_workspace_id);
         let restored = restore_backup_to_side_path(&BackupRestoreOptions {
             workspace_path: workspace,
             backup_path: PathBuf::from(&backup.backup_path),
-            side_path: tempdir.path().join("restored-ee08-lease-owner"),
+            side_path: side_path.clone(),
             restore_graph_cache: false,
             dry_run: false,
         })
