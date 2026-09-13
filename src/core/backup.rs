@@ -9535,7 +9535,19 @@ fn validate_maintenance_history(
 }
 
 fn redact_maintenance_id(value: &str, prefix: &str, level: RedactionLevel) -> String {
-    if level != RedactionLevel::None && redact_content(value, RedactionLevel::Standard) != value {
+    let should_opaque = match level {
+        RedactionLevel::None => false,
+        // Standard export redacts only identifiers that contain a recognized
+        // secret/high-entropy value so ordinary references remain readable.
+        RedactionLevel::Minimal | RedactionLevel::Standard | RedactionLevel::Strict => {
+            redact_content(value, RedactionLevel::Standard) != value
+        }
+        // Full export must make every maintenance identifier opaque. Keep the
+        // type prefix so rows can still be inspected and related references
+        // remain distinguishable after recovery.
+        RedactionLevel::Paranoid | RedactionLevel::Full => true,
+    };
+    if should_opaque {
         format!("{prefix}{}", blake3::hash(value.as_bytes()).to_hex())
     } else {
         value.to_owned()
@@ -22627,7 +22639,7 @@ mod tests {
                 created_at: timestamp.to_owned(), adopted_at: "2026-09-02T00:00:00Z".to_owned(), classifier_algorithm: "heuristic_v1".to_owned(),
                 classifier_version: "1".to_owned(), build_version: "0.2.0".to_owned() }],
             tripwires: vec![crate::db::StoredTripwire { id: "tw_recovery".to_owned(), workspace_id: workspace_id.to_owned(), preflight_run_id: "pre_recovery".to_owned(),
-                tripwire_type: "custom".to_owned(), condition: "task_contains_any(release)".to_owned(), action: "warn".to_owned(), state: "armed".to_owned(),
+                tripwire_type: "custom".to_owned(), condition: "task_contains_any(\"release\")".to_owned(), action: "warn".to_owned(), state: "armed".to_owned(),
                 message: Some("api_key=maintenance-secret-tripwire".to_owned()), created_at: timestamp.to_owned(), last_checked_at: None, triggered_at: None,
                 updated_at: "2026-09-02T00:00:00Z".to_owned() }],
             tripwire_checks: vec![crate::db::StoredTripwireCheckEvent { id: "tchk_recovery".to_owned(), workspace_id: workspace_id.to_owned(), tripwire_id: "tw_recovery".to_owned(),
@@ -22639,6 +22651,57 @@ mod tests {
                 evidence_uris_json: json!(["api_key=maintenance-secret-uri"]).to_string(), maturity: "promoted".to_owned(), confidence: 0.75,
                 helpful_count: 17, harmful_count: 2, created_at: timestamp.to_owned(), updated_at: "2026-09-02T00:00:00Z".to_owned(), last_recommended_at: Some(timestamp.to_owned()) }],
         })
+    }
+
+    #[test]
+    fn maintenance_id_redaction_is_level_aware_and_deterministic() -> TestResult {
+        let sensitive = "reflect_req_api_key=maintenance-secret-id";
+        let safe = "reflect_req_recovery";
+        let none_sensitive = redact_maintenance_id(sensitive, "reflect_req_", RedactionLevel::None);
+        ensure_equal(
+            none_sensitive,
+            sensitive.to_owned(),
+            "none redaction preserves sensitive identifiers",
+        )?;
+        let standard_sensitive =
+            redact_maintenance_id(sensitive, "reflect_req_", RedactionLevel::Standard);
+        ensure(
+            standard_sensitive.starts_with("reflect_req_"),
+            "standard redaction keeps the stable type prefix",
+        )?;
+        ensure(
+            standard_sensitive != sensitive,
+            "standard redaction changes a sensitive identifier",
+        )?;
+        ensure(
+            !standard_sensitive.contains("maintenance-secret-"),
+            "standard redaction does not publish sensitive identifier material",
+        )?;
+        ensure_equal(
+            standard_sensitive.clone(),
+            redact_maintenance_id(sensitive, "reflect_req_", RedactionLevel::Standard),
+            "standard identifier redaction is deterministic",
+        )?;
+        ensure_equal(
+            redact_maintenance_id(safe, "reflect_req_", RedactionLevel::Standard),
+            safe.to_owned(),
+            "standard redaction preserves a safe identifier",
+        )?;
+        let full_safe = redact_maintenance_id(safe, "reflect_req_", RedactionLevel::Full);
+        ensure(
+            full_safe.starts_with("reflect_req_") && full_safe != safe,
+            "full redaction makes safe identifiers opaque while retaining their type",
+        )?;
+        ensure_equal(
+            full_safe.clone(),
+            redact_maintenance_id(safe, "reflect_req_", RedactionLevel::Full),
+            "full identifier redaction is deterministic",
+        )?;
+        ensure(
+            !full_safe.contains("maintenance-secret-"),
+            "full redaction does not publish identifier material",
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -22759,11 +22822,26 @@ mod tests {
                 let chunk: BackupMaintenanceHistory =
                     serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
                 ensure(chunk.authentication.is_some(), "maintenance authenticated")?;
+                let serialized = String::from_utf8_lossy(&bytes);
                 if redaction != RedactionLevel::None {
                     ensure(
-                        !String::from_utf8_lossy(&bytes).contains("maintenance-secret-"),
+                        !serialized.contains("maintenance-secret-"),
                         "maintenance secrets redacted",
                     )?;
+                }
+                if redaction == RedactionLevel::Full {
+                    for identifier in [
+                        "reflect_req_recovery",
+                        "reflect_req_consumed",
+                        "reflect_key_historical",
+                        "sit_recovery",
+                        "plrec_recovery",
+                    ] {
+                        ensure(
+                            !serialized.contains(identifier),
+                            format!("full redaction hides ordinary identifier {identifier}"),
+                        )?;
+                    }
                 }
             }
             let side = tempdir.path().join("maintenance-restored");
@@ -22826,10 +22904,15 @@ mod tests {
                     "all durable fields exactly recovered",
                 )?;
             }
+            let recovered_request_id =
+                redact_maintenance_id("reflect_req_recovery", "reflect_req_", redaction);
+            let recovered_consumed_request_id =
+                redact_maintenance_id("reflect_req_consumed", "reflect_req_", redaction);
+            let recovered_situation_id = redact_maintenance_id("sit_recovery", "sit_", redaction);
             ensure_equal(
                 db.reflection_request_replay_status(
                     &target.id,
-                    "reflect_req_recovery",
+                    &recovered_request_id,
                     &hash_bytes(b"new result"),
                     "2026-09-03T00:00:00Z",
                 )
@@ -22840,7 +22923,7 @@ mod tests {
             ensure_equal(
                 db.reflection_request_replay_status(
                     &target.id,
-                    "reflect_req_consumed",
+                    &recovered_consumed_request_id,
                     &hash_bytes(b"accepted result"),
                     "2026-09-03T00:00:00Z",
                 )
@@ -22854,7 +22937,7 @@ mod tests {
                 matches!(
                     db.reflection_request_replay_status(
                         &target.id,
-                        "reflect_req_consumed",
+                        &recovered_consumed_request_id,
                         &hash_bytes(b"different result"),
                         "2026-09-03T00:00:00Z"
                     )
@@ -22864,7 +22947,7 @@ mod tests {
                 "consumed reflection refuses substituted result",
             )?;
             let situation =
-                crate::core::situation::get_situation_record_details(&db, "sit_recovery")
+                crate::core::situation::get_situation_record_details(&db, &recovered_situation_id)
                     .map_err(|e| e.message())?
                     .ok_or("restored situation consumer")?;
             ensure_equal(
@@ -22992,10 +23075,11 @@ mod tests {
                         task_outcome: None,
                     })
                     .map_err(|e| e.message())?;
+                let check_details = format!("restored tripwire evaluates live task: {check:?}");
                 ensure_equal(
                     check.result,
                     crate::core::tripwire::CheckResult::Triggered,
-                    "restored tripwire evaluates live task",
+                    &check_details,
                 )?;
                 ensure(!check.should_halt, "warning tripwire remains advisory")?;
                 ensure_equal(
