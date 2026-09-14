@@ -8664,8 +8664,9 @@ fn determine_health(
     }
 
     match (db_generation, index_generation) {
-        (Some(db_gen), Some(idx_gen)) if db_gen > idx_gen => IndexHealth::Stale,
+        (Some(db_gen), Some(idx_gen)) if db_gen != idx_gen => IndexHealth::Stale,
         (Some(_), None) => IndexHealth::Stale, // DB has generation but index doesn't
+        (None, Some(_)) => IndexHealth::Stale, // Index has generation but DB does not
         _ => IndexHealth::Ready,
     }
 }
@@ -15019,9 +15020,9 @@ mod tests {
     }
 
     #[test]
-    fn cache_invalidation_ready_when_index_ahead() {
+    fn cache_invalidation_stale_when_index_ahead() {
         let health = determine_health(true, 5, Some(8), Some(10), true, false, false);
-        assert_eq!(health, IndexHealth::Ready);
+        assert_eq!(health, IndexHealth::Stale);
     }
 
     #[test]
@@ -15031,9 +15032,9 @@ mod tests {
     }
 
     #[test]
-    fn cache_invalidation_ready_when_db_has_no_generation() {
+    fn cache_invalidation_stale_when_db_has_no_generation() {
         let health = determine_health(true, 5, None, Some(10), true, false, false);
-        assert_eq!(health, IndexHealth::Ready);
+        assert_eq!(health, IndexHealth::Stale);
     }
 
     #[test]
